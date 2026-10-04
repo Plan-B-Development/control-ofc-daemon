@@ -388,6 +388,37 @@ impl OverrideTable {
         released
     }
 
+    /// Drop the overrides on `control_ids` and every identify hold on a fan
+    /// `is_openfan` names, returning what went, each sorted (DEC-481). Called
+    /// as a firmware update starts: its channels are not writable until the
+    /// port is back, and an override taken before it must not re-pin them
+    /// afterwards.
+    pub fn release_for_maintenance(
+        &mut self,
+        control_ids: &std::collections::HashSet<String>,
+        is_openfan: impl Fn(&str) -> bool,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut controls: Vec<String> = Vec::new();
+        self.controls.retain(|id, _| {
+            let release = control_ids.contains(id);
+            if release {
+                controls.push(id.clone());
+            }
+            !release
+        });
+        let mut fans: Vec<String> = Vec::new();
+        self.identify.retain(|id, _| {
+            let release = is_openfan(id);
+            if release {
+                fans.push(id.clone());
+            }
+            !release
+        });
+        controls.sort();
+        fans.sort();
+        (controls, fans)
+    }
+
     /// Drop every entry whose deadman has fired, judged on the daemon's clock.
     /// Returns the cleared ids so the engine can reset lapsed controls' state.
     pub fn sweep(&mut self) -> SweepCleared {
@@ -931,6 +962,30 @@ mod tests {
         assert!(
             g2.token > g1.token,
             "the fencing counter is monotonic across a clear, not reset"
+        );
+    }
+
+    /// DEC-481: an update's start releases the overrides on the controls that
+    /// drive OpenFan channels and every identify hold on one — and nothing else.
+    #[test]
+    fn an_update_releases_only_what_drives_the_openfan_controller() {
+        let mut t = OverrideTable::new();
+        let ttl = Duration::from_secs(15);
+        t.take_override("front", 80, ttl);
+        t.take_override("cpu", 60, ttl);
+        t.identify_hold("openfan:ch03", 0, IdentifyMode::Stop, ttl);
+        t.identify_hold("hwmon:nct6798:pwm2", 0, IdentifyMode::Stop, ttl);
+        let openfan_controls = std::collections::HashSet::from(["front".to_string()]);
+        let (controls, fans) = t.release_for_maintenance(&openfan_controls, |id| {
+            crate::serial::openfan_channel_of(id).is_ok()
+        });
+        assert_eq!(controls, vec!["front".to_string()]);
+        assert_eq!(fans, vec!["openfan:ch03".to_string()]);
+        let left = t.snapshot();
+        assert_eq!(left.controls.keys().collect::<Vec<_>>(), vec!["cpu"]);
+        assert_eq!(
+            left.identify.keys().collect::<Vec<_>>(),
+            vec!["hwmon:nct6798:pwm2"]
         );
     }
 }

@@ -98,6 +98,24 @@ impl Command {
     }
 }
 
+/// `>05`: the controller's hardware information block (`HW_REV`, `MCU`, the
+/// fan driver…). Several reply lines — read with
+/// [`crate::serial::transport::read_info_block`], never `send_command`.
+pub const HW_INFO_OPCODE: u8 = 0x05;
+
+/// `>06`: the firmware information block (`FW_REV`, `PROTOCOL_VERSION`).
+pub const FW_INFO_OPCODE: u8 = 0x06;
+
+/// `>07`: reboot into the RP2040's USB bootloader (DEC-481). The firmware
+/// resets **before** it answers, so this command has no reply; a firmware
+/// update watches the USB device leave instead.
+pub const JUMP_TO_BOOTLOADER_OPCODE: u8 = 0x07;
+
+/// Encode a command that takes no parameters, such as the three above.
+pub fn encode_bare(opcode: u8) -> String {
+    format!(">{opcode:02X}\n")
+}
+
 /// A single channel RPM reading from a response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelRpm {

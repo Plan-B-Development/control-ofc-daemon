@@ -1,0 +1,1812 @@
+//! A firmware update's stages (DEC-481).
+//!
+//! 1. **Preparing** — read the board's USB identity and its `>05`/`>06` blocks.
+//! 2. **Parking** — every channel to 100 % through the normal write path; any
+//!    failure ends the run with no firmware change. Last point a cancel lands.
+//! 3. **Entering the bootloader** — borrow the port, send `>07` (no reply); if
+//!    the board is still in normal mode after a while, switch the same port to
+//!    1200 baud. The bootloader must then appear on the same USB port.
+//! 4. **Waiting for the file** — the user copies it onto the board's drive.
+//! 5. **Waiting for the board** — the same serial on the same USB port.
+//! 6. **Checking** — open only the interface the daemon used, `>00`,
+//!    `>05`/`>06`, the evidence.
+//! 7. **Restoring control** — hand the port back, lift the write suspension,
+//!    wait for fresh polls of every channel and for the settings to land.
+//!
+//! Every wait has a limit and watches the stop signal; every blocking call
+//! (serial, sysfs) runs on the blocking pool.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
+use tokio::sync::watch;
+
+use super::{
+    evidence, journal, outcome, stage, AliveGuard, BoardSnapshot, ClaimGuard, MaintenanceRecord,
+    MaintenanceSlot, StageTiming, STATE_FINISHED,
+};
+use crate::constants;
+use crate::error::SerialError;
+use crate::health::cache::StateCache;
+use crate::serial::controller::FanController;
+use crate::serial::port_loan::{self, LoanHandle, LoanReturn, LoanSender};
+use crate::serial::protocol::{
+    encode_bare, FW_INFO_OPCODE, HW_INFO_OPCODE, JUMP_TO_BOOTLOADER_OPCODE, NUM_CHANNELS,
+};
+use crate::serial::transport::{read_info_block, verify_openfan_identity, SerialTransport};
+use crate::serial::usb_identity as usb;
+
+/// Opens the board's serial interface after it comes back.
+pub type Opener = Arc<
+    dyn Fn(&str, Duration) -> Result<Box<dyn SerialTransport + Send>, SerialError> + Send + Sync,
+>;
+
+/// The channels whose settings must have landed before control counts as
+/// restored: the active profile's OpenFan channels, or every channel while
+/// the thermal force is active.
+pub type ExpectedChannels = Arc<dyn Fn() -> Vec<u8> + Send + Sync>;
+
+/// Each stage's limits. Production uses [`StageLimits::production`]; tests
+/// shrink them.
+#[derive(Debug, Clone, Copy)]
+pub struct StageLimits {
+    pub borrow_wait: Duration,
+    pub prepare: Duration,
+    pub park: Duration,
+    pub trigger_wait: Duration,
+    pub bootloader_wait: Duration,
+    pub enter: Duration,
+    pub file_wait: Duration,
+    pub return_wait: Duration,
+    pub check_wait: Duration,
+    pub restore_wait: Duration,
+    pub sysfs_poll: Duration,
+    /// Pause between handshake attempts on the returned board.
+    pub check_retry: Duration,
+}
+
+impl StageLimits {
+    pub fn production() -> Self {
+        Self {
+            borrow_wait: constants::OPENFAN_MAINT_BORROW_WAIT,
+            prepare: constants::OPENFAN_MAINT_PREPARE_LIMIT,
+            park: constants::OPENFAN_MAINT_PARK_LIMIT,
+            trigger_wait: constants::OPENFAN_MAINT_TRIGGER_WAIT,
+            bootloader_wait: constants::OPENFAN_MAINT_BOOTLOADER_WAIT,
+            enter: constants::OPENFAN_MAINT_ENTER_LIMIT,
+            file_wait: constants::OPENFAN_MAINT_FILE_WAIT,
+            return_wait: constants::OPENFAN_MAINT_RETURN_WAIT,
+            check_wait: constants::OPENFAN_MAINT_CHECK_WAIT,
+            restore_wait: constants::OPENFAN_MAINT_RESTORE_WAIT,
+            sysfs_poll: constants::OPENFAN_MAINT_SYSFS_POLL,
+            check_retry: Duration::from_millis(500),
+        }
+    }
+}
+
+/// Everything a run needs, injected so a test can drive it without hardware.
+pub struct RunEnv {
+    pub cache: Arc<StateCache>,
+    pub slot: Arc<MaintenanceSlot>,
+    pub controller: Arc<Mutex<FanController>>,
+    pub lender: LoanSender,
+    pub sys_root: PathBuf,
+    pub journal_path: PathBuf,
+    pub limits: StageLimits,
+    pub serial_timeout: Duration,
+    pub open: Opener,
+    pub expected_channels: ExpectedChannels,
+    pub shutdown: watch::Receiver<bool>,
+}
+
+/// Start a run and the supervisor that records an internal error if it
+/// panics. Returns the supervisor's handle, which is what the shutdown drain
+/// waits on.
+pub fn spawn(env: RunEnv, claim: ClaimGuard, alive: AliveGuard) -> tokio::task::JoinHandle<()> {
+    let slot = env.slot.clone();
+    let journal_path = env.journal_path.clone();
+    let run_id = claim.run_id().to_string();
+    let task = tokio::spawn(run(env, claim));
+    tokio::spawn(async move {
+        // Held until the record is final, so no second run starts before it.
+        let _alive = alive;
+        let Err(e) = task.await else {
+            return;
+        };
+        if !e.is_panic() {
+            return;
+        }
+        // The claim and the loan went with the unwinding task: the claim
+        // guard released it (as needing recovery once the bootloader was
+        // asked for), and the dropped loan handle reads as "nothing back" to
+        // the poll loop. What is left is the record.
+        let at = slot.record().map(|r| r.stage).unwrap_or_default();
+        log::error!("OpenFan firmware update {run_id}: internal error during {at}: {e}");
+        let finished = slot.update_record(|r| {
+            if r.is_running() {
+                let token = outcome::when_interrupted(r.bootloader_requested, r.board_answered);
+                finish_record(r, token, format!("internal error during {at}"), false);
+            }
+        });
+        if let Some(record) = finished {
+            save_journal(&journal_path, &run_id, &record).await;
+        }
+    })
+}
+
+/// Write the journal. It fsyncs, so it runs on the blocking pool — the
+/// runtime's workers are shared with the engine — and the caller awaits it
+/// before acting. A failure is logged and the run goes on ([`journal::save`]).
+async fn save_journal(path: &Path, run_id: &str, record: &MaintenanceRecord) {
+    let (path, record) = (path.to_path_buf(), record.clone());
+    if let Some(Err(e)) = blocking(move || journal::save(&path, &record)).await {
+        log::warn!("OpenFan firmware update {run_id}: journal could not be written: {e}");
+    }
+}
+
+/// Close `record` with `token`.
+pub(crate) fn finish_record(
+    record: &mut MaintenanceRecord,
+    token: &str,
+    detail: String,
+    interrupted: bool,
+) {
+    let now = crate::control_paths::unix_ms();
+    record.state = STATE_FINISHED.to_string();
+    record.cancellable = false;
+    record.finished_unix_ms = Some(now);
+    record.stage_deadline_unix_ms = None;
+    record.outcome = Some(token.to_string());
+    record.outcome_detail = Some(detail);
+    record.interrupted |= interrupted;
+    if let Some(last) = record.stages.last_mut() {
+        last.ended_unix_ms.get_or_insert(now);
+    }
+}
+
+/// How a run ended.
+struct End {
+    outcome: &'static str,
+    detail: String,
+    interrupted: bool,
+    cancelled: bool,
+}
+
+impl End {
+    fn new(outcome: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            outcome,
+            detail: detail.into(),
+            interrupted: false,
+            cancelled: false,
+        }
+    }
+
+    /// A `DELETE` that landed before the port was borrowed: nothing changed.
+    fn cancelled(detail: impl Into<String>) -> Self {
+        Self {
+            cancelled: true,
+            ..Self::new(outcome::NO_FIRMWARE_CHANGE, detail)
+        }
+    }
+}
+
+/// What a sysfs or cache watch came to.
+enum Watched<T> {
+    Found(T),
+    Deadline,
+    Shutdown,
+}
+
+/// What the board's USB port holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortHolds {
+    /// The board, running firmware: the expected serial.
+    Board,
+    Bootloader,
+    /// A different device.
+    Other,
+    Empty,
+}
+
+fn port_holds(sys: &Path, port: &str, serial: &str) -> PortHolds {
+    match usb::device_at(sys, port) {
+        None => PortHolds::Empty,
+        Some(d) if d.is_rp2040_bootloader() => PortHolds::Bootloader,
+        Some(d) if d.vendor_id == usb::RP2040_VENDOR_ID && d.serial.as_deref() == Some(serial) => {
+            PortHolds::Board
+        }
+        Some(_) => PortHolds::Other,
+    }
+}
+
+/// What appeared on the port after the board left normal mode.
+enum Landed {
+    Bootloader,
+    /// The board's firmware again, with the serial device to reopen.
+    Firmware(String),
+}
+
+/// What came back on the port after the drive went away.
+enum Back {
+    /// The board, with the serial device to reopen.
+    Board(String),
+    /// The bootloader again: the copied file did not start.
+    Bootloader,
+}
+
+fn to_map(pairs: Result<Vec<(String, String)>, SerialError>) -> Option<BTreeMap<String, String>> {
+    pairs.ok().map(|p| p.into_iter().collect())
+}
+
+/// Run `f` on the blocking pool; `None` if it panicked.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(v) => Some(v),
+        Err(e) => {
+            log::error!("OpenFan firmware update: a blocking step panicked: {e}");
+            None
+        }
+    }
+}
+
+struct Runner {
+    env: RunEnv,
+    run_id: String,
+    claim: Option<ClaimGuard>,
+    /// The borrowed port while the run holds it; `None` after the 1200-baud
+    /// signal consumed it, and once it is given back.
+    port: Option<Box<dyn SerialTransport + Send>>,
+    /// The loan, until it is settled.
+    handle: Option<LoanHandle>,
+}
+
+async fn run(env: RunEnv, claim: ClaimGuard) {
+    let run_id = claim.run_id().to_string();
+    let mut runner = Runner {
+        env,
+        run_id,
+        claim: Some(claim),
+        port: None,
+        handle: None,
+    };
+    let end = runner.drive().await;
+    runner.conclude(end).await;
+}
+
+impl Runner {
+    fn shutting_down(&self) -> bool {
+        *self.env.shutdown.borrow()
+    }
+
+    /// Change the record and write the journal before anything else happens.
+    /// `&mut self` because the future must be `Send`: the run holds its port,
+    /// which is not `Sync`.
+    async fn record(
+        &mut self,
+        f: impl FnOnce(&mut MaintenanceRecord),
+    ) -> Option<MaintenanceRecord> {
+        let updated = self.env.slot.update_record(f)?;
+        save_journal(&self.env.journal_path, &self.run_id, &updated).await;
+        Some(updated)
+    }
+
+    async fn note(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        log::info!("OpenFan firmware update {}: {text}", self.run_id);
+        self.record(|r| r.notes.push(text)).await;
+    }
+
+    /// Move to `next`, whose limit is `limit` from now.
+    async fn enter(&mut self, next: &'static str, limit: Duration) {
+        self.enter_until(next, Instant::now() + limit).await;
+    }
+
+    /// Move to `next`, which ends at `deadline`.
+    async fn enter_until(&mut self, next: &'static str, deadline: Instant) {
+        let now_ms = crate::control_paths::unix_ms();
+        let left = deadline.saturating_duration_since(Instant::now());
+        self.record(|r| {
+            if let Some(last) = r.stages.last_mut() {
+                last.ended_unix_ms.get_or_insert(now_ms);
+            }
+            r.stages.push(StageTiming {
+                stage: next.to_string(),
+                started_unix_ms: now_ms,
+                ended_unix_ms: None,
+            });
+            r.stage = next.to_string();
+            r.stage_started_unix_ms = now_ms;
+            r.stage_deadline_unix_ms = Some(now_ms + left.as_millis() as u64);
+        })
+        .await;
+        self.env
+            .cache
+            .set_openfan_maintenance_stage(&self.run_id, next, Some(deadline));
+        log::info!("OpenFan firmware update {}: {next}", self.run_id);
+    }
+
+    /// How a run the daemon is stopping ends.
+    fn interrupted(&self) -> End {
+        let record = self.env.slot.record();
+        let (requested, answered, at) = record
+            .map(|r| (r.bootloader_requested, r.board_answered, r.stage))
+            .unwrap_or_default();
+        End {
+            interrupted: true,
+            ..End::new(
+                outcome::when_interrupted(requested, answered),
+                format!("interrupted by a daemon stop during {at}"),
+            )
+        }
+    }
+
+    /// Re-read sysfs until `check` finds something, `limit` passes, or stop.
+    async fn watch_sysfs<T: Send + 'static>(
+        &mut self,
+        limit: Duration,
+        check: impl Fn(&Path) -> Option<T> + Send + Sync + 'static,
+    ) -> Watched<T> {
+        let deadline = Instant::now() + limit;
+        let check = Arc::new(check);
+        loop {
+            if self.shutting_down() {
+                return Watched::Shutdown;
+            }
+            let (c, root) = (check.clone(), self.env.sys_root.clone());
+            if let Some(Some(found)) = blocking(move || c(&root)).await {
+                return Watched::Found(found);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Watched::Deadline;
+            }
+            let nap = self.env.limits.sysfs_poll.min(deadline - now);
+            tokio::select! {
+                biased;
+                _ = self.env.shutdown.changed() => return Watched::Shutdown,
+                _ = tokio::time::sleep(nap) => {}
+            }
+        }
+    }
+
+    /// Sleep `nap`, or return `false` on a stop.
+    async fn pause(&mut self, nap: Duration) -> bool {
+        if self.shutting_down() {
+            return false;
+        }
+        tokio::select! {
+            biased;
+            _ = self.env.shutdown.changed() => false,
+            _ = tokio::time::sleep(nap) => true,
+        }
+    }
+
+    async fn drive(&mut self) -> End {
+        let limits = self.env.limits;
+        let serial = self
+            .env
+            .slot
+            .record()
+            .map(|r| r.expected_usb_serial)
+            .unwrap_or_default();
+
+        // ── 1. Preparing ──────────────────────────────────────────────────
+        self.enter(stage::PREPARING, limits.prepare).await;
+        let Some(adopted) = self.env.cache.openfan_port() else {
+            return End::new(
+                outcome::NO_FIRMWARE_CHANGE,
+                "the controller's serial device is not known",
+            );
+        };
+        let sys = self.env.sys_root.clone();
+        let identity = blocking(move || usb::tty_identity(&sys, &adopted))
+            .await
+            .flatten();
+        let Some(identity) = identity else {
+            return End::new(
+                outcome::NO_FIRMWARE_CHANGE,
+                "the board's USB identity could not be read",
+            );
+        };
+        if identity.device.serial.as_deref() != Some(serial.as_str()) {
+            return End::new(
+                outcome::NO_FIRMWARE_CHANGE,
+                "the connected board is not the one the update was started for",
+            );
+        }
+        let port = identity.device.port.clone();
+        let ifnum = identity.interface_number;
+        let tty = format!("/dev/{}", identity.tty);
+        let ctrl = self.env.controller.clone();
+        let (hw, fw) = blocking(move || {
+            let mut c = ctrl.lock();
+            (
+                to_map(c.read_info(HW_INFO_OPCODE)),
+                to_map(c.read_info(FW_INFO_OPCODE)),
+            )
+        })
+        .await
+        .unwrap_or((None, None));
+        self.record(|r| {
+            r.usb_port = Some(port.clone());
+            r.interface_number = Some(ifnum);
+            r.tty = Some(tty.clone());
+            r.before = BoardSnapshot {
+                usb: Some(identity.device.clone()),
+                hw_info: hw,
+                fw_info: fw,
+            };
+        })
+        .await;
+        if self.env.slot.cancel_requested() {
+            return End::cancelled("cancelled before the fans were touched");
+        }
+        if self.shutting_down() {
+            return self.interrupted();
+        }
+
+        // ── 2. Parking ────────────────────────────────────────────────────
+        self.enter(stage::PARKING, limits.park).await;
+        // [SAFETY] From here the engine and the thermal force leave the
+        // channels alone, or the profile would lower them again before the
+        // bootloader request. 100 % is the most either could ask for.
+        if !self.env.cache.suspend_openfan_writes(&self.run_id) {
+            return End::new(
+                outcome::NO_FIRMWARE_CHANGE,
+                "the update lost its claim on the controller",
+            );
+        }
+        for ch in 0..NUM_CHANNELS {
+            if self.env.slot.cancel_requested() {
+                return End::cancelled(
+                    "cancelled while parking the fans — they return to profile control",
+                );
+            }
+            let ctrl = self.env.controller.clone();
+            match blocking(move || ctrl.lock().set_pwm(ch, 100)).await {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => {
+                    return End::new(
+                        outcome::NO_FIRMWARE_CHANGE,
+                        format!("parking channel {ch} at 100 % failed ({e})"),
+                    )
+                }
+                None => {
+                    return End::new(
+                        outcome::NO_FIRMWARE_CHANGE,
+                        format!("parking channel {ch} at 100 % failed"),
+                    )
+                }
+            }
+        }
+        // The last point a cancel lands, decided with the request under one lock.
+        if self.env.slot.close_cancel_window() {
+            return End::cancelled(
+                "cancelled after parking the fans — they return to profile control",
+            );
+        }
+        if self.shutting_down() {
+            return self.interrupted();
+        }
+
+        // ── 3. Entering the bootloader ────────────────────────────────────
+        self.enter(stage::ENTERING_BOOTLOADER, limits.enter).await;
+        let loan = match port_loan::borrow(&self.env.lender, limits.borrow_wait).await {
+            Ok(loan) => loan,
+            Err(why) => {
+                return End::new(
+                    outcome::NO_FIRMWARE_CHANGE,
+                    format!("the port could not be borrowed: {}", why.describe()),
+                )
+            }
+        };
+        self.handle = Some(loan.handle);
+        // Journaled before the command goes out: from here the board may be in
+        // its bootloader whatever happens next.
+        self.record(|r| {
+            r.bootloader_requested = true;
+            r.bootloader_trigger = Some(">07".into());
+        })
+        .await;
+        if let Some(claim) = &self.claim {
+            claim.mark_bootloader_requested();
+        }
+        let mut lent = loan.transport;
+        let (lent, sent) = blocking(move || {
+            let sent = lent.write_line(&encode_bare(JUMP_TO_BOOTLOADER_OPCODE));
+            (lent, sent)
+        })
+        .await
+        .map_or(
+            (
+                None,
+                Err(SerialError::Protocol {
+                    message: "the write task failed".into(),
+                }),
+            ),
+            |(t, s)| (Some(t), s),
+        );
+        self.port = lent;
+        if let Err(e) = sent {
+            self.note(format!("sending >07 failed ({e})")).await;
+        }
+
+        let (p, s) = (port.clone(), serial.clone());
+        let left = move |sys: &Path| (port_holds(sys, &p, &s) != PortHolds::Board).then_some(());
+        let mut gone = match self.watch_sysfs(limits.trigger_wait, left.clone()).await {
+            Watched::Found(()) => true,
+            Watched::Deadline => false,
+            Watched::Shutdown => return self.interrupted(),
+        };
+        if !gone {
+            // Still in normal mode: the 1200-baud signal, on the same port.
+            self.record(|r| r.bootloader_trigger = Some("1200_baud".into()))
+                .await;
+            if let Some(held) = self.port.take() {
+                match blocking(move || held.touch_1200_baud()).await {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => {
+                        self.note(format!("the 1200-baud signal failed ({e})"))
+                            .await
+                    }
+                    None => self.note("the 1200-baud signal failed").await,
+                }
+            }
+            gone = match self.watch_sysfs(limits.trigger_wait, left).await {
+                Watched::Found(()) => true,
+                Watched::Deadline => false,
+                Watched::Shutdown => return self.interrupted(),
+            };
+        }
+        if !gone {
+            return self
+                .in_firmware(&tty, "the board did not leave normal mode")
+                .await;
+        }
+        let (p, s) = (port.clone(), serial.clone());
+        let appeared = move |sys: &Path| match port_holds(sys, &p, &s) {
+            PortHolds::Bootloader => Some(Landed::Bootloader),
+            PortHolds::Board => usb::tty_for(sys, &p, ifnum).map(Landed::Firmware),
+            PortHolds::Other | PortHolds::Empty => None,
+        };
+        match self.watch_sysfs(limits.bootloader_wait, appeared).await {
+            Watched::Found(Landed::Bootloader) => {}
+            Watched::Found(Landed::Firmware(tty)) => {
+                // It restarted, but into its firmware. The port the run held
+                // went with the device it was opened on: reopen.
+                self.drop_port().await;
+                return self
+                    .in_firmware(
+                        &tty,
+                        "the board restarted into its firmware instead of its bootloader",
+                    )
+                    .await;
+            }
+            Watched::Deadline => {
+                return End::new(
+                    outcome::NEEDS_RECOVERY,
+                    "the board left normal mode, but no bootloader appeared on its USB port",
+                )
+            }
+            Watched::Shutdown => return self.interrupted(),
+        }
+        // [SAFETY] From here the fans' settings are unknown to the daemon.
+        self.env.cache.invalidate_openfan_writes();
+        self.record(|r| r.bootloader_seen = true).await;
+        self.drop_port().await;
+
+        // ── 4–5. Waiting for the file, then for the board ─────────────────
+        // One file wait however often the board goes back to its bootloader:
+        // a return resumes it rather than starting it again, and only so many
+        // returns are waited through.
+        let file_deadline = Instant::now() + limits.file_wait;
+        let mut returns: u32 = 0;
+        let returned_tty = loop {
+            self.enter_until(stage::WAITING_FOR_FILE, file_deadline)
+                .await;
+            let (p, sys) = (port.clone(), self.env.sys_root.clone());
+            let drives = blocking(move || {
+                let ours = usb::block_devices_of(&sys, &p).into_iter().next();
+                let others: Vec<String> = usb::bootloaders(&sys)
+                    .into_iter()
+                    .filter(|d| d.port != p)
+                    .flat_map(|d| usb::block_devices_of(&sys, &d.port))
+                    .collect();
+                (ours, others)
+            })
+            .await;
+            if let Some((ours, others)) = drives {
+                self.record(|r| {
+                    r.bootloader_drive = ours;
+                    r.other_bootloader_drives = others;
+                })
+                .await;
+            }
+            let (p, s) = (port.clone(), serial.clone());
+            let drive_gone =
+                move |sys: &Path| (port_holds(sys, &p, &s) != PortHolds::Bootloader).then_some(());
+            let file_left = file_deadline.saturating_duration_since(Instant::now());
+            match self.watch_sysfs(file_left, drive_gone).await {
+                Watched::Found(()) => {}
+                Watched::Deadline => return End::new(
+                    outcome::NEEDS_RECOVERY,
+                    "no firmware file was copied in time — the board is still in its bootloader",
+                ),
+                Watched::Shutdown => return self.interrupted(),
+            }
+
+            self.enter(stage::WAITING_FOR_RETURN, limits.return_wait)
+                .await;
+            let (p, s) = (port.clone(), serial.clone());
+            let back = move |sys: &Path| match port_holds(sys, &p, &s) {
+                PortHolds::Board => usb::tty_for(sys, &p, ifnum).map(Back::Board),
+                PortHolds::Bootloader => Some(Back::Bootloader),
+                PortHolds::Other | PortHolds::Empty => None,
+            };
+            match self.watch_sysfs(limits.return_wait, back).await {
+                Watched::Found(Back::Board(tty)) => break tty,
+                Watched::Found(Back::Bootloader) => {
+                    returns += 1;
+                    if returns >= constants::OPENFAN_MAINT_MAX_BOOTLOADER_RETURNS {
+                        return End::new(
+                            outcome::NEEDS_RECOVERY,
+                            format!(
+                                "the board went back to its bootloader {returns} times after its \
+                                 drive went away — it is still in its bootloader"
+                            ),
+                        );
+                    }
+                    self.note(
+                        "the board went back to its bootloader — the copied file may not have \
+                         started; waiting for a file again",
+                    )
+                    .await;
+                }
+                Watched::Deadline => {
+                    return End::new(
+                        outcome::FIRMWARE_COPIED_BOARD_NOT_BACK,
+                        "the board did not come back after its drive went away",
+                    )
+                }
+                Watched::Shutdown => return self.interrupted(),
+            }
+        };
+
+        // ── 6. Checking ───────────────────────────────────────────────────
+        self.enter(stage::CHECKING, limits.check_wait).await;
+        let (p, sys) = (port.clone(), self.env.sys_root.clone());
+        let after_usb = blocking(move || usb::device_at(&sys, &p)).await.flatten();
+        self.record(|r| r.tty = Some(returned_tty.clone())).await;
+        let deadline = Instant::now() + limits.check_wait;
+        let timeout = self.env.serial_timeout;
+        let transport = loop {
+            let (open, path) = (self.env.open.clone(), returned_tty.clone());
+            let attempt = blocking(move || {
+                let mut t = open(&path, timeout)?;
+                verify_openfan_identity(&mut *t, timeout)?;
+                Ok::<_, SerialError>(t)
+            })
+            .await;
+            let last_error = match attempt {
+                Some(Ok(t)) => break t,
+                Some(Err(e)) => e.to_string(),
+                None => "the open task failed".to_string(),
+            };
+            if Instant::now() >= deadline {
+                return End::new(
+                    outcome::FIRMWARE_COPIED_BOARD_NOT_BACK,
+                    format!(
+                        "the board came back (its USB identity matches) but does not answer \
+                         Control-OFC's commands ({last_error})"
+                    ),
+                );
+            }
+            if !self.pause(limits.check_retry).await {
+                return self.interrupted();
+            }
+        };
+        // Journaled before anything else: from here an interruption leaves a
+        // board that answers, not one that needs recovering.
+        self.record(|r| r.board_answered = true).await;
+        if let Some(claim) = &self.claim {
+            claim.mark_board_answered();
+        }
+        let read = blocking(move || {
+            let mut t = transport;
+            let hw = to_map(read_info_block(&mut *t, HW_INFO_OPCODE, timeout));
+            let fw = to_map(read_info_block(&mut *t, FW_INFO_OPCODE, timeout));
+            (t, hw, fw)
+        })
+        .await;
+        let Some((transport, hw, fw)) = read else {
+            return End::new(
+                outcome::FIRMWARE_COPIED_BOARD_NOT_BACK,
+                "reading the returned board's information failed",
+            );
+        };
+        let after = BoardSnapshot {
+            usb: after_usb,
+            hw_info: hw,
+            fw_info: fw,
+        };
+        let verdict = self
+            .record(|r| {
+                r.evidence = Some(evidence::compare(&r.before, &after, &r.firmware));
+                r.after = Some(after);
+            })
+            .await
+            .and_then(|r| r.evidence)
+            .map(|e| e.verdict)
+            .unwrap_or_else(|| evidence::INCONCLUSIVE.to_string());
+
+        // ── 7. Restoring control ──────────────────────────────────────────
+        self.enter(stage::RESTORING_CONTROL, limits.restore_wait)
+            .await;
+        // The board restarted: nothing it held before is known to it now.
+        self.env.cache.invalidate_openfan_writes();
+        let known: Vec<u8> = self.env.cache.read_with(|s| {
+            s.openfan_fans
+                .values()
+                .filter(|f| f.rpm_polled)
+                .map(|f| f.channel)
+                .collect()
+        });
+        let polls_before = self.env.cache.openfan_polls_started();
+        let Some(handle) = self.handle.take() else {
+            return End::new(
+                outcome::BOARD_BACK_CONTROL_NOT_RESTORED,
+                "the loan was lost before the hand-back",
+            );
+        };
+        let settled = handle
+            .give_back(
+                LoanReturn::Port {
+                    transport,
+                    path: returned_tty.clone(),
+                },
+                limits.borrow_wait,
+            )
+            .await;
+        if !settled {
+            if self.shutting_down() {
+                return self.interrupted();
+            }
+            return End::new(
+                outcome::BOARD_BACK_CONTROL_NOT_RESTORED,
+                "the poll loop did not take the port back",
+            );
+        }
+        // Only now: the port is in the slot, so a write lands instead of failing.
+        self.env.cache.resume_openfan_writes(&self.run_id);
+        let expected = (self.env.expected_channels)();
+        let deadline = Instant::now() + limits.restore_wait;
+        loop {
+            let landed = self.env.cache.read_with(|s| {
+                expected.iter().all(|ch| {
+                    s.openfan_fans
+                        .get(ch)
+                        .is_some_and(|f| f.last_commanded_pwm.is_some())
+                }) && known.iter().all(|ch| {
+                    s.openfan_fans
+                        .get(ch)
+                        .is_some_and(|f| f.poll_seq > polls_before)
+                })
+            });
+            if landed {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return End::new(
+                    outcome::BOARD_BACK_CONTROL_NOT_RESTORED,
+                    "the board answers, but the fan settings did not land in time — the engine \
+                     keeps retrying",
+                );
+            }
+            if !self.pause(limits.sysfs_poll).await {
+                return self.interrupted();
+            }
+        }
+        if verdict == evidence::PREVIOUS_FIRMWARE {
+            End::new(
+                outcome::BACK_ON_PREVIOUS_FIRMWARE,
+                "control is restored, but the board reports the firmware it ran before — the \
+                 update was not applied",
+            )
+        } else {
+            End::new(
+                outcome::COMPLETED_BUILD_NOT_CONFIRMED,
+                "control is restored; the evidence is shown, but no check can prove which exact \
+                 build is running",
+            )
+        }
+    }
+
+    /// The board is in its firmware without having reached its bootloader:
+    /// confirm it answers — on the port the run holds, or reopened on `tty` —
+    /// and hand that back, or nothing. Either way no firmware changed.
+    async fn in_firmware(&mut self, tty: &str, what: &str) -> End {
+        let (held, open, path) = (self.port.take(), self.env.open.clone(), tty.to_string());
+        let timeout = self.env.serial_timeout;
+        let checked = blocking(move || {
+            let mut t = match held {
+                Some(t) => t,
+                None => open(&path, timeout)?,
+            };
+            verify_openfan_identity(&mut *t, timeout)?;
+            Ok::<_, SerialError>(t)
+        })
+        .await;
+        let Some(handle) = self.handle.take() else {
+            return End::new(outcome::NO_FIRMWARE_CHANGE, what);
+        };
+        let wait = self.env.limits.borrow_wait;
+        match checked {
+            Some(Ok(t)) => {
+                handle
+                    .give_back(
+                        LoanReturn::Port {
+                            transport: t,
+                            path: tty.to_string(),
+                        },
+                        wait,
+                    )
+                    .await;
+                End::new(
+                    outcome::NO_FIRMWARE_CHANGE,
+                    format!("{what}; it answers, and control resumes"),
+                )
+            }
+            _ => {
+                handle.give_back(LoanReturn::Nothing, wait).await;
+                End::new(
+                    outcome::NO_FIRMWARE_CHANGE,
+                    format!("{what}, and it does not answer — the daemon is reconnecting to it"),
+                )
+            }
+        }
+    }
+
+    /// Close the port the run holds, if any, without waiting for its output.
+    async fn drop_port(&mut self) {
+        if let Some(mut old) = self.port.take() {
+            blocking(move || {
+                old.discard_pending_output();
+                drop(old);
+            })
+            .await;
+        }
+    }
+
+    /// Every exit: the journal, then the port or nothing, then the claim.
+    async fn conclude(mut self, end: End) {
+        let detail = end.detail.clone();
+        let finished = self
+            .record(|r| {
+                finish_record(r, end.outcome, detail, end.interrupted);
+                r.cancelled = end.cancelled;
+            })
+            .await;
+        let at = finished.map(|r| r.stage).unwrap_or_default();
+        if outcome::needs_recovery(end.outcome) {
+            log::warn!(
+                "OpenFan firmware update {} ended during {at}: {} — {}",
+                self.run_id,
+                end.outcome,
+                end.detail
+            );
+        } else {
+            log::info!(
+                "OpenFan firmware update {} ended during {at}: {} — {}",
+                self.run_id,
+                end.outcome,
+                end.detail
+            );
+        }
+        if let Some(handle) = self.handle.take() {
+            self.drop_port().await;
+            handle
+                .give_back(LoanReturn::Nothing, self.env.limits.borrow_wait)
+                .await;
+        }
+        let recovery = outcome::needs_recovery(end.outcome).then_some(end.outcome);
+        if let Some(claim) = self.claim.take() {
+            claim.release(recovery);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! A run end to end against a board on the bench: its USB identity moves
+    //! in a sysfs fixture the way the kernel's does, the real poll loop lends
+    //! and takes back its port, and the board answers what the firmware
+    //! answers. Real time, short limits; every wait is bounded.
+    use super::*;
+    use crate::health::state::OpenFanLink;
+    use crate::openfan_maintenance::journal::JOURNAL_FILE;
+    use crate::openfan_maintenance::{CancelOutcome, FirmwareClaim};
+    use crate::serial::port_loan::loan_channel;
+    use crate::serial::usb_identity::fixture::{descriptors, Sysfs};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+
+    const USB_PORT: &str = "8-8";
+    const SERIAL: &str = "DE615CB14721492C";
+    const TTY: &str = "/dev/ttyACM91";
+    /// The descriptor tags of the firmware the board runs, and of the file.
+    const OLD: u8 = 0x80;
+    const NEW: u8 = 0x81;
+    const SERIAL_TIMEOUT: Duration = Duration::from_millis(50);
+    const POLL: Duration = Duration::from_millis(20);
+    /// How long the bench takes to re-enumerate, as the kernel does.
+    const REENUMERATE: Duration = Duration::from_millis(40);
+    const RUN: &str = "ofmaint-test";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Mode {
+        Firmware,
+        Bootloader,
+        Away,
+    }
+
+    /// What a trigger (`>07`, or the 1200-baud signal) does to the board.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum OnTrigger {
+        Bootloader,
+        /// Restarts into its firmware.
+        Restart,
+        /// Leaves USB and never comes back.
+        Vanish,
+        Nothing,
+    }
+
+    struct Board {
+        sys: Sysfs,
+        mode: parking_lot::Mutex<Mode>,
+        /// Bumped by every re-enumeration; a port opened before is dead.
+        generation: AtomicUsize,
+        /// The firmware it runs: descriptor tag and `FW_REV`.
+        firmware: parking_lot::Mutex<(u8, &'static str)>,
+        on_jump: parking_lot::Mutex<OnTrigger>,
+        on_1200: parking_lot::Mutex<OnTrigger>,
+        answers: AtomicBool,
+        /// A channel whose `>02` the firmware never acknowledges.
+        deaf_channel: parking_lot::Mutex<Option<u8>>,
+        frames: parking_lot::Mutex<Vec<String>>,
+        touches: AtomicUsize,
+        opened: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl Board {
+        fn new() -> Arc<Self> {
+            let board = Arc::new(Self {
+                sys: Sysfs::new(),
+                mode: parking_lot::Mutex::new(Mode::Away),
+                generation: AtomicUsize::new(0),
+                firmware: parking_lot::Mutex::new((OLD, "01")),
+                on_jump: parking_lot::Mutex::new(OnTrigger::Bootloader),
+                on_1200: parking_lot::Mutex::new(OnTrigger::Bootloader),
+                answers: AtomicBool::new(true),
+                deaf_channel: parking_lot::Mutex::new(None),
+                frames: parking_lot::Mutex::new(Vec::new()),
+                touches: AtomicUsize::new(0),
+                opened: parking_lot::Mutex::new(Vec::new()),
+            });
+            board.boot();
+            board
+        }
+
+        fn mode(&self) -> Mode {
+            *self.mode.lock()
+        }
+
+        fn leave(&self) {
+            self.generation.fetch_add(1, SeqCst);
+            self.sys.remove_device(USB_PORT);
+            *self.mode.lock() = Mode::Away;
+        }
+
+        /// Enumerate running its firmware.
+        fn boot(&self) {
+            self.leave();
+            let tag = self.firmware.lock().0;
+            self.sys
+                .add_openfan(USB_PORT, SERIAL, tag, "ttyACM91", "ttyACM92");
+            *self.mode.lock() = Mode::Firmware;
+        }
+
+        fn enter_bootloader(&self) {
+            self.leave();
+            self.sys.add_bootloader(USB_PORT, "sdx");
+            *self.mode.lock() = Mode::Bootloader;
+        }
+
+        /// The user copies a file: the bootloader writes it and restarts.
+        fn copy_file(&self, tag: u8, fw_rev: &'static str) {
+            assert_eq!(self.mode(), Mode::Bootloader, "the drive must be there");
+            *self.firmware.lock() = (tag, fw_rev);
+            self.boot();
+        }
+
+        /// Leave USB now and come back as `what` once the kernel has caught up.
+        fn trigger(self: &Arc<Self>, what: OnTrigger) {
+            if what == OnTrigger::Nothing {
+                return;
+            }
+            self.leave();
+            let board = self.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(REENUMERATE);
+                match what {
+                    OnTrigger::Bootloader => board.enter_bootloader(),
+                    OnTrigger::Restart => board.boot(),
+                    OnTrigger::Vanish | OnTrigger::Nothing => {}
+                }
+            });
+        }
+
+        fn port(self: &Arc<Self>) -> Box<dyn SerialTransport + Send> {
+            Box::new(BenchPort {
+                board: self.clone(),
+                generation: self.generation.load(SeqCst),
+                replies: VecDeque::new(),
+            })
+        }
+
+        /// What the production opener does: open the node, if it is there.
+        fn open(
+            self: &Arc<Self>,
+            path: &str,
+        ) -> Result<Box<dyn SerialTransport + Send>, SerialError> {
+            self.opened.lock().push(path.to_string());
+            if self.mode() == Mode::Firmware && path == TTY {
+                Ok(self.port())
+            } else {
+                Err(SerialError::Protocol {
+                    message: format!("{path}: no such device"),
+                })
+            }
+        }
+
+        /// The poll loop's reconnect: open and identify, as production does.
+        fn reconnect(
+            self: &Arc<Self>,
+            timeout: Duration,
+        ) -> Option<Box<dyn SerialTransport + Send>> {
+            if self.mode() != Mode::Firmware {
+                return None;
+            }
+            let mut port = self.port();
+            verify_openfan_identity(&mut *port, timeout).ok()?;
+            Some(port)
+        }
+
+        fn sent(&self, frame: &str) -> usize {
+            self.frames
+                .lock()
+                .iter()
+                .filter(|f| f.as_str() == frame)
+                .count()
+        }
+    }
+
+    struct BenchPort {
+        board: Arc<Board>,
+        generation: usize,
+        replies: VecDeque<String>,
+    }
+
+    impl BenchPort {
+        fn live(&self) -> bool {
+            self.board.generation.load(SeqCst) == self.generation
+                && self.board.mode() == Mode::Firmware
+        }
+    }
+
+    impl SerialTransport for BenchPort {
+        fn write_line(&mut self, data: &str) -> Result<(), SerialError> {
+            if !self.live() {
+                return Err(SerialError::Protocol {
+                    message: "the device has gone".into(),
+                });
+            }
+            self.board.frames.lock().push(data.trim_end().to_string());
+            if !self.board.answers.load(SeqCst) {
+                return Ok(());
+            }
+            let body = data.trim_start_matches('>').trim_end();
+            match &body[..2] {
+                "07" => {
+                    let what = *self.board.on_jump.lock();
+                    self.board.trigger(what);
+                }
+                "05" => self
+                    .replies
+                    .extend(["<05|", "HW_REV:03", "MCU:PICO2040", ""].map(|l| format!("{l}\r\n"))),
+                "06" => {
+                    let rev = self.board.firmware.lock().1;
+                    self.replies.extend([
+                        format!("<06|FW_REV:{rev}\r\n"),
+                        "PROTOCOL_VERSION:01\r\n".into(),
+                        "\r\n".into(),
+                    ]);
+                }
+                "02" if u8::from_str_radix(&body[2..4], 16).ok()
+                    == *self.board.deaf_channel.lock() => {}
+                _ => self
+                    .replies
+                    .push_back(crate::serial::protocol::firmware_echo_for(data)),
+            }
+            Ok(())
+        }
+
+        fn read_line(&mut self, _timeout: Duration) -> Result<String, SerialError> {
+            if !self.live() {
+                return Err(SerialError::Protocol {
+                    message: "the device has gone".into(),
+                });
+            }
+            self.replies
+                .pop_front()
+                .ok_or(SerialError::Timeout { timeout_ms: 1 })
+        }
+
+        fn touch_1200_baud(self: Box<Self>) -> Result<(), SerialError> {
+            self.board.touches.fetch_add(1, SeqCst);
+            if !self.live() {
+                return Err(SerialError::Protocol {
+                    message: "the device has gone".into(),
+                });
+            }
+            let what = *self.board.on_1200.lock();
+            self.board.trigger(what);
+            Ok(())
+        }
+    }
+
+    fn quick() -> StageLimits {
+        StageLimits {
+            borrow_wait: Duration::from_secs(2),
+            prepare: Duration::from_secs(5),
+            park: Duration::from_secs(5),
+            trigger_wait: Duration::from_millis(300),
+            bootloader_wait: Duration::from_secs(2),
+            enter: Duration::from_secs(10),
+            file_wait: Duration::from_secs(10),
+            return_wait: Duration::from_secs(3),
+            check_wait: Duration::from_secs(1),
+            restore_wait: Duration::from_secs(3),
+            sysfs_poll: Duration::from_millis(10),
+            check_retry: Duration::from_millis(20),
+        }
+    }
+
+    /// The file the GUI described: the new build's descriptor and `FW_REV`.
+    fn the_file() -> FirmwareClaim {
+        let config: String = descriptors(NEW)[18..]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        FirmwareClaim {
+            sha256: "ab".repeat(32),
+            size: 107_520,
+            usb_config_descriptor_hex: Some(config),
+            info: Some(BTreeMap::from([("FW_REV".to_string(), "02".to_string())])),
+        }
+    }
+
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    struct Bench {
+        board: Arc<Board>,
+        cache: Arc<StateCache>,
+        slot: Arc<MaintenanceSlot>,
+        ctrl: Arc<Mutex<FanController>>,
+        lender: LoanSender,
+        stop: watch::Sender<bool>,
+        poll: tokio::task::JoinHandle<()>,
+        journal: tempfile::TempDir,
+    }
+
+    impl Drop for Bench {
+        fn drop(&mut self) {
+            let _ = self.stop.send(true);
+            self.poll.abort();
+        }
+    }
+
+    impl Bench {
+        /// A board adopted on `TTY`, its poll loop running.
+        async fn new(board: Arc<Board>) -> Self {
+            let cache = Arc::new(StateCache::new());
+            cache.set_openfan_port(TTY);
+            let shared = Arc::new(Mutex::new(board.port()));
+            let ctrl = Arc::new(Mutex::new(FanController::new_shared(
+                shared.clone(),
+                cache.clone(),
+                SERIAL_TIMEOUT,
+            )));
+            let (lender, loans) = loan_channel();
+            let (stop, stop_rx) = watch::channel(false);
+            let b = board.clone();
+            let poll = tokio::spawn(crate::polling::openfan_poll_loop_with(
+                cache.clone(),
+                shared,
+                SERIAL_TIMEOUT,
+                POLL,
+                stop_rx,
+                move |_: &Arc<StateCache>, t: Duration| b.reconnect(t),
+                loans,
+                |_: &str| {},
+            ));
+            let c = cache.clone();
+            wait_until("the first polls", || {
+                c.openfan_link() == Some(OpenFanLink::Connected)
+                    && c.read_with(|s| s.openfan_fans.len()) == NUM_CHANNELS as usize
+            })
+            .await;
+            Self {
+                board,
+                cache,
+                slot: Arc::new(MaintenanceSlot::default()),
+                ctrl,
+                lender,
+                stop,
+                poll,
+                journal: tempfile::tempdir().unwrap(),
+            }
+        }
+
+        fn journal_path(&self) -> PathBuf {
+            self.journal.path().join(JOURNAL_FILE)
+        }
+
+        fn env(&self, limits: StageLimits, expected: ExpectedChannels) -> RunEnv {
+            let board = self.board.clone();
+            RunEnv {
+                cache: self.cache.clone(),
+                slot: self.slot.clone(),
+                controller: self.ctrl.clone(),
+                lender: self.lender.clone(),
+                sys_root: self.board.sys.root().to_path_buf(),
+                journal_path: self.journal_path(),
+                limits,
+                serial_timeout: SERIAL_TIMEOUT,
+                open: Arc::new(move |path: &str, _: Duration| board.open(path)),
+                expected_channels: expected,
+                shutdown: self.stop.subscribe(),
+            }
+        }
+
+        /// Claim and record as the handler does — but not yet spawn.
+        fn claim(&self) -> (ClaimGuard, AliveGuard) {
+            self.cache
+                .try_begin_openfan_maintenance(RUN, stage::PREPARING)
+                .expect("the bench's controller is free and connected");
+            let claim = ClaimGuard::new(self.cache.clone(), RUN.into());
+            let alive = self.slot.claim().expect("no run yet");
+            self.slot.set_record(MaintenanceRecord::new(
+                RUN.into(),
+                SERIAL.into(),
+                the_file(),
+            ));
+            (claim, alive)
+        }
+
+        fn start_with(
+            &self,
+            limits: StageLimits,
+            expected: ExpectedChannels,
+        ) -> tokio::task::JoinHandle<()> {
+            let (claim, alive) = self.claim();
+            spawn(self.env(limits, expected), claim, alive)
+        }
+
+        fn start(&self) -> tokio::task::JoinHandle<()> {
+            self.start_with(quick(), Arc::new(Vec::new))
+        }
+
+        fn record(&self) -> MaintenanceRecord {
+            self.slot.record().expect("a run was started")
+        }
+
+        async fn reached(&self, stage: &str) {
+            let slot = self.slot.clone();
+            wait_until(&format!("stage {stage}"), || {
+                slot.record().is_some_and(|r| r.stage == stage)
+            })
+            .await;
+        }
+
+        async fn finish(&self, run: tokio::task::JoinHandle<()>) -> MaintenanceRecord {
+            tokio::time::timeout(Duration::from_secs(20), run)
+                .await
+                .expect("the run must end")
+                .expect("the supervisor must not fail");
+            let record = self.record();
+            assert_eq!(record.state, STATE_FINISHED);
+            assert_eq!(
+                journal::load(&self.journal_path()).as_ref(),
+                Some(&record),
+                "the journal holds what the run ended with"
+            );
+            record
+        }
+
+        fn polls_since(&self, before: u64) -> bool {
+            self.cache
+                .read_with(|s| s.openfan_fans.values().all(|f| f.poll_seq > before))
+        }
+    }
+
+    fn park_frame(ch: u8) -> String {
+        format!(">02{ch:02X}{:02X}", crate::pwm::percent_to_raw(100))
+    }
+
+    #[tokio::test]
+    async fn a_full_update_parks_hands_the_port_out_and_back_and_restores_control() {
+        let bench = Bench::new(Board::new()).await;
+        let run = bench.start();
+        bench.reached(stage::WAITING_FOR_FILE).await;
+
+        // Parked, then the bootloader asked for — once, and with `>07` alone.
+        for ch in 0..NUM_CHANNELS {
+            assert_eq!(
+                bench.board.sent(&park_frame(ch)),
+                1,
+                "channel {ch} parked at 100 %"
+            );
+        }
+        assert_eq!(bench.board.sent(">07"), 1);
+        assert_eq!(
+            bench.board.touches.load(SeqCst),
+            0,
+            "the 1200-baud signal is a fallback only"
+        );
+        let r = bench.record();
+        assert!(r.bootloader_requested && r.bootloader_seen);
+        assert_eq!(r.bootloader_trigger.as_deref(), Some(">07"));
+        assert_eq!(r.bootloader_drive.as_deref(), Some("sdx"));
+        assert_eq!(r.usb_port.as_deref(), Some(USB_PORT));
+        assert_eq!(r.interface_number, Some(0));
+        assert!(!r.cancellable);
+        // [SAFETY] Writes are suspended, the port is out, the force stays off it.
+        assert!(bench.cache.openfan_writes_suspended());
+        let err = bench.ctrl.lock().set_pwm(0, 50).unwrap_err().to_string();
+        assert!(err.contains("firmware update"), "{err}");
+        assert_eq!(
+            bench.slot.request_cancel(),
+            CancelOutcome::TooLate,
+            "no cancel once the board was asked to leave"
+        );
+
+        // The user copies the file.
+        let polls_before = bench.cache.openfan_polls_started();
+        bench.board.copy_file(NEW, "02");
+        let r = bench.finish(run).await;
+
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some(outcome::COMPLETED_BUILD_NOT_CONFIRMED)
+        );
+        assert!(r.board_answered && !r.interrupted && !r.cancelled);
+        let ev = r.evidence.expect("evidence");
+        assert_eq!(ev.verdict, evidence::CONSISTENT_WITH_FILE);
+        assert_eq!(ev.descriptor_changed, Some(true));
+        assert_eq!(ev.info_matches_file, Some(true));
+        assert_eq!(
+            r.after
+                .and_then(|a| a.fw_info)
+                .and_then(|i| i.get("FW_REV").cloned()),
+            Some("02".to_string())
+        );
+        assert_eq!(
+            *bench.board.opened.lock(),
+            vec![TTY.to_string()],
+            "one open, of the interface the daemon was using"
+        );
+        // Control is back: the claim is gone, writes land, polls run on the new port.
+        assert!(bench.cache.openfan_maintenance().is_none());
+        assert!(!bench.cache.openfan_writes_suspended());
+        assert_eq!(bench.cache.openfan_link(), Some(OpenFanLink::Connected));
+        assert!(bench.polls_since(polls_before));
+        bench
+            .ctrl
+            .lock()
+            .set_pwm(0, 50)
+            .expect("a write lands again");
+    }
+
+    #[tokio::test]
+    async fn a_board_that_ignores_07_gets_the_1200_baud_signal_on_the_same_port() {
+        let board = Board::new();
+        *board.on_jump.lock() = OnTrigger::Nothing;
+        let bench = Bench::new(board).await;
+        let opened_before = bench.board.opened.lock().len();
+        let run = bench.start();
+        bench.reached(stage::WAITING_FOR_FILE).await;
+        assert_eq!(bench.board.sent(">07"), 1);
+        assert_eq!(bench.board.touches.load(SeqCst), 1);
+        assert_eq!(
+            bench.board.opened.lock().len(),
+            opened_before,
+            "the signal goes down the port it borrowed — nothing is opened for it"
+        );
+        assert_eq!(
+            bench.record().bootloader_trigger.as_deref(),
+            Some("1200_baud")
+        );
+        bench.board.copy_file(NEW, "02");
+        let r = bench.finish(run).await;
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some(outcome::COMPLETED_BUILD_NOT_CONFIRMED)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_board_that_never_leaves_normal_mode_is_handed_back_unchanged() {
+        let board = Board::new();
+        *board.on_jump.lock() = OnTrigger::Nothing;
+        *board.on_1200.lock() = OnTrigger::Nothing;
+        let bench = Bench::new(board).await;
+        let r = bench.finish(bench.start()).await;
+        assert_eq!(r.outcome.as_deref(), Some(outcome::NO_FIRMWARE_CHANGE));
+        assert!(r.bootloader_requested && !r.bootloader_seen);
+        let detail = r.outcome_detail.unwrap();
+        assert!(
+            detail.contains("did not leave normal mode") && detail.contains("it answers"),
+            "{detail}"
+        );
+        assert_eq!(
+            *bench.board.opened.lock(),
+            vec![TTY.to_string()],
+            "the 1200-baud signal closed the port, so it is reopened once"
+        );
+        assert!(bench.cache.openfan_maintenance().is_none());
+        assert!(!bench.cache.openfan_writes_suspended());
+        let polls = bench.cache.openfan_polls_started();
+        let b = &bench;
+        wait_until("polls on the returned port", || b.polls_since(polls)).await;
+    }
+
+    #[tokio::test]
+    async fn a_board_that_restarts_into_its_firmware_is_reopened_and_handed_back() {
+        let board = Board::new();
+        *board.on_jump.lock() = OnTrigger::Restart;
+        let bench = Bench::new(board).await;
+        let r = bench.finish(bench.start()).await;
+        assert_eq!(r.outcome.as_deref(), Some(outcome::NO_FIRMWARE_CHANGE));
+        assert!(!r.bootloader_seen);
+        assert_eq!(bench.board.touches.load(SeqCst), 0, "it left: no fallback");
+        assert!(r
+            .outcome_detail
+            .unwrap()
+            .contains("restarted into its firmware"));
+        assert_eq!(*bench.board.opened.lock(), vec![TTY.to_string()]);
+        assert!(bench.cache.openfan_maintenance().is_none());
+        assert_eq!(bench.cache.openfan_link(), Some(OpenFanLink::Connected));
+    }
+
+    #[tokio::test]
+    async fn a_board_that_vanishes_needs_recovery_until_it_answers_again() {
+        let board = Board::new();
+        *board.on_jump.lock() = OnTrigger::Vanish;
+        let bench = Bench::new(board).await;
+        let r = bench.finish(bench.start()).await;
+        assert_eq!(r.outcome.as_deref(), Some(outcome::NEEDS_RECOVERY));
+        // [SAFETY] Writes stay off and the claim is a recovery, not a release.
+        assert!(bench.cache.openfan_writes_suspended());
+        assert!(matches!(
+            bench.cache.openfan_maintenance(),
+            Some(crate::health::state::OpenFanMaintenance::NeedsRecovery { .. })
+        ));
+        assert!(
+            bench.ctrl.lock().set_pwm(0, 50).is_err(),
+            "the port was handed back as nothing"
+        );
+
+        // The user power-cycles it: the poll loop finds it, and that ends it.
+        bench.board.boot();
+        let c = bench.cache.clone();
+        wait_until("the reconnect", || c.openfan_maintenance().is_none()).await;
+        assert!(!bench.cache.openfan_writes_suspended());
+        assert_eq!(bench.cache.openfan_link(), Some(OpenFanLink::Connected));
+    }
+
+    #[tokio::test]
+    async fn no_file_copied_in_time_leaves_the_board_needing_recovery() {
+        let bench = Bench::new(Board::new()).await;
+        let limits = StageLimits {
+            file_wait: Duration::from_millis(300),
+            ..quick()
+        };
+        let r = bench
+            .finish(bench.start_with(limits, Arc::new(Vec::new)))
+            .await;
+        assert_eq!(r.outcome.as_deref(), Some(outcome::NEEDS_RECOVERY));
+        assert_eq!(r.stage, stage::WAITING_FOR_FILE);
+        assert!(r.bootloader_seen && !r.board_answered);
+        assert!(bench.cache.openfan_writes_suspended());
+    }
+
+    #[tokio::test]
+    async fn a_board_back_on_usb_that_does_not_answer_is_not_back() {
+        let bench = Bench::new(Board::new()).await;
+        let run = bench.start();
+        bench.reached(stage::WAITING_FOR_FILE).await;
+        bench.board.answers.store(false, SeqCst);
+        bench.board.copy_file(NEW, "02");
+        let r = bench.finish(run).await;
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some(outcome::FIRMWARE_COPIED_BOARD_NOT_BACK)
+        );
+        assert!(!r.board_answered);
+        let opened = bench.board.opened.lock().clone();
+        assert!(!opened.is_empty());
+        assert!(
+            opened.iter().all(|p| p == TTY),
+            "only the interface the daemon used is ever opened: {opened:?}"
+        );
+        let limits = quick();
+        let most = (limits.check_wait.as_millis() / limits.check_retry.as_millis()) as usize + 2;
+        assert!(
+            opened.len() <= most,
+            "{} opens, at most {most}",
+            opened.len()
+        );
+        assert!(bench.cache.openfan_writes_suspended());
+    }
+
+    #[tokio::test]
+    async fn a_board_that_goes_back_to_its_bootloader_is_noted_and_waited_for() {
+        let bench = Bench::new(Board::new()).await;
+        let run = bench.start();
+        bench.reached(stage::WAITING_FOR_FILE).await;
+        // The drive goes, and the bootloader comes back.
+        bench.board.leave();
+        bench.reached(stage::WAITING_FOR_RETURN).await;
+        bench.board.enter_bootloader();
+        let slot = bench.slot.clone();
+        wait_until("the note", || {
+            slot.record()
+                .is_some_and(|r| r.stage == stage::WAITING_FOR_FILE && !r.notes.is_empty())
+        })
+        .await;
+        bench.board.copy_file(NEW, "02");
+        let r = bench.finish(run).await;
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some(outcome::COMPLETED_BUILD_NOT_CONFIRMED)
+        );
+        assert!(r
+            .notes
+            .iter()
+            .any(|n| n.contains("went back to its bootloader")));
+        assert_eq!(
+            r.stages
+                .iter()
+                .filter(|s| s.stage == stage::WAITING_FOR_FILE)
+                .count(),
+            2
+        );
+    }
+
+    /// Returns to the bootloader are capped. Uncapped, a board (or a hub)
+    /// that kept re-enumerating held the controller, and grew the record and
+    /// its journal, for as long as it kept doing it.
+    #[tokio::test]
+    async fn a_board_that_keeps_going_back_to_its_bootloader_is_left_needing_recovery() {
+        let bench = Bench::new(Board::new()).await;
+        let run = bench.start();
+        let max = constants::OPENFAN_MAINT_MAX_BOOTLOADER_RETURNS as usize;
+        let waits = |r: &MaintenanceRecord| {
+            r.stages
+                .iter()
+                .filter(|s| s.stage == stage::WAITING_FOR_FILE)
+                .count()
+        };
+        for pass in 1..=max {
+            let slot = bench.slot.clone();
+            wait_until(&format!("file wait {pass}"), || {
+                slot.record()
+                    .is_some_and(|r| r.stage == stage::WAITING_FOR_FILE && waits(&r) == pass)
+            })
+            .await;
+            bench.board.leave();
+            bench.reached(stage::WAITING_FOR_RETURN).await;
+            bench.board.enter_bootloader();
+        }
+        let r = bench.finish(run).await;
+        assert_eq!(r.outcome.as_deref(), Some(outcome::NEEDS_RECOVERY));
+        assert!(
+            r.outcome_detail
+                .as_deref()
+                .is_some_and(|d| d.contains(&format!("{max} times"))),
+            "{:?}",
+            r.outcome_detail
+        );
+        assert_eq!(waits(&r), max, "no file wait after the last return");
+        assert!(
+            bench.cache.openfan_writes_suspended(),
+            "left needing recovery"
+        );
+    }
+
+    /// A return to the bootloader resumes the file wait rather than starting
+    /// it again — or every return bought the board a fresh limit.
+    #[tokio::test]
+    async fn a_return_to_the_bootloader_does_not_restart_the_file_wait() {
+        let bench = Bench::new(Board::new()).await;
+        let limits = StageLimits {
+            file_wait: Duration::from_millis(1500),
+            ..quick()
+        };
+        let run = bench.start_with(limits, Arc::new(Vec::new));
+        bench.reached(stage::WAITING_FOR_FILE).await;
+        let first = bench.record().stage_deadline_unix_ms.expect("a limit");
+        // Much of the wait goes by before the board goes back to its bootloader.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        bench.board.leave();
+        bench.reached(stage::WAITING_FOR_RETURN).await;
+        bench.board.enter_bootloader();
+        let slot = bench.slot.clone();
+        wait_until("the second file wait", || {
+            slot.record()
+                .is_some_and(|r| r.stage == stage::WAITING_FOR_FILE && !r.notes.is_empty())
+        })
+        .await;
+        let second = bench.record().stage_deadline_unix_ms.expect("a limit");
+        assert!(
+            second <= first + 50,
+            "the file wait started again: its limit moved {} ms",
+            second.saturating_sub(first)
+        );
+        // And it runs out at that first limit, no file having been copied.
+        let r = bench.finish(run).await;
+        assert_eq!(r.outcome.as_deref(), Some(outcome::NEEDS_RECOVERY));
+        let ended = r.finished_unix_ms.expect("finished");
+        assert!(
+            ended < first + 500,
+            "the wait ran {} ms past its limit",
+            ended.saturating_sub(first)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_firmware_back_again_is_reported_as_the_previous_one() {
+        let bench = Bench::new(Board::new()).await;
+        let run = bench.start();
+        bench.reached(stage::WAITING_FOR_FILE).await;
+        bench.board.copy_file(OLD, "01");
+        let r = bench.finish(run).await;
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some(outcome::BACK_ON_PREVIOUS_FIRMWARE)
+        );
+        assert_eq!(r.evidence.unwrap().verdict, evidence::PREVIOUS_FIRMWARE);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_before_the_port_is_borrowed_changes_nothing() {
+        let bench = Bench::new(Board::new()).await;
+        let (claim, alive) = bench.claim();
+        assert_eq!(bench.slot.request_cancel(), CancelOutcome::Requested);
+        let r = bench
+            .finish(spawn(bench.env(quick(), Arc::new(Vec::new)), claim, alive))
+            .await;
+        assert_eq!(r.outcome.as_deref(), Some(outcome::NO_FIRMWARE_CHANGE));
+        assert!(r.cancelled && !r.bootloader_requested);
+        assert_eq!(
+            bench.board.sent(&park_frame(0)),
+            0,
+            "cancelled before parking"
+        );
+        assert_eq!(bench.board.sent(">07"), 0);
+        assert!(bench.cache.openfan_maintenance().is_none());
+        assert!(!bench.cache.openfan_writes_suspended());
+    }
+
+    #[tokio::test]
+    async fn a_failed_park_changes_nothing_and_never_asks_for_the_bootloader() {
+        let board = Board::new();
+        *board.deaf_channel.lock() = Some(5);
+        let bench = Bench::new(board).await;
+        let r = bench.finish(bench.start()).await;
+        assert_eq!(r.outcome.as_deref(), Some(outcome::NO_FIRMWARE_CHANGE));
+        assert!(r.outcome_detail.unwrap().contains("channel 5"));
+        assert_eq!(bench.board.sent(">07"), 0);
+        assert!(!r.bootloader_requested);
+        assert!(bench.cache.openfan_maintenance().is_none());
+        assert!(
+            !bench.cache.openfan_writes_suspended(),
+            "the engine takes the channels back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_while_waiting_for_the_file_is_recorded_as_needing_recovery() {
+        let bench = Bench::new(Board::new()).await;
+        let run = bench.start();
+        bench.reached(stage::WAITING_FOR_FILE).await;
+        bench.stop.send(true).unwrap();
+        let r = bench.finish(run).await;
+        assert!(r.interrupted);
+        assert_eq!(r.outcome.as_deref(), Some(outcome::NEEDS_RECOVERY));
+        assert_eq!(r.stage, stage::WAITING_FOR_FILE);
+        assert!(bench.cache.openfan_writes_suspended());
+    }
+
+    #[tokio::test]
+    async fn settings_that_do_not_land_leave_control_not_restored_but_writes_on() {
+        let bench = Bench::new(Board::new()).await;
+        let limits = StageLimits {
+            restore_wait: Duration::from_millis(300),
+            ..quick()
+        };
+        // Channel 3 is the profile's, and nothing writes it on the bench.
+        let run = bench.start_with(limits, Arc::new(|| vec![3]));
+        bench.reached(stage::WAITING_FOR_FILE).await;
+        bench.board.copy_file(NEW, "02");
+        let r = bench.finish(run).await;
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some(outcome::BOARD_BACK_CONTROL_NOT_RESTORED)
+        );
+        assert!(
+            !bench.cache.openfan_writes_suspended() && bench.cache.openfan_maintenance().is_none(),
+            "the board answers: the engine keeps trying"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_restore_waits_for_the_profile_settings_to_land() {
+        let bench = Bench::new(Board::new()).await;
+        let run = bench.start_with(quick(), Arc::new(|| vec![3]));
+        bench.reached(stage::WAITING_FOR_FILE).await;
+        bench.board.copy_file(NEW, "02");
+        bench.reached(stage::RESTORING_CONTROL).await;
+        // The engine's next tick, once writes are back on.
+        let c = bench.cache.clone();
+        wait_until("writes back on", || !c.openfan_writes_suspended()).await;
+        assert!(!run.is_finished(), "it waits for channel 3");
+        bench.ctrl.lock().set_pwm(3, 40).unwrap();
+        let r = bench.finish(run).await;
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some(outcome::COMPLETED_BUILD_NOT_CONFIRMED)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_panics_is_recorded_and_its_claim_released() {
+        let bench = Bench::new(Board::new()).await;
+        let run = bench.start_with(quick(), Arc::new(|| panic!("injected")));
+        bench.reached(stage::WAITING_FOR_FILE).await;
+        bench.board.copy_file(NEW, "02");
+        let r = bench.finish(run).await;
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some(outcome::BOARD_BACK_CONTROL_NOT_RESTORED),
+            "it had answered: an internal error there is not a board to recover"
+        );
+        assert!(r
+            .outcome_detail
+            .unwrap()
+            .contains("internal error during restoring_control"));
+        assert!(bench.cache.openfan_maintenance().is_none());
+        assert!(!bench.cache.openfan_writes_suspended());
+        assert!(!bench.slot.is_alive(), "the next run may start");
+    }
+}

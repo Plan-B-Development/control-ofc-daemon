@@ -113,6 +113,8 @@ pub enum StartError {
     Unsatisfiable(String),
     /// The session could not be persisted.
     Persistence(String),
+    /// An OpenFan firmware update owns the controller (DEC-481).
+    OpenFanMaintenance,
 }
 
 /// What became of a client's marker or measurement (§5, §14).
@@ -427,6 +429,13 @@ impl ValidationEngine {
         let seeded = seed_watch(ctx);
 
         let mut slot = self.slot.lock();
+        // DEC-481: no session starts while a firmware update owns the OpenFan
+        // controller. Checked under the slot guard, which `is_recording` takes:
+        // an update claims first and checks `is_recording` second, so this
+        // check-then-install and that claim-then-check cannot both pass.
+        if ctx.cache.openfan_maintenance_running() {
+            return Err(StartError::OpenFanMaintenance);
+        }
         // DEC-335 §3.6: an operator ALWAYS wins over the background startup
         // recording. Without this, enabling `[startup] record_startup` would
         // make `POST /validation/session` return 409 for the first two minutes

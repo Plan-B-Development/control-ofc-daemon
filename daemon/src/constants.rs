@@ -41,6 +41,69 @@ pub const SERIAL_BAUD_RATE: u32 = 115_200;
 /// (e.g. `/dev/ttyACM0` through `/dev/ttyACM9`).
 pub const SERIAL_PROBE_RANGE: std::ops::Range<u8> = 0..10;
 
+// ── OpenFan firmware update (DEC-481) ────────────────────────────────
+//
+// Each stage's time limit. The update ends a stage at its limit itself; the
+// `openfan` health entry turns critical only once a stage has overrun its limit
+// by `OPENFAN_MAINT_OVERRUN_GRACE`, which means the update is stuck.
+
+/// Longest wait for the poll loop to answer a request for the port: one poll
+/// at the largest serial timeout the API accepts, plus the interval.
+pub const OPENFAN_MAINT_BORROW_WAIT: Duration = Duration::from_secs(5);
+
+/// Reading the board's identity and information blocks before anything else.
+pub const OPENFAN_MAINT_PREPARE_LIMIT: Duration = Duration::from_secs(10);
+
+/// Parking all ten channels at 100 %: ten writes at the serial timeout.
+pub const OPENFAN_MAINT_PARK_LIMIT: Duration = Duration::from_secs(15);
+
+/// After `>07`, how long the board has to leave normal mode before the
+/// 1200-baud signal is tried; and after that signal, as long again.
+pub const OPENFAN_MAINT_TRIGGER_WAIT: Duration = Duration::from_secs(5);
+
+/// Once the board has left normal mode, how long its bootloader has to appear
+/// on the same USB port.
+pub const OPENFAN_MAINT_BOOTLOADER_WAIT: Duration = Duration::from_secs(10);
+
+/// The whole bootloader-entry stage: the borrow, both triggers, the appearance.
+pub const OPENFAN_MAINT_ENTER_LIMIT: Duration = Duration::from_secs(
+    OPENFAN_MAINT_BORROW_WAIT.as_secs()
+        + 2 * OPENFAN_MAINT_TRIGGER_WAIT.as_secs()
+        + OPENFAN_MAINT_BOOTLOADER_WAIT.as_secs()
+        + 5,
+);
+
+/// How long the user has to copy the firmware file onto the `RPI-RP2` drive.
+/// One budget per run: a board that goes back to its bootloader resumes it,
+/// never starts it again.
+pub const OPENFAN_MAINT_FILE_WAIT: Duration = Duration::from_secs(15 * 60);
+
+/// How many times the board may go back to its bootloader after its drive went
+/// away before the update stops waiting and leaves it needing recovery. Each
+/// return is a copied file that did not start, or the device dropping off USB;
+/// uncapped, a board that kept doing it would hold the controller, and grow the
+/// run's record and journal, without end.
+pub const OPENFAN_MAINT_MAX_BOOTLOADER_RETURNS: u32 = 3;
+
+/// After the drive goes, how long the board has to come back running firmware.
+pub const OPENFAN_MAINT_RETURN_WAIT: Duration = Duration::from_secs(20);
+
+/// Opening the returned board and running the `>00` handshake, with retries.
+pub const OPENFAN_MAINT_CHECK_WAIT: Duration = Duration::from_secs(10);
+
+/// After the hand-back, how long the fan settings have to land.
+pub const OPENFAN_MAINT_RESTORE_WAIT: Duration = Duration::from_secs(10);
+
+/// How far past a stage's limit the health entry waits before calling the
+/// update stuck (critical) rather than in progress (warn).
+pub const OPENFAN_MAINT_OVERRUN_GRACE: Duration = Duration::from_secs(10);
+
+/// How often sysfs is re-read while the update watches the board.
+pub const OPENFAN_MAINT_SYSFS_POLL: Duration = Duration::from_millis(200);
+
+const _: () =
+    assert!(OPENFAN_MAINT_BOOTLOADER_WAIT.as_secs() >= OPENFAN_MAINT_TRIGGER_WAIT.as_secs());
+
 // ── GPU fan control ──────────────────────────────────────────────────
 
 /// Coalescing threshold for GPU fan writes. Writes within this

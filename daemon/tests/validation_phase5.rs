@@ -3733,3 +3733,28 @@ fn each_session_gets_a_fresh_power_baseline_without_start_touching_the_sampler()
          session-id key is not resetting the RAPL baseline (`P8-v`)"
     );
 }
+
+/// DEC-481: no session starts while an OpenFan firmware update holds the
+/// controller — decided under the recorder's slot lock — and one may once it
+/// has handed the controller back.
+#[test]
+fn a_session_is_refused_while_an_openfan_firmware_update_holds_the_controller() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+    ctx.cache
+        .set_openfan_link(control_ofc_daemon::health::state::OpenFanLink::Connected);
+    ctx.cache
+        .try_begin_openfan_maintenance("r1", "preparing")
+        .unwrap();
+    let err = engine
+        .start(unique_session("during-update"), &ctx)
+        .unwrap_err();
+    assert_eq!(
+        err,
+        control_ofc_daemon::validation::recorder::StartError::OpenFanMaintenance
+    );
+    assert!(!engine.is_recording());
+    ctx.cache.end_openfan_maintenance("r1", None);
+    assert!(engine.start(unique_session("after-update"), &ctx).is_ok());
+}

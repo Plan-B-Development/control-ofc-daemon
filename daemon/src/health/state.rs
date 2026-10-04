@@ -516,6 +516,130 @@ pub struct DaemonState {
     /// back. `pwm_commanded_pct` itself is untouched: the pump stall response
     /// reads it. Produced only by [`crate::health::cache::StateCache::record_hwmon_command`].
     pub hwmon_diagnostic_commanded: HashMap<String, u64>,
+    /// What the OpenFan poll loop last observed of its serial link (DEC-481).
+    /// `None` until a poll loop starts, which is also "no controller adopted".
+    /// Written only by [`crate::health::cache::StateCache::set_openfan_link`].
+    pub openfan_link: Option<OpenFanLink>,
+    /// The device path the OpenFan controller was adopted on (DEC-481), so the
+    /// firmware update can find the board's USB identity in sysfs. Published at
+    /// every adoption: boot, rescan, reconnect and a firmware update's hand-back.
+    pub openfan_port: Option<String>,
+    /// An OpenFan firmware update's hold on the controller, or the failed run
+    /// it left behind (DEC-481). Under this lock so that starting an update and
+    /// claiming the diagnostic pause are one decision.
+    pub openfan_maintenance: Option<OpenFanMaintenance>,
+}
+
+/// What the OpenFan poll loop last observed of its serial link (DEC-481).
+///
+/// Kept apart from presence: `AppState::openfan()` says a controller was
+/// adopted, while this says whether the loop can talk to it right now. A
+/// firmware update starts only from [`OpenFanLink::Connected`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenFanLink {
+    /// The last poll succeeded, or a verified adoption has just happened.
+    Connected,
+    /// At least one poll in a row failed, short of the reconnect threshold; the
+    /// loop still holds the port.
+    Unresponsive,
+    /// The loop has given up on the port and is searching for the controller.
+    Reconnecting,
+}
+
+impl OpenFanLink {
+    /// The wire token on `status.openfan_link`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Unresponsive => "unresponsive",
+            Self::Reconnecting => "reconnecting",
+        }
+    }
+}
+
+/// An OpenFan firmware update's standing in the shared state (DEC-481).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenFanMaintenance {
+    /// A run owns the controller. While `writes_suspended`, the engine, the
+    /// thermal force and every give-back skip OpenFan writes instead of failing
+    /// them; the run lifts it once the poll loop has the port back.
+    Running {
+        run_id: String,
+        /// The stage's wire token (`openfan_maintenance::stage`).
+        stage: &'static str,
+        /// When the stage's time limit runs out; `None` for a stage with none.
+        stage_deadline: Option<Instant>,
+        writes_suspended: bool,
+    },
+    /// The run ended with the board outside normal control — in its bootloader,
+    /// or back but not answering. OpenFan writes stay suspended, and `openfan`
+    /// health reports the outcome as critical, until the poll loop next reports
+    /// [`OpenFanLink::Connected`].
+    NeedsRecovery {
+        run_id: String,
+        /// The run's outcome token (`openfan_maintenance::outcome`).
+        outcome: &'static str,
+    },
+}
+
+impl OpenFanMaintenance {
+    pub fn run_id(&self) -> &str {
+        match self {
+            Self::Running { run_id, .. } | Self::NeedsRecovery { run_id, .. } => run_id,
+        }
+    }
+}
+
+/// Why a firmware update could not claim the OpenFan controller (DEC-481).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceRefusal {
+    /// Another update owns the controller.
+    MaintenanceActive,
+    /// The poll loop is not reporting a working link (or has not started).
+    LinkNotReady(Option<OpenFanLink>),
+    /// The last update left the board needing recovery and the poll loop has
+    /// not seen it answer since — even while the link still reads `connected`,
+    /// which it does until the loop has handled the loan's end.
+    RecoveryPending,
+    /// A diagnostic holds the write pause — including one whose deadman lapsed
+    /// without a release, which an update refuses to take over.
+    DiagnosticActive,
+    /// The thermal or coolant emergency is forcing the fans.
+    ThermalEmergency,
+}
+
+impl MaintenanceRefusal {
+    /// The `details.reason` token of the 409.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::MaintenanceActive => "maintenance_active",
+            Self::LinkNotReady(_) | Self::RecoveryPending => "openfan_link_not_ready",
+            Self::DiagnosticActive => "diagnostic_active",
+            Self::ThermalEmergency => "thermal_emergency",
+        }
+    }
+
+    pub fn message(self) -> String {
+        match self {
+            Self::MaintenanceActive => "an OpenFan firmware update is already running".into(),
+            Self::LinkNotReady(link) => format!(
+                "the OpenFan controller's connection is {} — an update starts only while it is \
+                 connected",
+                link.map_or("not established yet", OpenFanLink::as_str)
+            ),
+            Self::RecoveryPending => {
+                "the last firmware update left the OpenFan board needing recovery — an update \
+                 starts once the controller answers again"
+                    .into()
+            }
+            Self::DiagnosticActive => {
+                "a hardware diagnostic or calibration holds the fans — wait for it to finish".into()
+            }
+            Self::ThermalEmergency => {
+                "a thermal emergency is forcing the fans — wait until it has cleared".into()
+            }
+        }
+    }
 }
 
 /// One hwmon header's duty-reconciliation record (DEC-406).
@@ -555,6 +679,41 @@ impl DaemonState {
                 .verify_active_until
                 .is_some_and(|deadline| now < deadline)
     }
+
+    /// Whether a firmware update owns the OpenFan controller (DEC-481). Every
+    /// diagnostic that takes the write pause is refused while it does.
+    pub fn openfan_maintenance_running(&self) -> bool {
+        matches!(
+            self.openfan_maintenance,
+            Some(OpenFanMaintenance::Running { .. })
+        )
+    }
+
+    /// Whether OpenFan writes are suspended for a firmware update (DEC-481):
+    /// from the update's claim until it has the port back, and after a run
+    /// that left the board outside normal control until the link reconnects.
+    ///
+    /// The thermal force reads this alone — it outranks the diagnostic pause
+    /// (DEC-297) but not an update, whose channels were parked at 100 % before
+    /// the port was lent and cannot be written while the board is away.
+    pub fn openfan_writes_suspended(&self) -> bool {
+        match &self.openfan_maintenance {
+            Some(OpenFanMaintenance::Running {
+                writes_suspended, ..
+            }) => *writes_suspended,
+            Some(OpenFanMaintenance::NeedsRecovery { .. }) => true,
+            None => false,
+        }
+    }
+
+    /// `status.openfan_link`: `"maintenance"` while an update runs, otherwise
+    /// what the poll loop last observed (DEC-481). `None` without a controller.
+    pub fn openfan_link_wire(&self) -> Option<&'static str> {
+        if self.openfan_maintenance_running() {
+            return Some("maintenance");
+        }
+        self.openfan_link.map(OpenFanLink::as_str)
+    }
 }
 
 impl Default for DaemonState {
@@ -584,6 +743,9 @@ impl Default for DaemonState {
             hwmon_duty_reconciliation: HashMap::new(),
             hwmon_seen_spinning: HashSet::new(),
             hwmon_diagnostic_commanded: HashMap::new(),
+            openfan_link: None,
+            openfan_port: None,
+            openfan_maintenance: None,
         }
     }
 }

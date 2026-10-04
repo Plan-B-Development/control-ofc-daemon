@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### Added
+
+- **OpenFAN firmware update: `GET /fans/openfan/device` and `POST`/`GET`/`DELETE
+  /fans/openfan/maintenance`, advertised as `control.openfan_firmware_maintenance`.** The daemon checks
+  the board — its USB serial number, nothing else holding the fans, no other board in its bootloader, no
+  thermal emergency — sets every OpenFAN channel to 100 %, and sends `>07`; if the board has not left
+  normal mode within 5 s it sets the same port to 1200 baud. It then waits up to 15 minutes for the user
+  to copy the `.uf2` onto the `RPI-RP2` drive — one wait per run, however often the board goes back to its
+  bootloader, and the third return leaves it needing recovery — confirms the same board comes back on the same USB port,
+  compares its configuration descriptor and `>05`/`>06` reports with what it reported before and with the
+  file, and restores control. It never writes firmware, reads a file or opens any other device. Each run
+  is journaled to `{state_dir}/openfan-maintenance.json` before each action; a run a stop interrupts is
+  finished as interrupted at the next start and never resumed (DEC-481).
+- **`/status` and `/poll` carry `openfan_link`** (`connected` | `unresponsive` | `reconnecting` |
+  `maintenance`; omitted with no controller) **and `openfan_maintenance`** (`{run_id, stage, state,
+  outcome?}` while an update holds the controller, or while the board it left needs recovery).
+
+### Changed
+
+- **While a firmware update holds the OpenFAN controller**, the engine, the thermal force and every
+  give-back skip OpenFAN writes rather than fail them. The diagnostics, the OpenFan calibration, a
+  validation session start, an OpenFan rescan, and an override or identify on an OpenFAN channel are
+  refused with `409 validation_error`, `details.reason: "openfan_maintenance"`, and overrides and identify
+  holds on OpenFAN channels are released as it starts. The `openfan` health entry reports the update:
+  `warn`, or `crit` when a stage overruns its limit or the board needs recovery. After a restart with the
+  board left in its bootloader, the daemon watches its USB port and takes the board back once it answers;
+  no new update starts over a board still needing recovery (DEC-481).
+
 ## [3.7.0] — 2026-10-04
 
 Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor. GUI 3.6.1 judges a second AMD

@@ -892,6 +892,11 @@ pub(crate) struct OpenFanBackend {
     /// candidate on the next tick. Shared with the task and never locked at the
     /// same time as the controller.
     lost_duties: Arc<Mutex<Option<(u64, u16)>>>,
+    /// DEC-481: whether the thermal force's last run found the OpenFan writes
+    /// suspended for a firmware update, and whether that has been logged — so
+    /// the skip is reported once per transition, never per channel per tick.
+    force_suspended: Arc<std::sync::atomic::AtomicBool>,
+    force_suspended_logged: bool,
 }
 
 const _: () = assert!(NUM_CHANNELS <= u16::BITS as u8);
@@ -938,6 +943,8 @@ impl OpenFanBackend {
             pre_emergency: Arc::new(Mutex::new(None)),
             held: Arc::new(Mutex::new(OpenFanHeld::default())),
             lost_duties: Arc::new(Mutex::new(None)),
+            force_suspended: Arc::default(),
+            force_suspended_logged: false,
         }
     }
 
@@ -1071,7 +1078,10 @@ impl OpenFanBackend {
                         // claimed the pause, corrupting its first RPM readback. A
                         // skipped channel records no outcome (it was not attempted),
                         // so it neither counts as a failure nor resets a streak.
-                        if cache.verify_active() {
+                        // DEC-481: a firmware update suspends the same way — a write
+                        // failed against the lent port would forget the duty DEC-466
+                        // puts back, and a coalesced one would read as delivered.
+                        if cache.openfan_writes_paused() {
                             return None;
                         }
                         let res = guard
@@ -1089,7 +1099,7 @@ impl OpenFanBackend {
                 let checks_put_back = !put_back.is_empty();
                 for ch in put_back {
                     let mut guard = ctrl.lock();
-                    if cache.verify_active() {
+                    if cache.openfan_writes_paused() {
                         break;
                     }
                     let Some(duty) = guard.duty_before_loss(ch) else {
@@ -1280,7 +1290,9 @@ impl WriteBackend for OpenFanBackend {
 /// sweep step — as low as 0 % (DEC-452's walk descends to a stop). The calibration aborts under the force and
 /// skips its own restore (`api/calibration.rs`), so a snapshot of that step would
 /// be the only thing ever writing the channel again, and it would stop the fan.
-/// Unknown stays at the forced duty (DEC-382 review, security F2).
+/// Unknown stays at the forced duty (DEC-382 review, security F2). A firmware
+/// update counts the same (DEC-481): its channels hold the 100 % park or the
+/// board's own start-up default, neither of which is a duty to give back.
 fn record_pre_emergency(
     ctrl: &Mutex<crate::serial::controller::FanController>,
     cache: &StateCache,
@@ -1289,7 +1301,7 @@ fn record_pre_emergency(
     if pre_emergency.lock().is_some() {
         return;
     }
-    let duties: Vec<Option<u8>> = if cache.verify_active() {
+    let duties: Vec<Option<u8>> = if cache.openfan_writes_paused() {
         vec![None; NUM_CHANNELS as usize]
     } else {
         // `TS-bc`: a duty a reconnect or resume lost is recorded as the duty it
@@ -1352,7 +1364,7 @@ fn release_unheld_openfan(
     let floor = cache.exit_floor_pct();
     for ch in unheld {
         let mut guard = ctrl.lock();
-        if cache.verify_active() {
+        if cache.openfan_writes_paused() {
             return;
         }
         // `TS-bc`: a duty a reconnect or resume lost is judged by the duty it
@@ -1423,7 +1435,7 @@ fn give_back_pre_emergency(
     pre_emergency: &Mutex<Option<Vec<Option<u8>>>>,
     members: &HashSet<u8>,
 ) -> Vec<(u8, Result<(), String>)> {
-    if cache.verify_active() {
+    if cache.openfan_writes_paused() {
         return Vec::new();
     }
     let Some(duties) = pre_emergency.lock().take() else {
@@ -1443,7 +1455,7 @@ fn give_back_pre_emergency(
             continue;
         };
         let mut guard = ctrl.lock();
-        if cache.verify_active() {
+        if cache.openfan_writes_paused() {
             // Never hold the controller and the snapshot slot together.
             drop(guard);
             let pending = (ch..NUM_CHANNELS)
@@ -1455,8 +1467,9 @@ fn give_back_pre_emergency(
                 *slot = Some(duties);
             }
             log::info!(
-                "Thermal emergency over: a hardware diagnostic holds the engine write-pause — \
-                 {pending} channel(s) get their pre-emergency duty back once it ends"
+                "Thermal emergency over: a hardware diagnostic or an OpenFan firmware update \
+                 holds the OpenFan writes — {pending} channel(s) get their pre-emergency duty \
+                 back once it ends"
             );
             return results;
         }
@@ -1550,6 +1563,7 @@ impl SafetyWriteBackend for OpenFanBackend {
         let pre_emergency = self.pre_emergency.clone();
         let engine_held = self.held.clone();
         let ctrl = self.ctrl.clone();
+        let force_suspended = self.force_suspended.clone();
         // D1-j: this tick's profile duty per channel, so `pct` acts as a floor
         // over it rather than replacing it. Parsed silently — `apply` owns the
         // malformed-`member_id` warning, and a forced tick `continue`s before
@@ -1576,8 +1590,18 @@ impl SafetyWriteBackend for OpenFanBackend {
                     // duty IS the forced one.
                     record_pre_emergency(&ctrl, &cache, &pre_emergency);
                 }
+                let mut suspended = false;
                 for ch in targets {
                     let mut guard = ctrl.lock();
+                    // [SAFETY] DEC-481: the one gate this force obeys. A firmware
+                    // update parked every channel at 100 % before it took the port,
+                    // and the port is not there to write through until it is handed
+                    // back; the first tick after that reaches every channel again.
+                    // Read under the controller lock, as the engine's pause is.
+                    if cache.openfan_writes_suspended() {
+                        suspended = true;
+                        break;
+                    }
                     let held_duty = held
                         .contains(&ch)
                         .then(|| guard.last_known_duty(ch))
@@ -1592,6 +1616,7 @@ impl SafetyWriteBackend for OpenFanBackend {
                         log::error!("THERMAL SAFETY: OpenFan ch{ch} write FAILED: {e}");
                     }
                 }
+                force_suspended.store(suspended, std::sync::atomic::Ordering::SeqCst);
                 match give_back {
                     Some(members) => {
                         give_back_openfan(&ctrl, &cache, &pre_emergency, &engine_held, &members)
@@ -1629,6 +1654,23 @@ impl SafetyWriteBackend for OpenFanBackend {
         // a degraded link, and an emergency-to-release hold can last minutes, so a per-tick
         // line would bury the transition it exists to report. Every other safety
         // log in this file is throttled the same way.
+        // DEC-481: one line when an update first keeps the force off the OpenFan
+        // channels and one when it reaches them again — never a line per channel.
+        let suspended = self
+            .force_suspended
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if suspended && !self.force_suspended_logged {
+            self.force_suspended_logged = true;
+            log::warn!(
+                "THERMAL SAFETY: the OpenFan channels cannot be written — a firmware update holds \
+                 the controller, or left it needing recovery. They were parked at 100 % when the \
+                 update began; the force reaches them again on the first tick after the board is \
+                 back under control"
+            );
+        } else if !suspended && self.force_suspended_logged {
+            self.force_suspended_logged = false;
+            log::info!("THERMAL SAFETY: the force is reaching the OpenFan channels again");
+        }
         if stalled {
             if !self.stall_logged {
                 self.stall_logged = true;
@@ -6635,6 +6677,102 @@ mod tests {
             0,
             "any channel success resets the whole-link streak"
         );
+    }
+
+    /// DEC-481: a firmware update suspends OpenFan writes from the moment it
+    /// parks the channels. A skipped write is not a failure — the channel's
+    /// streak and the link streak stay where they were — and writes resume
+    /// when the update hands the controller back.
+    #[tokio::test]
+    async fn openfan_backend_skips_writes_while_a_firmware_update_holds_the_controller() {
+        use crate::health::state::OpenFanLink;
+        let (mut be, written, cache) = openfan_backend();
+        cache.set_openfan_link(OpenFanLink::Connected);
+        cache
+            .try_begin_openfan_maintenance("r1", crate::openfan_maintenance::stage::PREPARING)
+            .expect("free");
+        be.apply(&[cmd("openfan:ch00", "openfan", 50)]).await;
+        assert_eq!(
+            written.lock().len(),
+            1,
+            "while the update only reads, the engine still writes"
+        );
+
+        assert!(cache.suspend_openfan_writes("r1"));
+        be.apply(&[cmd("openfan:ch01", "openfan", 60)]).await;
+        assert_eq!(written.lock().len(), 1, "no write while suspended");
+        assert_eq!(
+            (be.channel_failure_streak(1), be.link_down_streak()),
+            (0, 0),
+            "a suspended write is not a failed one"
+        );
+
+        cache.end_openfan_maintenance("r1", None);
+        be.apply(&[cmd("openfan:ch01", "openfan", 60)]).await;
+        assert!(
+            written.lock().iter().any(|c| c.starts_with(">0201")),
+            "writes resume once the update hands the controller back"
+        );
+    }
+
+    /// [SAFETY] DEC-481: the thermal force leaves channels a firmware update
+    /// holds alone — it cannot write through a lent port — says so once, and
+    /// reaches every channel again on the first tick after the update ends.
+    #[tokio::test]
+    async fn the_force_leaves_suspended_openfan_channels_alone_until_the_update_ends() {
+        use crate::health::state::OpenFanLink;
+        let (mut be, written, cache) = openfan_backend();
+        cache.set_openfan_link(OpenFanLink::Connected);
+        cache
+            .try_begin_openfan_maintenance("r1", crate::openfan_maintenance::stage::PREPARING)
+            .expect("free");
+        assert!(cache.suspend_openfan_writes("r1"));
+
+        be.force_all_with_floor(100, &[], ForceReach::All).await;
+        assert!(
+            written.lock().is_empty(),
+            "no write through a held controller"
+        );
+        assert!(be.force_suspended_logged, "said once");
+        be.force_all_with_floor(100, &[], ForceReach::All).await;
+        assert!(be.force_suspended_logged, "and not again while it lasts");
+
+        cache.end_openfan_maintenance("r1", None);
+        be.force_all_with_floor(100, &[], ForceReach::All).await;
+        let frames = written.lock().clone();
+        for ch in 0..NUM_CHANNELS {
+            assert!(
+                frames
+                    .iter()
+                    .any(|f| f.starts_with(&format!(">02{ch:02X}"))),
+                "channel {ch} is forced again: {frames:?}"
+            );
+        }
+        assert!(!be.force_suspended_logged, "the falling edge is reported");
+    }
+
+    /// [SAFETY] DEC-481: an update that failed with the board possibly in its
+    /// bootloader keeps the force off the channels until the board answers —
+    /// and the link reporting `Connected` is what ends it.
+    #[tokio::test]
+    async fn the_force_returns_when_a_board_needing_recovery_answers_again() {
+        use crate::health::state::OpenFanLink;
+        let (mut be, written, cache) = openfan_backend();
+        cache.set_openfan_link(OpenFanLink::Connected);
+        cache
+            .try_begin_openfan_maintenance("r1", crate::openfan_maintenance::stage::PREPARING)
+            .expect("free");
+        cache.end_openfan_maintenance(
+            "r1",
+            Some(crate::openfan_maintenance::outcome::NEEDS_RECOVERY),
+        );
+        cache.set_openfan_link(OpenFanLink::Reconnecting);
+        be.force_all_with_floor(100, &[], ForceReach::All).await;
+        assert!(written.lock().is_empty());
+
+        cache.set_openfan_link(OpenFanLink::Connected);
+        be.force_all_with_floor(100, &[], ForceReach::All).await;
+        assert_eq!(written.lock().len(), NUM_CHANNELS as usize);
     }
 
     #[tokio::test]

@@ -76,10 +76,24 @@ pub async fn override_take_handler(
                 )),
             );
         }
-        state
-            .override_table
-            .lock()
-            .take_override(&control_id, body.pwm_percent, ttl)
+        let drives_openfan = profile_guard.as_ref().is_some_and(|p| {
+            p.controls
+                .iter()
+                .filter(|c| c.id == control_id)
+                .flat_map(|c| &c.members)
+                .any(|m| m.source == "openfan")
+        });
+        // DEC-481: decided under the `override_table` guard the insert takes.
+        // An update's start claims the controller and only then takes this guard
+        // to release OpenFan overrides, so a take serialises strictly before that
+        // release (which then removes it) or after the claim (refused here). The
+        // cache lock is a leaf — only pure reads happen under it — so reading it
+        // under this guard closes no cycle.
+        let mut table = state.override_table.lock();
+        if drives_openfan && state.cache.openfan_maintenance_running() {
+            return super::openfan_maintenance_conflict();
+        }
+        table.take_override(&control_id, body.pwm_percent, ttl)
     };
 
     json_ok(
@@ -162,6 +176,13 @@ pub async fn fan_identify_handler(
 ) -> (StatusCode, Json<serde_json::Value>) {
     match body.action.as_str() {
         "stop" => {
+            // DEC-481: a firmware update owns the OpenFan channels. A fast refusal
+            // here; the decision that counts is taken again under the insert's
+            // `override_table` guard below.
+            let openfan_fan = crate::serial::openfan_channel_of(&fan_id).is_ok();
+            if openfan_fan && state.cache.openfan_maintenance_running() {
+                return super::openfan_maintenance_conflict();
+            }
             // The fan must exist. (Restore stays lenient below — you must always
             // be able to clear a hold.)
             //
@@ -237,6 +258,13 @@ pub async fn fan_identify_handler(
                     .as_ref()
                     .is_some_and(|p| super::pump_header_ids(p).contains(&fan_id));
                 let mut table = state.override_table.lock();
+                // DEC-481: an update's start claims the controller and only then
+                // takes this guard to release OpenFan identify holds, so a hold
+                // serialises strictly before that release or after the claim. The
+                // cache lock is a leaf, so reading it here closes no cycle.
+                if openfan_fan && state.cache.openfan_maintenance_running() {
+                    return super::openfan_maintenance_conflict();
+                }
                 let assigned = state
                     .header_roles()
                     .get(crate::hwmon::roles::role_key(&fan_id).as_ref())

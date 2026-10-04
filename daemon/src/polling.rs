@@ -892,6 +892,7 @@ pub async fn openfan_poll_loop(
     interval: Duration,
     shutdown: watch::Receiver<bool>,
     survey: crate::serial::adoption::ReconnectSurvey,
+    loans: crate::serial::port_loan::LoanReceiver,
 ) {
     use crate::serial::adoption::node_id;
 
@@ -906,6 +907,10 @@ pub async fn openfan_poll_loop(
     // to be `auto_detect_port`, which opened every tty on every attempt. The loop
     // runs one probe at a time, so the lock is never contended.
     let survey = Arc::new(parking_lot::Mutex::new(survey));
+    // DEC-481: a firmware update hands back a port opened on whatever node the
+    // board re-enumerated as, so the survey is re-seeded for that node exactly as
+    // a reconnect re-seeds it.
+    let reseed_survey = survey.clone();
     openfan_poll_loop_with(
         cache,
         transport,
@@ -922,6 +927,18 @@ pub async fn openfan_poll_loop(
                 |p| crate::serial::real_transport::RealSerialTransport::open(p, t),
                 std::time::Instant::now(),
             )
+        },
+        loans,
+        move |path: &str| {
+            let mut s = reseed_survey.lock();
+            let configured = s.configured().map(str::to_string);
+            let candidates = crate::serial::real_transport::enumerate_serial_candidates();
+            *s = crate::serial::adoption::ReconnectSurvey::new(
+                configured,
+                path,
+                &candidates,
+                node_id,
+            );
         },
     )
     .await;
@@ -960,6 +977,7 @@ fn reconnect_via_survey<T: SerialTransport + Send + 'static>(
     })?;
     if let Some(path) = chosen {
         log::info!("OpenFan Controller re-found on {path}");
+        cache.set_openfan_port(&path);
         *s = crate::serial::adoption::ReconnectSurvey::new(configured, &path, &candidates, observe);
     }
     Some(adopted)
@@ -994,23 +1012,39 @@ fn release_adopted_port(transport: &parking_lot::Mutex<Box<dyn SerialTransport +
 /// `None` if nothing suitable was found. It must perform the DEC-250 identity
 /// handshake itself — the production closure does so via
 /// [`adopt_reconnected_transport`].
-async fn openfan_poll_loop_with<F>(
+///
+/// `loans` carries a firmware update's requests for the port, and `reseed`
+/// (blocking pool) re-seeds the reconnect survey for the node a port is handed
+/// back on (DEC-481, [`crate::serial::port_loan`]). The loop answers a request
+/// only between polls, and lends only while its last poll succeeded.
+// Eight: the six the loop always took, plus the two halves of DEC-481's lending.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn openfan_poll_loop_with<F, G>(
     cache: Arc<StateCache>,
     transport: Arc<parking_lot::Mutex<Box<dyn SerialTransport + Send>>>,
     timeout: Duration,
     interval: Duration,
     mut shutdown: watch::Receiver<bool>,
     reconnect: F,
+    mut loans: crate::serial::port_loan::LoanReceiver,
+    reseed: G,
 ) where
     F: Fn(&Arc<StateCache>, Duration) -> Option<Box<dyn SerialTransport + Send>>
         + Send
         + Sync
         + Clone
         + 'static,
+    G: Fn(&str) + Send + Sync + Clone + 'static,
 {
+    use crate::health::state::OpenFanLink;
+    use crate::serial::port_loan::LoanEnd;
+
     // `OFAN-a`: this loop owns the interval, so it publishes it — a calibration
     // derives its shortest hold from it (the DEC-267 pattern).
     cache.set_openfan_poll_interval_ms(interval.as_millis() as u64);
+    // DEC-481: the loop is spawned only for a controller that has just passed
+    // the identity handshake, so it starts connected.
+    cache.set_openfan_link(OpenFanLink::Connected);
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1026,7 +1060,7 @@ async fn openfan_poll_loop_with<F>(
     let mut short_frame_logged = false;
 
     loop {
-        tokio::select! {
+        let loan_request = tokio::select! {
             // [SAFETY] DEC-272 round 2 — same reasoning as the hwmon loop above.
             // This leg also awaits a `spawn_blocking` reconnect/probe, so it too
             // can arrive at the select with an overdue tick AND a set stop flag
@@ -1038,7 +1072,51 @@ async fn openfan_poll_loop_with<F>(
                 log::info!("openfan poll loop shutting down");
                 return;
             }
-            _ = tick.tick() => {}
+            // DEC-481: a firmware update borrowing the port. Reached only here,
+            // between polls, so no poll or reconnect of this loop is in flight.
+            Some(request) = loans.recv() => Some(request),
+            _ = tick.tick() => None,
+        };
+
+        if let Some(request) = loan_request {
+            // [SAFETY] DEC-481: while the port is out `lend` does not return, so
+            // the loop sends no polls, counts no failures, and neither releases
+            // nor reopens anything. Lent only while the last poll succeeded.
+            let connected = consecutive_errors == 0;
+            match crate::serial::port_loan::lend(&transport, request, connected, &mut shutdown)
+                .await
+            {
+                LoanEnd::Shutdown => {
+                    log::info!("openfan poll loop shutting down");
+                    return;
+                }
+                LoanEnd::Refused | LoanEnd::Abandoned => {}
+                LoanEnd::Returned { path, settled } => {
+                    let reseed = reseed.clone();
+                    let node = path.clone();
+                    if let Err(e) = tokio::task::spawn_blocking(move || reseed(&node)).await {
+                        log::error!(
+                            "openfan poll loop: re-seeding the reconnect search failed: {e}"
+                        );
+                    }
+                    cache.set_openfan_port(&path);
+                    consecutive_errors = 0;
+                    reconnect_backoff = 1;
+                    adopted_port_released = false;
+                    cache.set_openfan_link(OpenFanLink::Connected);
+                    let _ = settled.send(());
+                }
+                LoanEnd::Lost { settled } => {
+                    // The slot already holds the disconnected placeholder, so the
+                    // first reconnect attempt has no port of ours to close.
+                    adopted_port_released = true;
+                    consecutive_errors = reconnect_threshold;
+                    reconnect_backoff = 1;
+                    cache.set_openfan_link(OpenFanLink::Reconnecting);
+                    let _ = settled.send(());
+                }
+            }
+            continue;
         }
 
         // If too many consecutive errors, attempt reconnect instead of polling
@@ -1073,9 +1151,11 @@ async fn openfan_poll_loop_with<F>(
                 Ok(Some(new_transport)) => {
                     let mut guard = transport.lock();
                     *guard = new_transport;
+                    drop(guard);
                     adopted_port_released = false;
                     consecutive_errors = 0;
                     reconnect_backoff = 1;
+                    cache.set_openfan_link(OpenFanLink::Connected);
                     log::info!("OpenFan Controller reconnected");
                     continue;
                 }
@@ -1110,6 +1190,14 @@ async fn openfan_poll_loop_with<F>(
             consecutive_errors = 0;
             reconnect_backoff = 1;
         }
+        // DEC-481: what this poll says about the link, from the same count.
+        cache.set_openfan_link(if consecutive_errors == 0 {
+            OpenFanLink::Connected
+        } else if consecutive_errors >= reconnect_threshold {
+            OpenFanLink::Reconnecting
+        } else {
+            OpenFanLink::Unresponsive
+        });
 
         match result {
             Ok(Ok(response)) => {
@@ -1183,6 +1271,11 @@ async fn openfan_poll_loop_with<F>(
 
 #[cfg(test)]
 mod tests {
+    /// A lending channel nobody can send on: the loop's loan arm stays idle.
+    fn no_loans() -> crate::serial::port_loan::LoanReceiver {
+        crate::serial::port_loan::loan_channel().1
+    }
+
     use super::*;
     use std::fs;
 
@@ -1459,6 +1552,8 @@ mod tests {
             interval,
             shutdown_rx,
             |_: &Arc<StateCache>, _: Duration| None,
+            no_loans(),
+            |_: &str| {},
         ));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while seen.lock().len() < 3 && std::time::Instant::now() < deadline {
@@ -1499,6 +1594,8 @@ mod tests {
             Duration::from_millis(1),
             shutdown_rx,
             reconnect,
+            no_loans(),
+            |_: &str| {},
         ));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !done() && std::time::Instant::now() < deadline {
@@ -1625,6 +1722,309 @@ mod tests {
             "the slot still holds the old port (it answered `{err}`), not the \
              disconnected placeholder"
         );
+    }
+
+    // ── DEC-481: lending the port to a firmware update ───────────────
+
+    /// A port on a controller that answers `ReadAllRpm` — or, while `failing`,
+    /// never answers — counting every frame written to it.
+    struct LendablePort {
+        frames: Arc<std::sync::atomic::AtomicU32>,
+        failing: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl LendablePort {
+        fn boxed(
+            frames: &Arc<std::sync::atomic::AtomicU32>,
+            failing: &Arc<std::sync::atomic::AtomicBool>,
+        ) -> Box<dyn SerialTransport + Send> {
+            Box::new(Self {
+                frames: frames.clone(),
+                failing: failing.clone(),
+            })
+        }
+    }
+
+    impl SerialTransport for LendablePort {
+        fn write_line(&mut self, _data: &str) -> Result<(), crate::error::SerialError> {
+            self.frames
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn read_line(&mut self, _t: Duration) -> Result<String, crate::error::SerialError> {
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::error::SerialError::Timeout { timeout_ms: 1 });
+            }
+            Ok(openfan_replies().0[0].clone())
+        }
+    }
+
+    async fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    fn count(n: &Arc<std::sync::atomic::AtomicU32>) -> u32 {
+        n.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// [SAFETY] DEC-481. While a firmware update holds the port, the loop must
+    /// not poll it, must not decide the link is down and reconnect — which would
+    /// close and replace whatever is in the slot and reopen the node the update
+    /// is driving — and must install exactly what comes back, once. Observed at
+    /// every sample across the whole window, not only at its end.
+    #[tokio::test]
+    async fn a_lent_port_stops_every_poll_and_reconnect_until_it_comes_back_once() {
+        use crate::serial::port_loan::{borrow, loan_channel, LoanReturn};
+        let cache = Arc::new(StateCache::new());
+        let (first, failing) = (Arc::default(), Arc::default());
+        let slot: Slot = Arc::new(parking_lot::Mutex::new(LendablePort::boxed(
+            &first, &failing,
+        )));
+        let probes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let reseeded = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let (lender, loans) = loan_channel();
+        let (stop, stop_rx) = watch::channel(false);
+        let (pr, rs) = (probes.clone(), reseeded.clone());
+        let handle = tokio::spawn(openfan_poll_loop_with(
+            cache.clone(),
+            slot.clone(),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            stop_rx,
+            move |_: &Arc<StateCache>, _: Duration| {
+                pr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
+            },
+            loans,
+            move |path: &str| rs.lock().push(path.to_string()),
+        ));
+        wait_for("the first polls", || count(&first) > 3).await;
+
+        let Ok(loan) = borrow(&lender, Duration::from_secs(2)).await else {
+            panic!("a connected loop lends its port");
+        };
+        let (frames_at_loan, polls_at_loan) = (count(&first), cache.openfan_polls_started());
+        let mut samples = 0;
+        let until = std::time::Instant::now() + Duration::from_millis(200);
+        while std::time::Instant::now() < until {
+            assert_eq!(
+                count(&first),
+                frames_at_loan,
+                "the lent port is the borrower's alone"
+            );
+            assert_eq!(
+                cache.openfan_polls_started(),
+                polls_at_loan,
+                "no poll begins while the port is out"
+            );
+            assert_eq!(count(&probes), 0, "no reconnect while the port is out");
+            let err = send_command(
+                &mut **slot.lock(),
+                &Command::ReadAllRpm,
+                Duration::from_millis(1),
+            )
+            .expect_err("the slot holds the placeholder");
+            assert!(err.to_string().contains("firmware update"), "{err}");
+            samples += 1;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            samples >= 20,
+            "precondition: the window was observed ({samples} samples)"
+        );
+
+        // The update hands back a port it opened itself.
+        let second = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let back = LendablePort::boxed(&second, &Arc::default());
+        let settled = loan
+            .handle
+            .give_back(
+                LoanReturn::Port {
+                    transport: back,
+                    path: "/dev/ttyACM9".into(),
+                },
+                Duration::from_secs(2),
+            )
+            .await;
+        assert!(settled, "the loop settles the hand-back");
+        assert_eq!(cache.openfan_port().as_deref(), Some("/dev/ttyACM9"));
+        assert_eq!(
+            *reseeded.lock(),
+            vec!["/dev/ttyACM9".to_string()],
+            "re-seeded once"
+        );
+        assert_eq!(
+            cache.openfan_link(),
+            Some(crate::health::state::OpenFanLink::Connected)
+        );
+        wait_for("polls on the returned port", || count(&second) > 3).await;
+        assert_eq!(
+            count(&first),
+            frames_at_loan,
+            "the old port is never written again"
+        );
+        assert_eq!(count(&probes), 0);
+        drop(loan.transport);
+
+        let _ = stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// DEC-481: lent only while the last poll succeeded. A failing link — still
+    /// retrying, or already searching — is refused, and refusing touches nothing.
+    #[tokio::test]
+    async fn a_loan_is_refused_while_the_link_is_failing() {
+        use crate::serial::port_loan::{borrow, loan_channel, LoanRefusal, LoanReturn};
+        let cache = Arc::new(StateCache::new());
+        let (frames, failing) = (
+            Arc::default(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let slot: Slot = Arc::new(parking_lot::Mutex::new(LendablePort::boxed(
+            &frames, &failing,
+        )));
+        let (lender, loans) = loan_channel();
+        let (stop, stop_rx) = watch::channel(false);
+        let (f, fl) = (frames.clone(), failing.clone());
+        let handle = tokio::spawn(openfan_poll_loop_with(
+            cache.clone(),
+            slot.clone(),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            stop_rx,
+            move |_: &Arc<StateCache>, _: Duration| {
+                (!fl.load(std::sync::atomic::Ordering::SeqCst))
+                    .then(|| LendablePort::boxed(&f, &fl))
+            },
+            loans,
+            |_: &str| {},
+        ));
+        wait_for("the first polls", || count(&frames) > 3).await;
+
+        failing.store(true, std::sync::atomic::Ordering::SeqCst);
+        let c = cache.clone();
+        wait_for("the link to fail", || {
+            c.openfan_link() != Some(crate::health::state::OpenFanLink::Connected)
+        })
+        .await;
+        let refused = borrow(&lender, Duration::from_secs(2)).await;
+        assert!(
+            matches!(refused, Err(LoanRefusal::NotConnected)),
+            "a failing link is not lent"
+        );
+        let err = send_command(
+            &mut **slot.lock(),
+            &Command::ReadAllRpm,
+            Duration::from_millis(1),
+        )
+        .expect_err("still failing");
+        assert!(
+            !err.to_string().contains("firmware update"),
+            "a refusal installs no placeholder: {err}"
+        );
+
+        // Once it answers again, it lends; nothing back means reconnecting.
+        failing.store(false, std::sync::atomic::Ordering::SeqCst);
+        wait_for("the link to recover", || {
+            c.openfan_link() == Some(crate::health::state::OpenFanLink::Connected)
+        })
+        .await;
+        let Ok(loan) = borrow(&lender, Duration::from_secs(2)).await else {
+            panic!("a connected loop lends its port");
+        };
+        drop(loan.transport);
+        assert!(
+            loan.handle
+                .give_back(LoanReturn::Nothing, Duration::from_secs(2))
+                .await
+        );
+        assert_ne!(
+            cache.openfan_link(),
+            Some(crate::health::state::OpenFanLink::Connected),
+            "nothing back is a lost controller"
+        );
+        wait_for("the reconnect", || {
+            c.openfan_link() == Some(crate::health::state::OpenFanLink::Connected)
+        })
+        .await;
+
+        let _ = stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// DEC-481: a loan asked for while a reconnect probe is in flight waits for
+    /// the loop — the request is answered only at its select — and a borrower
+    /// that gave up meanwhile costs nothing: the loop puts the port straight
+    /// back, so the slot never ends holding the placeholder.
+    #[tokio::test]
+    async fn a_loan_asked_for_mid_reconnect_never_splits_the_port() {
+        use crate::serial::port_loan::{borrow, loan_channel, LoanRefusal};
+        let cache = Arc::new(StateCache::new());
+        let (frames, failing) = (
+            Arc::default(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let slot: Slot = Arc::new(parking_lot::Mutex::new(LendablePort::boxed(
+            &frames, &failing,
+        )));
+        let entered = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let after = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (lender, loans) = loan_channel();
+        let (stop, stop_rx) = watch::channel(false);
+        let (e, r, a) = (entered.clone(), release.clone(), after.clone());
+        let handle = tokio::spawn(openfan_poll_loop_with(
+            cache.clone(),
+            slot.clone(),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            stop_rx,
+            move |_: &Arc<StateCache>, _: Duration| {
+                e.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // A wedge with its own deadline (rust.md).
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !r.load(std::sync::atomic::Ordering::SeqCst)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Some(LendablePort::boxed(&a, &Arc::default()))
+            },
+            loans,
+            |_: &str| {},
+        ));
+        wait_for("the first polls", || count(&frames) > 3).await;
+        failing.store(true, std::sync::atomic::Ordering::SeqCst);
+        wait_for("the reconnect probe", || count(&entered) == 1).await;
+
+        let gave_up = borrow(&lender, Duration::from_millis(200)).await;
+        assert!(
+            matches!(gave_up, Err(LoanRefusal::Timeout)),
+            "a loop inside a probe answers nothing"
+        );
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        wait_for("polls on the reconnected port", || count(&after) > 5).await;
+        assert_eq!(count(&entered), 1, "one probe was enough");
+        send_command(
+            &mut **slot.lock(),
+            &Command::ReadAllRpm,
+            Duration::from_millis(1),
+        )
+        .expect("the slot holds the reconnected port, not the placeholder");
+        let Ok(loan) = borrow(&lender, Duration::from_secs(2)).await else {
+            panic!("and it lends again");
+        };
+        drop(loan);
+
+        let _ = stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
     // ── DEC-133: sensor descriptor cache ─────────────────────────────
@@ -3144,6 +3544,8 @@ mod tests {
                 r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 None
             },
+            no_loans(),
+            |_: &str| {},
         ));
 
         // Long enough for far more than RECONNECT_THRESHOLD ticks at 1 ms.

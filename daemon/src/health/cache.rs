@@ -677,6 +677,12 @@ impl StateCache {
     /// mid-test-write. See [`Self::end_verify`].
     pub fn try_begin_verify(&self, window: Duration) -> Option<u64> {
         let mut state = self.inner.write();
+        // DEC-481: a firmware update owns the OpenFan controller, and every
+        // claimant of this slot is refused for its whole run. Under this same
+        // write guard, so an update and a diagnostic can never both start.
+        if state.openfan_maintenance_running() {
+            return None;
+        }
         let now = Instant::now();
         let genuinely_held = state.verify_in_progress
             && state
@@ -805,6 +811,256 @@ impl StateCache {
         // this method without re-entering the read lock, so the rule lives on
         // `DaemonState` and both readers evaluate the one copy.
         self.inner.read().verify_active_at(Instant::now())
+    }
+
+    // ── OpenFan link and firmware maintenance (DEC-481) ─────────────────
+
+    /// Publish what the OpenFan poll loop observed of its link.
+    ///
+    /// Called after every poll, so the unchanged case takes only a read guard.
+    /// `Connected` also ends a failed update's `NeedsRecovery`: the board is
+    /// answering again, so OpenFan writes resume.
+    pub fn set_openfan_link(&self, link: OpenFanLink) {
+        {
+            let state = self.inner.read();
+            let ends_recovery = link == OpenFanLink::Connected
+                && matches!(
+                    state.openfan_maintenance,
+                    Some(OpenFanMaintenance::NeedsRecovery { .. })
+                );
+            if state.openfan_link == Some(link) && !ends_recovery {
+                return;
+            }
+        }
+        let mut state = self.inner.write();
+        state.openfan_link = Some(link);
+        if link != OpenFanLink::Connected {
+            return;
+        }
+        if let Some(OpenFanMaintenance::NeedsRecovery { run_id, outcome }) =
+            &state.openfan_maintenance
+        {
+            log::info!(
+                "OpenFan controller is answering again after firmware update {run_id} \
+                 ({outcome}) — OpenFan writes resume"
+            );
+            state.openfan_maintenance = None;
+        }
+    }
+
+    pub fn openfan_link(&self) -> Option<OpenFanLink> {
+        self.inner.read().openfan_link
+    }
+
+    /// Record the device path the controller was adopted on.
+    pub fn set_openfan_port(&self, path: &str) {
+        let mut state = self.inner.write();
+        if state.openfan_port.as_deref() != Some(path) {
+            state.openfan_port = Some(path.to_string());
+        }
+    }
+
+    pub fn openfan_port(&self) -> Option<String> {
+        self.inner.read().openfan_port.clone()
+    }
+
+    /// Claim the OpenFan controller for a firmware update — one decision under
+    /// the write guard [`Self::try_begin_verify`] takes, so an update and a
+    /// diagnostic can never both start.
+    ///
+    /// Refuses where a diagnostic would steal: a pause whose deadman lapsed but
+    /// was never released still counts as held (`verify_in_progress` alone, not
+    /// [`DaemonState::verify_active_at`]), because its owner may still be
+    /// driving hardware (DEC-296).
+    ///
+    /// OpenFan writes go on until [`Self::suspend_openfan_writes`]: while the
+    /// run only reads, the profile and the thermal force still reach every
+    /// channel.
+    pub fn try_begin_openfan_maintenance(
+        &self,
+        run_id: &str,
+        first_stage: &'static str,
+    ) -> Result<(), MaintenanceRefusal> {
+        let mut state = self.inner.write();
+        if state.openfan_maintenance_running() {
+            return Err(MaintenanceRefusal::MaintenanceActive);
+        }
+        if state.openfan_link != Some(OpenFanLink::Connected) {
+            return Err(MaintenanceRefusal::LinkNotReady(state.openfan_link));
+        }
+        // Never over a board the last run left needing recovery. The link can
+        // still read `connected` then: the poll loop marks it lost only when it
+        // handles the loan's end, and a run that panicked dropped its claim
+        // before its loan (as does a hand-back the loop did not settle in
+        // time). The loop's first good poll clears the recovery, and a start is
+        // accepted again.
+        if matches!(
+            state.openfan_maintenance,
+            Some(OpenFanMaintenance::NeedsRecovery { .. })
+        ) {
+            return Err(MaintenanceRefusal::RecoveryPending);
+        }
+        if state.verify_in_progress {
+            return Err(MaintenanceRefusal::DiagnosticActive);
+        }
+        if state.thermal_override_state.as_deref() == Some("emergency") {
+            return Err(MaintenanceRefusal::ThermalEmergency);
+        }
+        state.openfan_maintenance = Some(OpenFanMaintenance::Running {
+            run_id: run_id.to_string(),
+            stage: first_stage,
+            stage_deadline: None,
+            writes_suspended: false,
+        });
+        Ok(())
+    }
+
+    /// Suspend OpenFan writes for the run that owns the controller, from the
+    /// moment it parks the channels. `false` if `run_id` no longer owns it.
+    ///
+    /// [SAFETY] Takes effect for the engine's next channel write, whichever
+    /// way the race goes: every engine and thermal-force write re-checks this
+    /// while holding the controller lock (DEC-191), and the run's own parking
+    /// writes take that lock after this returns — so a write that checked
+    /// before this lands before the parking write to its channel, never after.
+    pub fn suspend_openfan_writes(&self, run_id: &str) -> bool {
+        let mut state = self.inner.write();
+        match &mut state.openfan_maintenance {
+            Some(OpenFanMaintenance::Running {
+                run_id: id,
+                writes_suspended,
+                ..
+            }) if id == run_id => {
+                if !*writes_suspended {
+                    *writes_suspended = true;
+                    log::info!(
+                        "OpenFan firmware update {run_id}: OpenFan writes suspended while the \
+                         update holds the controller"
+                    );
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Move a running update to its next stage. `false` if `run_id` no longer
+    /// owns the controller.
+    pub fn set_openfan_maintenance_stage(
+        &self,
+        run_id: &str,
+        next: &'static str,
+        deadline: Option<Instant>,
+    ) -> bool {
+        let mut state = self.inner.write();
+        match &mut state.openfan_maintenance {
+            Some(OpenFanMaintenance::Running {
+                run_id: id,
+                stage,
+                stage_deadline,
+                ..
+            }) if id == run_id => {
+                *stage = next;
+                *stage_deadline = deadline;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Lift the write suspension of a running update: the poll loop has the
+    /// port back, so the engine and the thermal force may write again.
+    pub fn resume_openfan_writes(&self, run_id: &str) -> bool {
+        let mut state = self.inner.write();
+        match &mut state.openfan_maintenance {
+            Some(OpenFanMaintenance::Running {
+                run_id: id,
+                writes_suspended,
+                ..
+            }) if id == run_id => {
+                if *writes_suspended {
+                    *writes_suspended = false;
+                    log::info!(
+                        "OpenFan firmware update {run_id}: OpenFan writes resume — the poll loop \
+                         has the controller back"
+                    );
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Release a running update's claim. `needs_recovery` names the outcome of
+    /// a run that left the board outside normal control: writes then stay
+    /// suspended until the link reports `Connected` (see
+    /// [`Self::set_openfan_link`]). Idempotent; a stale `run_id` is ignored.
+    pub fn end_openfan_maintenance(&self, run_id: &str, needs_recovery: Option<&'static str>) {
+        let mut state = self.inner.write();
+        let Some(OpenFanMaintenance::Running {
+            run_id: id,
+            writes_suspended,
+            ..
+        }) = &state.openfan_maintenance
+        else {
+            return;
+        };
+        if id != run_id {
+            return;
+        }
+        let was_suspended = *writes_suspended;
+        match needs_recovery {
+            Some(outcome) => {
+                log::warn!(
+                    "OpenFan firmware update {run_id} ended with the board outside normal control \
+                     ({outcome}) — OpenFan writes stay suspended until the controller answers again"
+                );
+                state.openfan_maintenance = Some(OpenFanMaintenance::NeedsRecovery {
+                    run_id: run_id.to_string(),
+                    outcome,
+                });
+            }
+            None => {
+                if was_suspended {
+                    log::info!("OpenFan firmware update {run_id} ended — OpenFan writes resume");
+                }
+                state.openfan_maintenance = None;
+            }
+        }
+    }
+
+    /// At startup, for a run this start found interrupted after it had asked
+    /// the board to enter its bootloader: report the board as needing recovery
+    /// until the poll loop next reports `Connected`. Never replaces a run.
+    pub fn restore_openfan_recovery(&self, run_id: &str, outcome: &'static str) {
+        let mut state = self.inner.write();
+        if state.openfan_maintenance.is_none() {
+            state.openfan_maintenance = Some(OpenFanMaintenance::NeedsRecovery {
+                run_id: run_id.to_string(),
+                outcome,
+            });
+        }
+    }
+
+    pub fn openfan_maintenance(&self) -> Option<OpenFanMaintenance> {
+        self.inner.read().openfan_maintenance.clone()
+    }
+
+    /// See [`DaemonState::openfan_maintenance_running`].
+    pub fn openfan_maintenance_running(&self) -> bool {
+        self.inner.read().openfan_maintenance_running()
+    }
+
+    /// See [`DaemonState::openfan_writes_suspended`]. The thermal force's gate.
+    pub fn openfan_writes_suspended(&self) -> bool {
+        self.inner.read().openfan_writes_suspended()
+    }
+
+    /// The gate for every OpenFan write the engine makes outside the thermal
+    /// force: the diagnostic pause or a firmware update, read under one guard.
+    pub fn openfan_writes_paused(&self) -> bool {
+        let state = self.inner.read();
+        state.verify_active_at(Instant::now()) || state.openfan_writes_suspended()
     }
 
     /// Relinquish a GPU fan to firmware-auto: the profile engine stops writing
@@ -2571,5 +2827,168 @@ mod tests {
             1,
             "channel 1 was measured before and is missing now"
         );
+    }
+
+    // ── DEC-481: a firmware update and the diagnostic slot ───────────
+
+    fn connected() -> StateCache {
+        let cache = StateCache::new();
+        cache.set_openfan_link(OpenFanLink::Connected);
+        cache
+    }
+
+    #[test]
+    fn an_update_refuses_every_diagnostic_and_a_diagnostic_refuses_an_update() {
+        let cache = connected();
+        cache
+            .try_begin_openfan_maintenance("r1", "preparing")
+            .expect("free");
+        assert!(
+            cache.try_begin_verify(Duration::from_secs(30)).is_none(),
+            "update first: the diagnostic is refused"
+        );
+        cache.end_openfan_maintenance("r1", None);
+
+        let epoch = cache
+            .try_begin_verify(Duration::from_secs(30))
+            .expect("free again");
+        assert_eq!(
+            cache.try_begin_openfan_maintenance("r2", "preparing"),
+            Err(MaintenanceRefusal::DiagnosticActive),
+            "diagnostic first: the update is refused"
+        );
+        cache.end_verify(epoch);
+        assert!(cache
+            .try_begin_openfan_maintenance("r2", "preparing")
+            .is_ok());
+    }
+
+    #[test]
+    fn an_update_refuses_a_diagnostic_claim_that_lapsed_but_was_never_released() {
+        // DEC-296: a diagnostic may steal such a claim; an update must not —
+        // the holder may still be driving hardware.
+        let cache = connected();
+        let _epoch = cache.try_begin_verify(Duration::ZERO).expect("free");
+        assert!(
+            !cache.verify_active(),
+            "precondition: its deadman has lapsed"
+        );
+        assert_eq!(
+            cache.try_begin_openfan_maintenance("r1", "preparing"),
+            Err(MaintenanceRefusal::DiagnosticActive)
+        );
+    }
+
+    #[test]
+    fn an_update_needs_a_connected_link_no_emergency_and_no_other_update() {
+        let cache = StateCache::new();
+        assert_eq!(
+            cache.try_begin_openfan_maintenance("r1", "preparing"),
+            Err(MaintenanceRefusal::LinkNotReady(None))
+        );
+        cache.set_openfan_link(OpenFanLink::Unresponsive);
+        assert_eq!(
+            cache.try_begin_openfan_maintenance("r1", "preparing"),
+            Err(MaintenanceRefusal::LinkNotReady(Some(
+                OpenFanLink::Unresponsive
+            )))
+        );
+        cache.set_openfan_link(OpenFanLink::Connected);
+        cache.record_engine_tick("emergency", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
+        assert_eq!(
+            cache.try_begin_openfan_maintenance("r1", "preparing"),
+            Err(MaintenanceRefusal::ThermalEmergency)
+        );
+        cache.record_engine_tick("normal", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
+        cache
+            .try_begin_openfan_maintenance("r1", "preparing")
+            .unwrap();
+        assert_eq!(
+            cache.try_begin_openfan_maintenance("r2", "preparing"),
+            Err(MaintenanceRefusal::MaintenanceActive)
+        );
+        assert_eq!(
+            cache.read_with(|st| st.openfan_link_wire()),
+            Some("maintenance")
+        );
+    }
+
+    #[test]
+    fn racing_an_update_against_a_diagnostic_never_lets_both_start() {
+        let cache = Arc::new(connected());
+        for _ in 0..200 {
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let (c, b) = (cache.clone(), barrier.clone());
+            let verify = std::thread::spawn(move || {
+                b.wait();
+                c.try_begin_verify(Duration::from_secs(30))
+            });
+            barrier.wait();
+            let update = cache
+                .try_begin_openfan_maintenance("r", "preparing")
+                .is_ok();
+            let epoch = verify.join().unwrap();
+            assert!(
+                !(update && epoch.is_some()),
+                "an update and a diagnostic both started"
+            );
+            assert!(update || epoch.is_some(), "one of them must win");
+            if update {
+                cache.end_openfan_maintenance("r", None);
+            }
+            if let Some(e) = epoch {
+                cache.end_verify(e);
+            }
+        }
+    }
+
+    #[test]
+    fn a_board_needing_recovery_is_cleared_only_by_the_link_answering() {
+        let cache = connected();
+        cache
+            .try_begin_openfan_maintenance("r1", "preparing")
+            .unwrap();
+        cache.end_openfan_maintenance("r1", Some("needs_recovery"));
+        assert!(cache.openfan_writes_suspended());
+        cache.set_openfan_link(OpenFanLink::Reconnecting);
+        cache.set_openfan_link(OpenFanLink::Unresponsive);
+        assert!(cache.openfan_writes_suspended(), "only `Connected` ends it");
+        cache.set_openfan_link(OpenFanLink::Connected);
+        assert!(!cache.openfan_writes_suspended());
+        assert!(cache.openfan_maintenance().is_none());
+        // Restored at boot, it never replaces a run.
+        cache
+            .try_begin_openfan_maintenance("r2", "preparing")
+            .unwrap();
+        cache.restore_openfan_recovery("r0", "needs_recovery");
+        assert!(cache.openfan_maintenance_running());
+    }
+
+    /// A run that panicked releases its claim before its loan, so it ends
+    /// needing recovery while the link still reads `connected`. A start then
+    /// would have replaced the recovery with a run of its own — and that run's
+    /// end, finding nothing wrong with itself, would have lifted the write
+    /// suspension and the critical health over a board still not answering.
+    #[test]
+    fn an_update_never_starts_over_a_board_left_needing_recovery() {
+        let cache = connected();
+        cache
+            .try_begin_openfan_maintenance("r1", "preparing")
+            .unwrap();
+        cache.end_openfan_maintenance("r1", Some("needs_recovery"));
+        assert_eq!(cache.openfan_link(), Some(OpenFanLink::Connected));
+        assert_eq!(
+            cache.try_begin_openfan_maintenance("r2", "preparing"),
+            Err(MaintenanceRefusal::RecoveryPending)
+        );
+        assert!(matches!(
+            cache.openfan_maintenance(),
+            Some(OpenFanMaintenance::NeedsRecovery { ref run_id, .. }) if run_id == "r1"
+        ));
+        // The poll loop's next good poll ends the recovery; a start is accepted.
+        cache.set_openfan_link(OpenFanLink::Connected);
+        cache
+            .try_begin_openfan_maintenance("r2", "preparing")
+            .unwrap();
     }
 }

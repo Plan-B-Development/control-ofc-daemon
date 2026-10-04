@@ -134,10 +134,7 @@ pub async fn stall_probe_handler(
     let Some(verify_guard) =
         super::begin_verify_pause(&state.cache, crate::constants::VERIFY_PAUSE_DEADMAN)
     else {
-        return error_response(
-            StatusCode::CONFLICT,
-            &ErrorEnvelope::validation("a hardware verify or calibration is already in progress"),
-        );
+        return super::verify_slot_refusal(&state.cache);
     };
 
     let verify_lease_id = {

@@ -112,6 +112,19 @@ impl FanController {
         }
     }
 
+    /// Whether a firmware update holds this controller or left it needing
+    /// recovery (DEC-481) — the exit floor reports its channels as one line then.
+    pub fn firmware_update_holds(&self) -> bool {
+        self.cache.openfan_maintenance().is_some()
+    }
+
+    /// Read one of the controller's information blocks (`>05`, `>06`) under the
+    /// transport lock, like any other exchange (DEC-481). Information only.
+    pub fn read_info(&mut self, opcode: u8) -> Result<Vec<(String, String)>, SerialError> {
+        let mut transport = self.transport.lock();
+        crate::serial::transport::read_info_block(&mut **transport, opcode, self.timeout)
+    }
+
     /// The duty this controller last put on `channel`, or `None` when it does not
     /// know it: nothing written since it started, the device may have lost it (a
     /// reconnect or resume clears every channel — DEC-256), or the last command's

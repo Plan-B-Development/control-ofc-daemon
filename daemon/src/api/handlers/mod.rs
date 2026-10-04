@@ -12,6 +12,7 @@ mod hw_diagnostics;
 mod hwmon_ctl;
 mod inventory;
 mod openfan;
+mod openfan_firmware;
 mod path_confine;
 mod profile;
 pub mod stall_probe;
@@ -26,6 +27,7 @@ pub use hw_diagnostics::*;
 pub use hwmon_ctl::*;
 pub use inventory::*;
 pub use openfan::*;
+pub use openfan_firmware::*;
 pub use profile::*;
 pub use status::*;
 
@@ -564,6 +566,10 @@ pub struct AppState {
     /// a [`AdoptedTasks`] rather than a bare `Vec` for exactly that: closing and
     /// draining is one critical section, and so is checking-then-registering.
     pub adopted_poll_tasks: Arc<Mutex<AdoptedTasks>>,
+    /// OpenFan firmware updates (DEC-481): the poll loop's port-lending channel,
+    /// the current or last run's record, its cancel flag and its task for the
+    /// shutdown drain. The run's claim on the controller lives in the cache.
+    pub openfan_maintenance: Arc<crate::openfan_maintenance::MaintenanceSlot>,
     /// Detected AMD GPU info (populated at startup). Empty if no AMD GPU found.
     pub amd_gpus: Vec<crate::hwmon::gpu_detect::AmdGpuInfo>,
     /// Detected Intel discrete GPU info (populated at startup). Empty if none
@@ -1032,6 +1038,36 @@ pub(crate) fn begin_verify_pause(
         })
 }
 
+/// The 409 for a refused [`begin_verify_pause`]. While a firmware update holds
+/// the OpenFan controller every claimant is refused (DEC-481), and the answer
+/// says so in `details.reason`, so a client can tell it from a diagnostic.
+pub(crate) fn verify_slot_refusal(
+    cache: &crate::health::cache::StateCache,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if cache.openfan_maintenance_running() {
+        return openfan_maintenance_conflict();
+    }
+    error_response(
+        StatusCode::CONFLICT,
+        &ErrorEnvelope::validation("a hardware verify or calibration is already in progress"),
+    )
+}
+
+/// The `details.reason` of every refusal caused by a running firmware update.
+pub const OPENFAN_MAINTENANCE_REASON: &str = "openfan_maintenance";
+
+/// The answer of every route refused while a firmware update runs (DEC-481):
+/// 409 `validation_error`, retryable, `details.reason: "openfan_maintenance"`.
+/// An older client that reads only `message` still shows why.
+pub(crate) fn openfan_maintenance_conflict() -> (StatusCode, Json<serde_json::Value>) {
+    let mut e = ErrorEnvelope::validation(
+        "an OpenFan firmware update is running — try again once it has finished",
+    );
+    e.error.retryable = true;
+    e.error.details = Some(serde_json::json!({ "reason": OPENFAN_MAINTENANCE_REASON }));
+    error_response(StatusCode::CONFLICT, &e)
+}
+
 /// Refuse to START a hardware fan verify when it would fight thermal safety.
 ///
 /// **Corrected in DEC-297 (AUD-l).** This comment used to say a verify "pauses
@@ -1160,7 +1196,35 @@ where
     }
 }
 
-// Eight since DEC-443's `cooling`: each argument is one snapshot-guarded read
+/// `status.openfan_link` and `status.openfan_maintenance` (DEC-481), read under
+/// the same guard as the health entry they explain.
+pub(crate) struct OpenFanStatusEntries {
+    pub link: Option<String>,
+    pub maintenance: Option<OpenFanMaintenanceSummary>,
+}
+
+pub(crate) fn build_openfan_status_entries(snap: &DaemonState) -> OpenFanStatusEntries {
+    use crate::health::state::OpenFanMaintenance;
+    OpenFanStatusEntries {
+        link: snap.openfan_link_wire().map(str::to_string),
+        maintenance: snap.openfan_maintenance.as_ref().map(|m| match m {
+            OpenFanMaintenance::Running { run_id, stage, .. } => OpenFanMaintenanceSummary {
+                run_id: run_id.clone(),
+                stage: stage.to_string(),
+                state: "running".into(),
+                outcome: None,
+            },
+            OpenFanMaintenance::NeedsRecovery { run_id, outcome } => OpenFanMaintenanceSummary {
+                run_id: run_id.clone(),
+                stage: crate::openfan_maintenance::stage::FINISHED.into(),
+                state: "needs_recovery".into(),
+                outcome: Some(outcome.to_string()),
+            },
+        }),
+    }
+}
+
+// Nine since DEC-481's `openfan`: each argument is one snapshot-guarded read
 // the two callers build under a single `read_with`, so bundling them would only
 // move the list into a struct both callers must fill field by field.
 #[allow(clippy::too_many_arguments)]
@@ -1173,6 +1237,7 @@ pub(crate) fn build_status_response(
     health: crate::health::staleness::HealthSummary,
     verify_active: bool,
     cooling: CoolingSafetyEntries,
+    openfan: OpenFanStatusEntries,
 ) -> StatusResponse {
     // `AUD3-m`. Hoisted out of the struct literal deliberately: a temporary in a
     // field initialiser lives until the end of the whole statement, so reading it
@@ -1293,6 +1358,9 @@ pub(crate) fn build_status_response(
         emergency_causes: cooling.emergency_causes,
         pump_stalls: cooling.pump_stalls,
         advisories: cooling.advisories,
+        // DEC-481: under the same guard as `health`'s `openfan` entry.
+        openfan_link: openfan.link,
+        openfan_maintenance: openfan.maintenance,
     }
 }
 
@@ -1334,6 +1402,46 @@ mod tests {
     use super::*;
     use crate::health::state::DaemonState;
     use std::time::Instant;
+
+    /// DEC-481: a refused diagnostic says why — a firmware update holding the
+    /// slot is a reason a client can show, not the generic "already running".
+    #[test]
+    fn a_refused_diagnostic_names_a_running_firmware_update() {
+        use crate::health::state::OpenFanLink;
+        let cache = crate::health::cache::StateCache::new();
+        let (code, Json(v)) = verify_slot_refusal(&cache);
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(v["error"]["details"].is_null(), "{v}");
+        cache.set_openfan_link(OpenFanLink::Connected);
+        cache
+            .try_begin_openfan_maintenance("r1", "preparing")
+            .unwrap();
+        let (code, Json(v)) = verify_slot_refusal(&cache);
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(v["error"]["code"], "validation_error");
+        assert_eq!(v["error"]["retryable"], true);
+        assert_eq!(v["error"]["details"]["reason"], OPENFAN_MAINTENANCE_REASON);
+    }
+
+    #[test]
+    fn a_board_needing_recovery_is_summarised_with_its_outcome() {
+        use crate::health::state::{OpenFanLink, OpenFanMaintenance};
+        let mut snap = DaemonState::default();
+        let none = build_openfan_status_entries(&snap);
+        assert!(none.link.is_none() && none.maintenance.is_none());
+        snap.openfan_link = Some(OpenFanLink::Reconnecting);
+        snap.openfan_maintenance = Some(OpenFanMaintenance::NeedsRecovery {
+            run_id: "r1".into(),
+            outcome: "needs_recovery",
+        });
+        let e = build_openfan_status_entries(&snap);
+        assert_eq!(e.link.as_deref(), Some("reconnecting"));
+        let m = e.maintenance.unwrap();
+        assert_eq!(
+            (m.state.as_str(), m.outcome.as_deref(), m.run_id.as_str()),
+            ("needs_recovery", Some("needs_recovery"), "r1")
+        );
+    }
 
     #[test]
     fn json_ok_serializes_valid_struct() {

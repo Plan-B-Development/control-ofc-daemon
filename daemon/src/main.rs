@@ -1214,6 +1214,11 @@ fn apply_exit_floor(
                 );
                 return;
             };
+            // DEC-481: the writes are still attempted, but while a firmware
+            // update holds the controller (or left it outside normal control)
+            // their failure is expected, and one line says so.
+            let held = guard.firmware_update_holds();
+            let mut missed: Vec<String> = Vec::new();
             for w in guard.apply_exit_floor(floor_pct) {
                 match &w.result {
                     Ok(done) if done.coalesced => {}
@@ -1227,6 +1232,10 @@ fn apply_exit_floor(
                                 .map_or("unknown".to_string(), |p| format!("{p} %"))
                         );
                     }
+                    Err(_) if held => {
+                        f.fetch_add(1, SeqCst);
+                        missed.push(w.channel.to_string());
+                    }
                     Err(e) => {
                         f.fetch_add(1, SeqCst);
                         log::error!(
@@ -1237,6 +1246,14 @@ fn apply_exit_floor(
                         );
                     }
                 }
+            }
+            if !missed.is_empty() {
+                log::error!(
+                    "OpenFan: the {floor_pct} % exit floor did not reach channel(s) {} — a \
+                     firmware update holds the controller or left it outside normal control, \
+                     so they keep whatever duty the board holds",
+                    missed.join(", ")
+                );
             }
         });
         if !finished {
@@ -1906,6 +1923,23 @@ async fn shutdown_sequence<G, F>(
     restore_hardware();
 }
 
+/// `primary` and `others` as one drain entry: a task that finishes when all of
+/// them have. Overrunning the drain's timeout detaches it, and with it the
+/// tasks it waits on, exactly as it would each of them alone.
+fn join_with(
+    primary: Option<tokio::task::JoinHandle<()>>,
+    others: Vec<tokio::task::JoinHandle<()>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if others.is_empty() {
+        return primary;
+    }
+    Some(tokio::spawn(async move {
+        for handle in primary.into_iter().chain(others) {
+            let _ = handle.await;
+        }
+    }))
+}
+
 /// `shutdown_sequence`, then the restart-forcing exit — deliberately ONE unit.
 ///
 /// The ordering is the safety property (DEC-266/267): the hardware must be back
@@ -2303,6 +2337,9 @@ async fn async_main(cli: CliOptions) {
             },
         ) {
             log::info!("OpenFanController connected on {port}");
+            // DEC-481: the node a firmware update reads the board's USB identity
+            // through. The poll loop keeps it current from here.
+            cache.set_openfan_port(&port);
             boot_survey = Some(control_ofc_daemon::serial::adoption::ReconnectSurvey::new(
                 config.serial.port.clone(),
                 &port,
@@ -2604,6 +2641,7 @@ async fn async_main(cli: CliOptions) {
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
+        openfan_maintenance: Default::default(),
         amd_gpus,
         intel_gpus,
         nvidia_gpus,
@@ -2729,12 +2767,24 @@ async fn async_main(cli: CliOptions) {
         });
     }
 
+    // ── DEC-481: the last OpenFan firmware update ───────────────────
+    // Before the poll loop: a run the last stop interrupted is finished here,
+    // never resumed, and a board it left in its bootloader is reported as such.
+    let openfan_recovery = control_ofc_daemon::api::handlers::recover_openfan_maintenance(
+        &app_state,
+        Path::new(control_ofc_daemon::serial::usb_identity::SYSFS_ROOT),
+        &control_ofc_daemon::openfan_maintenance::journal::path(),
+    );
+
     // ── Spawn OpenFanController polling loop ────────────────────────
     let openfan_poll_handle =
         if let (Some(transport), Some(survey)) = (openfan_transport, boot_survey) {
             let openfan_cache = cache.clone();
             let openfan_interval = Duration::from_millis(config.polling.poll_interval_ms);
             let openfan_shutdown = poll_shutdown_rx.clone();
+            // DEC-481: a firmware update borrows the port through this loop.
+            let (lender, loans) = control_ofc_daemon::serial::port_loan::loan_channel();
+            app_state.openfan_maintenance.set_lender(lender);
             Some(tokio::spawn(async move {
                 control_ofc_daemon::polling::openfan_poll_loop(
                     openfan_cache,
@@ -2743,6 +2793,7 @@ async fn async_main(cli: CliOptions) {
                     openfan_interval,
                     openfan_shutdown,
                     survey,
+                    loans,
                 )
                 .await;
             }))
@@ -2973,6 +3024,19 @@ async fn async_main(cli: CliOptions) {
         }))
     };
 
+    // DEC-481: a board the last update left outside normal control, which boot
+    // did not adopt, is watched for — read-only — and adopted when it returns.
+    // Not drained: it writes nothing, its adoption goes through the same
+    // shutdown-checked install as a rescan (`OFN-t`), and it ends on the
+    // shutdown watch.
+    if let Some(record) = openfan_recovery {
+        tokio::spawn(control_ofc_daemon::api::handlers::openfan_recovery_watch(
+            app_state.clone(),
+            record,
+            poll_shutdown_tx.subscribe(),
+        ));
+    }
+
     log::info!("Daemon ready — waiting for shutdown signal");
 
     // Handle SIGHUP (config reload), SIGINT/SIGTERM (shutdown), and IPC task
@@ -3069,6 +3133,16 @@ async fn async_main(cli: CliOptions) {
     // `shutdown_sequence`: stop the IPC server and drain the poll/engine tasks
     // BEFORE restoring hardware to automatic, so neither a late client write nor
     // an in-flight engine write can land after the restore.
+    // DEC-481: a running firmware update ends on the shutdown watch — it
+    // records how far it got, hands back the port or nothing, and releases its
+    // claim — so the exit floor below sees what it left. Joined with the
+    // OpenFan poll loop's entry rather than given one of its own, so the drain
+    // count (and with it `TimeoutStopSec`'s budget) is unchanged; closed here,
+    // with the adopted loops below, so a start racing the stop is refused.
+    let openfan_poll_handle = join_with(
+        openfan_poll_handle,
+        app_state.openfan_maintenance.close_and_drain(),
+    );
     let mut task_handles: Vec<(&'static str, tokio::task::JoinHandle<()>)> = [
         ("hwmon-poll", Some(hwmon_poll_handle)),
         ("openfan-poll", openfan_poll_handle),

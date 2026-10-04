@@ -302,10 +302,7 @@ pub async fn gpu_verify_handler(
     let Some(verify_guard) =
         super::begin_verify_pause(&state.cache, constants::VERIFY_PAUSE_DEADMAN)
     else {
-        return error_response(
-            StatusCode::CONFLICT,
-            &ErrorEnvelope::validation("a hardware verify or calibration is already in progress"),
-        );
+        return super::verify_slot_refusal(&state.cache);
     };
 
     // Release review, 2026-08-10. The verify pause above coordinates against the
@@ -1342,6 +1339,7 @@ mod tests {
             openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
             last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
             adopted_poll_tasks: Arc::new(parking_lot::Mutex::new(Default::default())),
+            openfan_maintenance: Default::default(),
             amd_gpus: vec![gpu],
             intel_gpus: Vec::new(),
             nvidia_gpus: Vec::new(),

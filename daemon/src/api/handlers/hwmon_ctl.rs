@@ -458,10 +458,7 @@ pub async fn hwmon_verify_handler(
     let Some(verify_guard) =
         super::begin_verify_pause(&state.cache, crate::constants::VERIFY_PAUSE_DEADMAN)
     else {
-        return error_response(
-            StatusCode::CONFLICT,
-            &ErrorEnvelope::validation("a hardware verify or calibration is already in progress"),
-        );
+        return super::verify_slot_refusal(&state.cache);
     };
     // Force-take a daemon-owned "verify" lease for our own controlled writes,
     // released by `VerifyLeaseGuard` (defined above the handler) on EVERY exit
@@ -1059,10 +1056,7 @@ pub async fn hwmon_characterize_handler(
     let Some(verify_guard) =
         super::begin_verify_pause(&state.cache, crate::constants::VERIFY_PAUSE_DEADMAN)
     else {
-        return error_response(
-            StatusCode::CONFLICT,
-            &ErrorEnvelope::validation("a hardware verify or calibration is already in progress"),
-        );
+        return super::verify_slot_refusal(&state.cache);
     };
 
     // [SAFETY] The UNION predicate, never the wire `role` (DEC-312): a user who
@@ -3827,6 +3821,7 @@ pub(crate) mod tests {
             openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
             last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
             adopted_poll_tasks: Arc::new(parking_lot::Mutex::new(Default::default())),
+            openfan_maintenance: Default::default(),
             amd_gpus: Vec::new(),
             intel_gpus: Vec::new(),
             nvidia_gpus: Vec::new(),

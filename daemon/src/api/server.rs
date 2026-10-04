@@ -175,6 +175,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         // `ROLE-f`: each OpenFan channel's role and pump protection.
         .route("/fans/openfan/roles", get(handlers::openfan_roles_handler))
+        // DEC-481: the OpenFan firmware update.
+        .route(
+            "/fans/openfan/device",
+            get(handlers::openfan_device_handler),
+        )
+        .route(
+            "/fans/openfan/maintenance",
+            get(handlers::openfan_maintenance_status_handler)
+                .post(handlers::openfan_maintenance_start_handler)
+                .delete(handlers::openfan_maintenance_cancel_handler),
+        )
         // Hardware diagnostics
         .route(
             "/diagnostics/hardware",
@@ -379,4 +390,195 @@ pub async fn serve(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// What a route does while an OpenFan firmware update holds the controller
+    /// (DEC-481).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DuringUpdate {
+        /// Refused: 409 `validation_error`, `details.reason: "openfan_maintenance"`.
+        Refused,
+        /// Refused only when it targets an OpenFan channel.
+        RefusedForOpenFan,
+        /// The update's own route.
+        Itself,
+        /// Answers as it always does: it neither drives the OpenFan controller
+        /// nor claims the diagnostic slot an update holds.
+        Unaffected,
+    }
+    use DuringUpdate::*;
+
+    /// Every route the router serves, classified. A route missing from here
+    /// fails [`every_route_says_what_it_does_during_a_firmware_update`] until
+    /// someone decides (DEC-367): a new route that drives the OpenFan
+    /// controller, or claims the diagnostic slot, must be refused while an
+    /// update holds the controller. The refusals are proven live in
+    /// `daemon/tests/ipc_integration.rs` (identify, override, rescan) and at
+    /// `verify_slot_refusal`'s call sites.
+    const ROUTES: &[(&str, &str, DuringUpdate)] = &[
+        ("GET", "/status", Unaffected),
+        ("GET", "/sensors", Unaffected),
+        ("GET", "/fans", Unaffected),
+        ("GET", "/poll", Unaffected),
+        ("GET", "/sensors/history", Unaffected),
+        ("POST", "/fans/openfan/{channel}/calibration", Refused),
+        ("GET", "/diagnostics/openfan-calibration", Unaffected),
+        ("DELETE", "/diagnostics/openfan-calibration", Unaffected),
+        ("POST", "/fans/openfan/{channel}/calibrate", Refused),
+        ("GET", "/capabilities", Unaffected),
+        ("POST", "/gpu/{gpu_id}/fan/reset", Unaffected),
+        ("POST", "/gpu/{gpu_id}/fan/verify", Refused),
+        ("GET", "/hwmon/headers", Unaffected),
+        ("POST", "/hwmon/{header_id}/verify", Refused),
+        ("POST", "/hwmon/{header_id}/characterize", Refused),
+        ("GET", "/diagnostics/characterization", Unaffected),
+        ("DELETE", "/diagnostics/characterization", Unaffected),
+        ("GET", "/diagnostics/preflight", Unaffected),
+        ("POST", "/hwmon/{header_id}/discover-control-path", Refused),
+        ("GET", "/diagnostics/control-path", Unaffected),
+        ("DELETE", "/diagnostics/control-path", Unaffected),
+        ("POST", "/hwmon/{header_id}/stall-probe", Refused),
+        ("GET", "/diagnostics/stall-probe", Unaffected),
+        ("DELETE", "/diagnostics/stall-probe", Unaffected),
+        ("POST", "/validation/session", Refused),
+        ("GET", "/validation/session", Unaffected),
+        ("DELETE", "/validation/session", Unaffected),
+        ("POST", "/validation/session/stop", Unaffected),
+        ("POST", "/validation/session/event", Unaffected),
+        ("POST", "/validation/session/measurement", Unaffected),
+        ("GET", "/validation/sessions", Unaffected),
+        ("GET", "/validation/sessions/{session_id}", Unaffected),
+        ("POST", "/hwmon/rescan", Unaffected),
+        ("POST", "/fans/openfan/rescan", Refused),
+        ("GET", "/fans/openfan/roles", Unaffected),
+        ("GET", "/fans/openfan/device", Itself),
+        ("GET", "/fans/openfan/maintenance", Itself),
+        ("POST", "/fans/openfan/maintenance", Itself),
+        ("DELETE", "/fans/openfan/maintenance", Itself),
+        ("GET", "/diagnostics/hardware", Unaffected),
+        ("GET", "/inventory/hwmon", Unaffected),
+        ("GET", "/inventory/cooling-devices", Unaffected),
+        ("GET", "/inventory/readiness", Unaffected),
+        ("GET", "/inventory/hardware-readiness", Unaffected),
+        ("GET", "/inventory/superio", Unaffected),
+        ("POST", "/inventory/superio/probe", Unaffected),
+        ("POST", "/control/{control_id}/override", RefusedForOpenFan),
+        // Release and renew stay open: a client can always let go, and a renew
+        // of an override the update's start released is refused as stale.
+        ("DELETE", "/control/{control_id}/override", Unaffected),
+        ("POST", "/control/{control_id}/override/renew", Unaffected),
+        ("POST", "/fans/{fan_id}/identify", RefusedForOpenFan),
+        ("GET", "/profile/active", Unaffected),
+        ("POST", "/profile/activate", Unaffected),
+        ("POST", "/profile/deactivate", Unaffected),
+        ("GET", "/profiles", Unaffected),
+        ("POST", "/profiles", Unaffected),
+        ("GET", "/profiles/{id}", Unaffected),
+        ("PUT", "/profiles/{id}", Unaffected),
+        ("DELETE", "/profiles/{id}", Unaffected),
+        ("GET", "/config", Unaffected),
+        ("POST", "/config/profile-search-dirs", Unaffected),
+        ("POST", "/config/startup-delay", Unaffected),
+        ("POST", "/config/exit-floor", Unaffected),
+        ("POST", "/config/coolant-limit", Unaffected),
+        ("POST", "/config/preferred-cpu-sensor", Unaffected),
+        ("POST", "/config/preferred-mb-sensor", Unaffected),
+        ("POST", "/config/header-role", Unaffected),
+        ("POST", "/config/cooling-device", Unaffected),
+        ("DELETE", "/config/cooling-device/{id}", Unaffected),
+        // The serial and polling setters persist for the next start.
+        ("POST", "/config/poll-interval", Unaffected),
+        ("POST", "/config/serial-port", Unaffected),
+        ("POST", "/config/serial-timeout", Unaffected),
+        ("POST", "/config/allow-port-probe", Unaffected),
+        ("POST", "/config/nvidia-telemetry", Unaffected),
+    ];
+
+    /// `(method, path)` for every `.route(` in `build_router`'s body — the
+    /// function's own text, brace-matched, with `//` comments dropped, so this
+    /// test's table and any comment naming a route are not read as routes.
+    fn served_routes() -> Vec<(String, String)> {
+        let src = include_str!("server.rs");
+        let start = src.find("pub fn build_router").expect("build_router");
+        let open = start + src[start..].find('{').expect("body");
+        let mut depth = 0usize;
+        let mut end = open;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body: String = src[open..end]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut routes = Vec::new();
+        let mut at = 0;
+        while let Some(found) = body[at..].find(".route(") {
+            let args_start = at + found + ".route(".len();
+            let mut depth = 1usize;
+            let mut args_end = args_start;
+            for (i, c) in body[args_start..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            args_end = args_start + i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let args = &body[args_start..args_end];
+            let path = args.split('"').nth(1).expect("a route's path literal");
+            for method in ["get", "post", "put", "delete", "patch"] {
+                let call = format!("{method}(handlers::");
+                if args
+                    .match_indices(&call)
+                    .any(|(i, _)| i == 0 || !args.as_bytes()[i - 1].is_ascii_alphanumeric())
+                {
+                    routes.push((method.to_ascii_uppercase(), path.to_string()));
+                }
+            }
+            at = args_end;
+        }
+        routes
+    }
+
+    #[test]
+    fn every_route_says_what_it_does_during_a_firmware_update() {
+        let served = served_routes();
+        assert!(
+            served.len() >= 70,
+            "precondition: the parse found the router's routes ({})",
+            served.len()
+        );
+        let unclassified: Vec<_> = served
+            .iter()
+            .filter(|(m, p)| !ROUTES.iter().any(|(rm, rp, _)| rm == m && rp == p))
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "classify these in ROUTES — does each one drive the OpenFan controller or \
+             claim the diagnostic slot? {unclassified:?}"
+        );
+        let stale: Vec<_> = ROUTES
+            .iter()
+            .filter(|(m, p, _)| !served.iter().any(|(sm, sp)| sm == m && sp == p))
+            .collect();
+        assert!(stale.is_empty(), "no longer served: {stale:?}");
+    }
 }

@@ -9,8 +9,8 @@ use axum::response::Json;
 
 use super::{
     build_control_output_entries, build_cooling_safety_entries, build_fan_entries,
-    build_sensor_entries, build_skipped_entries, build_status_response, build_unavailable_entries,
-    error_response, json_ok, AppState,
+    build_openfan_status_entries, build_sensor_entries, build_skipped_entries,
+    build_status_response, build_unavailable_entries, error_response, json_ok, AppState,
 };
 use crate::api::responses::*;
 use crate::health::staleness::{compute_health, OpenFanPresence};
@@ -48,7 +48,7 @@ pub async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusRe
     // EFF-1: read the state once under a shared guard instead of cloning the
     // whole `DaemonState`. Only pure reads happen inside; the override_table
     // lock in `build_status_response` stays outside the guard.
-    let (health, thermal_state, unavailable, skipped, outputs, verify_active, cooling) =
+    let (health, thermal_state, unavailable, skipped, outputs, verify_active, cooling, of) =
         state.cache.read_with(|snap| {
             (
                 compute_health(snap, &state.staleness_config, now, openfan),
@@ -63,6 +63,8 @@ pub async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusRe
                 snap.verify_active_at(now),
                 // DEC-443: under the same guard as `thermal_state`.
                 build_cooling_safety_entries(snap, now),
+                // DEC-481: under the same guard as the `openfan` health entry.
+                build_openfan_status_entries(snap),
             )
         });
     Json(build_status_response(
@@ -74,6 +76,7 @@ pub async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusRe
         health,
         verify_active,
         cooling,
+        of,
     ))
 }
 
@@ -115,6 +118,7 @@ pub async fn poll_handler(State(state): State<Arc<AppState>>) -> Json<PollRespon
         fans,
         verify_active,
         cooling,
+        of,
     ) = state.cache.read_with(|snap| {
         (
             compute_health(snap, &state.staleness_config, now, openfan),
@@ -128,6 +132,8 @@ pub async fn poll_handler(State(state): State<Arc<AppState>>) -> Json<PollRespon
             snap.verify_active_at(now),
             // DEC-443 — see the note in `status_handler`.
             build_cooling_safety_entries(snap, now),
+            // DEC-481 — see the note in `status_handler`.
+            build_openfan_status_entries(snap),
         )
     });
 
@@ -142,6 +148,7 @@ pub async fn poll_handler(State(state): State<Arc<AppState>>) -> Json<PollRespon
             health,
             verify_active,
             cooling,
+            of,
         ),
         sensors,
         fans,
@@ -496,6 +503,7 @@ pub async fn capabilities_handler(
             openfan_header_roles: true,
             // `ROLE-a`: an assigned `cpu_fan` earns the CPU/pump floor.
             cpu_fan_role_floor: true,
+            openfan_firmware_maintenance: true,
         },
     })
 }

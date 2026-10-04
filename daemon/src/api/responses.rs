@@ -177,6 +177,31 @@ pub struct StatusResponse {
     /// forced because of one. Omitted when none (additive).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub advisories: Vec<CoolingAdvisoryEntry>,
+    /// The OpenFan controller's connection (DEC-481): `"connected"`,
+    /// `"unresponsive"`, `"reconnecting"`, or `"maintenance"` while a firmware
+    /// update holds it. Separate from presence. Omitted when no controller has
+    /// been adopted (additive). A client renders an unrecognised token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openfan_link: Option<String>,
+    /// A firmware update running, or one that left the board needing recovery
+    /// (DEC-481). Omitted otherwise (additive). The full record is
+    /// `GET /fans/openfan/maintenance`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openfan_maintenance: Option<OpenFanMaintenanceSummary>,
+}
+
+/// `status.openfan_maintenance` (DEC-481).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OpenFanMaintenanceSummary {
+    pub run_id: String,
+    /// The stage token while `running`; `finished` once the run has ended
+    /// needing recovery.
+    pub stage: String,
+    /// `"running"` or `"needs_recovery"`.
+    pub state: String,
+    /// The run's outcome, present with `needs_recovery`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
 }
 
 /// One pump under the stall response, on `/status` + `/poll` (DEC-443).
@@ -1318,6 +1343,12 @@ pub struct ControlCapability {
     /// site enforces.
     #[serde(default)]
     pub cpu_fan_role_floor: bool,
+    /// The OpenFan firmware update (DEC-481): `status.openfan_link`,
+    /// `status.openfan_maintenance`, `GET /fans/openfan/device` and
+    /// `POST|GET|DELETE /fans/openfan/maintenance`. A client shows the update
+    /// only when this is true and a controller is present.
+    #[serde(default)]
+    pub openfan_firmware_maintenance: bool,
 }
 
 /// Per-device-group capability info.
@@ -1643,6 +1674,72 @@ pub struct OpenFanRescanResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<String>,
     pub message: String,
+}
+
+/// `GET /fans/openfan/device` (DEC-481): what the daemon can say about the
+/// OpenFan controller before an update — read from sysfs and from the board's
+/// own `>05`/`>06` answers — and whether an update could start now.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenFanDeviceResponse {
+    pub api_version: u32,
+    /// A controller is adopted.
+    pub present: bool,
+    /// As `status.openfan_link`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
+    /// The serial device the controller was adopted on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<String>,
+    /// The USB device behind it, from sysfs; absent when it cannot be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usb: Option<crate::serial::usb_identity::UsbDevice>,
+    /// The serial interface the daemon uses on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface_number: Option<u8>,
+    /// The `>05` block, or absent when the board did not answer it (or an
+    /// update holds the port).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hw_info: Option<std::collections::BTreeMap<String, String>>,
+    /// The `>06` block, likewise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fw_info: Option<std::collections::BTreeMap<String, String>>,
+    /// Whether `POST /fans/openfan/maintenance` would pass its checks now.
+    /// Informational — the POST decides again, atomically.
+    pub update_available: bool,
+    /// Why not, when it would not. Empty when `update_available`.
+    pub update_refusals: Vec<OpenFanUpdateRefusal>,
+}
+
+/// One reason an update could not start, as its 409 would give it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OpenFanUpdateRefusal {
+    /// The `details.reason` token.
+    pub reason: String,
+    pub message: String,
+}
+
+/// `POST /fans/openfan/maintenance` → 202 (DEC-481).
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenFanMaintenanceStartResponse {
+    pub api_version: u32,
+    pub run_id: String,
+    pub stage: String,
+}
+
+/// `GET /fans/openfan/maintenance` (DEC-481): the current or most recent run.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenFanMaintenanceResponse {
+    pub api_version: u32,
+    #[serde(flatten)]
+    pub record: crate::openfan_maintenance::MaintenanceRecord,
+}
+
+/// `DELETE /fans/openfan/maintenance` → 202 (DEC-481).
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenFanMaintenanceCancelResponse {
+    pub api_version: u32,
+    pub run_id: String,
+    pub cancel_requested: bool,
 }
 
 /// Response for `GET /fans/openfan/roles` (`ROLE-f`): every channel the
@@ -3495,6 +3592,104 @@ mod tests {
             "CoolingAdvisoryEntry",
         );
 
+        // DEC-481: the OpenFAN firmware update — the `/status` summary, the
+        // device answer and the run record with its parts. Every `Option` is
+        // `Some`, so a key `skip_serializing_if` would drop stays pinned.
+        let summary = OpenFanMaintenanceSummary {
+            run_id: "ofmaint-1".into(),
+            stage: "finished".into(),
+            state: "needs_recovery".into(),
+            outcome: Some("needs_recovery".into()),
+        };
+        expect(
+            &serde_json::to_value(&summary).unwrap(),
+            "OpenFanMaintenanceSummary",
+        );
+        let usb = crate::serial::usb_identity::UsbDevice {
+            port: "8-8".into(),
+            vendor_id: "2e8a".into(),
+            product_id: "000a".into(),
+            manufacturer: Some("Karanovic Research".into()),
+            product: Some("OpenFan".into()),
+            serial: Some("DE615CB14721492C".into()),
+            bcd_device: Some("0100".into()),
+            config_descriptor_hex: Some("09028d00".into()),
+        };
+        expect(&serde_json::to_value(&usb).unwrap(), "UsbDevice");
+        let refusal = OpenFanUpdateRefusal {
+            reason: "calibration_active".into(),
+            message: "an OpenFan calibration is running".into(),
+        };
+        expect(
+            &serde_json::to_value(&refusal).unwrap(),
+            "OpenFanUpdateRefusal",
+        );
+        let info = std::collections::BTreeMap::from([("HW_REV".to_string(), "01".to_string())]);
+        let device = OpenFanDeviceResponse {
+            api_version: 1,
+            present: true,
+            link: Some("connected".into()),
+            port: Some("/dev/ttyACM1".into()),
+            usb: Some(usb.clone()),
+            interface_number: Some(0),
+            hw_info: Some(info.clone()),
+            fw_info: Some(info.clone()),
+            update_available: false,
+            update_refusals: vec![refusal],
+        };
+        expect(
+            &serde_json::to_value(&device).unwrap(),
+            "OpenFanDeviceResponse",
+        );
+        let snapshot = crate::openfan_maintenance::BoardSnapshot {
+            usb: Some(usb),
+            hw_info: Some(info.clone()),
+            fw_info: Some(info.clone()),
+        };
+        expect(&serde_json::to_value(&snapshot).unwrap(), "BoardSnapshot");
+        let evidence = crate::openfan_maintenance::evidence::Evidence {
+            descriptor_changed: Some(true),
+            descriptor_matches_file: Some(true),
+            info_matches_file: Some(true),
+            info_changed: Some(true),
+            verdict: "consistent_with_file".into(),
+        };
+        expect(&serde_json::to_value(&evidence).unwrap(), "Evidence");
+        let timing = crate::openfan_maintenance::StageTiming {
+            stage: "preparing".into(),
+            started_unix_ms: 1,
+            ended_unix_ms: Some(2),
+        };
+        expect(&serde_json::to_value(&timing).unwrap(), "StageTiming");
+        let claim = crate::openfan_maintenance::FirmwareClaim {
+            sha256: "ab".repeat(32),
+            size: 512,
+            usb_config_descriptor_hex: Some("09028d00".into()),
+            info: Some(info),
+        };
+        expect(&serde_json::to_value(&claim).unwrap(), "FirmwareClaim");
+        let mut record = crate::openfan_maintenance::MaintenanceRecord::new(
+            "ofmaint-1".into(),
+            "DE615CB14721492C".into(),
+            claim,
+        );
+        record.stage_deadline_unix_ms = Some(3);
+        record.finished_unix_ms = Some(4);
+        record.outcome = Some("completed_build_not_confirmed".into());
+        record.outcome_detail = Some("control restored".into());
+        record.bootloader_trigger = Some(">07".into());
+        record.bootloader_drive = Some("sdb".into());
+        record.other_bootloader_drives = vec!["sdc".into()];
+        record.notes = vec!["a note".into()];
+        record.stages = vec![timing];
+        record.usb_port = Some("8-8".into());
+        record.interface_number = Some(0);
+        record.tty = Some("/dev/ttyACM1".into());
+        record.before = snapshot.clone();
+        record.after = Some(snapshot);
+        record.evidence = Some(evidence);
+        expect(&serde_json::to_value(&record).unwrap(), "MaintenanceRecord");
+
         // **Both directions, and this is what makes the oracle an interlock
         // rather than a workflow (`P8-cb`).** A struct declared in the fixture
         // with no arm here is the `P8-ca` gap — sixteen entries the GUI checked
@@ -3727,6 +3922,8 @@ mod tests {
             emergency_causes: Vec::new(),
             pump_stalls: Vec::new(),
             advisories: Vec::new(),
+            openfan_link: None,
+            openfan_maintenance: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["api_version"], 1);
@@ -3792,6 +3989,8 @@ mod tests {
             emergency_causes: Vec::new(),
             pump_stalls: Vec::new(),
             advisories: Vec::new(),
+            openfan_link: None,
+            openfan_maintenance: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["readiness"]["overall"], "warning");
@@ -3831,6 +4030,8 @@ mod tests {
             emergency_causes: Vec::new(),
             pump_stalls: Vec::new(),
             advisories: Vec::new(),
+            openfan_link: None,
+            openfan_maintenance: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(
@@ -3870,6 +4071,8 @@ mod tests {
             emergency_causes: Vec::new(),
             pump_stalls: Vec::new(),
             advisories: Vec::new(),
+            openfan_link: None,
+            openfan_maintenance: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["skipped_controls"][0]["control_id"], "ctl-front");
@@ -3909,6 +4112,8 @@ mod tests {
             emergency_causes: Vec::new(),
             pump_stalls: Vec::new(),
             advisories: Vec::new(),
+            openfan_link: None,
+            openfan_maintenance: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(

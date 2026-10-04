@@ -27,6 +27,20 @@ pub trait SerialTransport {
     /// and a controller that is not reading never drains it. Best effort: a
     /// transport with nothing to discard, or that cannot, does nothing.
     fn discard_pending_output(&mut self) {}
+
+    /// Ask the controller to enter its USB bootloader by switching the line to
+    /// 1200 baud, then close the port (DEC-481). Consumes the transport: the
+    /// controller resets in response, so nothing may be sent through it after.
+    ///
+    /// Only a firmware update calls this, on the port the poll loop lent it, and
+    /// only when `>07` did not take the board out of normal mode. The default
+    /// refuses, so a transport that cannot change its line speed says so instead
+    /// of pretending.
+    fn touch_1200_baud(self: Box<Self>) -> Result<(), SerialError> {
+        Err(SerialError::Protocol {
+            message: "this transport cannot change its line speed".to_string(),
+        })
+    }
 }
 
 /// What the shared transport slot holds while the poll loop is looking for a
@@ -45,6 +59,33 @@ impl DisconnectedTransport {
 }
 
 impl SerialTransport for DisconnectedTransport {
+    fn write_line(&mut self, _data: &str) -> Result<(), SerialError> {
+        Err(SerialError::Protocol {
+            message: Self::MESSAGE.to_string(),
+        })
+    }
+
+    fn read_line(&mut self, _timeout: Duration) -> Result<String, SerialError> {
+        Err(SerialError::Protocol {
+            message: Self::MESSAGE.to_string(),
+        })
+    }
+}
+
+/// What the shared transport slot holds while the poll loop has lent the port
+/// to a firmware update (DEC-481).
+///
+/// Fails every call at once, like [`DisconnectedTransport`]. OpenFan writes are
+/// suspended for the whole update, so nothing should reach it; a stray call is
+/// reported failed rather than queued behind a port that is not here.
+pub struct MaintenanceTransport;
+
+impl MaintenanceTransport {
+    const MESSAGE: &'static str =
+        "OpenFan controller is lent to a firmware update — writes are suspended";
+}
+
+impl SerialTransport for MaintenanceTransport {
     fn write_line(&mut self, _data: &str) -> Result<(), SerialError> {
         Err(SerialError::Protocol {
             message: Self::MESSAGE.to_string(),
@@ -208,6 +249,85 @@ pub fn send_command(
                 debug_lines_skipped += 1;
             }
         }
+    }
+}
+
+/// Most `KEY:VALUE` lines one information block may carry. The shipped blocks
+/// have six (`>05`) and two (`>06`).
+const MAX_INFO_LINES: usize = 16;
+
+/// Ask the controller for one of its information blocks — `>05` (hardware) or
+/// `>06` (firmware) — and return its `KEY:VALUE` pairs in order (DEC-481).
+///
+/// The reply spans several lines, which [`send_command`] cannot read: the
+/// `<05|` line (the first pair may follow the `|`), one pair per line, then a
+/// blank line. Debug lines before it are skipped as `send_command` skips them.
+/// A firmware that does not know the command answers `<05|` alone, which reads
+/// as an empty block once the blank line or the deadline arrives. A line that
+/// is not a pair (a log line, say) is ignored rather than reported as one.
+///
+/// Information only: nothing the daemon decides depends on these strings.
+pub fn read_info_block(
+    transport: &mut dyn SerialTransport,
+    opcode: u8,
+    timeout: Duration,
+) -> Result<Vec<(String, String)>, SerialError> {
+    use std::time::Instant;
+
+    transport.write_line(&crate::serial::protocol::encode_bare(opcode))?;
+    let deadline = Instant::now() + timeout;
+    let prefix = format!("<{opcode:02X}|");
+    let mut skipped = 0;
+    let first = loop {
+        if Instant::now() >= deadline {
+            return Err(SerialError::Timeout {
+                timeout_ms: timeout.as_millis() as u64,
+            });
+        }
+        if skipped >= MAX_DEBUG_LINES {
+            return Err(SerialError::Protocol {
+                message: format!("no reply to {opcode:#04X} after {skipped} other lines"),
+            });
+        }
+        let line = transport.read_line(deadline.saturating_duration_since(Instant::now()))?;
+        let line = line.trim_end_matches(['\r', '\n']);
+        if let Some(rest) = line.strip_prefix(&prefix) {
+            break rest.to_string();
+        }
+        skipped += 1;
+    };
+    let mut pairs = Vec::new();
+    push_info_pair(&mut pairs, &first);
+    for _ in 0..MAX_INFO_LINES {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Ok(line) = transport.read_line(deadline.saturating_duration_since(Instant::now()))
+        else {
+            break;
+        };
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            break;
+        }
+        push_info_pair(&mut pairs, line);
+    }
+    Ok(pairs)
+}
+
+/// Keep `line` if it is a `KEY:VALUE` pair with an upper-case key.
+fn push_info_pair(pairs: &mut Vec<(String, String)>, line: &str) {
+    let Some((key, value)) = line.split_once(':') else {
+        return;
+    };
+    let key_ok = !key.is_empty()
+        && key.len() <= 32
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+    let value_ok = value.len() <= 64 && value.bytes().all(|b| (0x20..0x7f).contains(&b));
+    if key_ok && value_ok && pairs.len() < MAX_INFO_LINES {
+        pairs.push((key.to_string(), value.trim().to_string()));
     }
 }
 

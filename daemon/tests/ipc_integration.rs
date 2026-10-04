@@ -120,6 +120,7 @@ fn test_app_state_inner(engine_ticked: bool, runtime_cfg: std::path::PathBuf) ->
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
+        openfan_maintenance: Default::default(),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -909,6 +910,7 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
+        openfan_maintenance: Default::default(),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -1194,6 +1196,7 @@ fn test_app_state_with_nvidia_gpu(
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
+        openfan_maintenance: Default::default(),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: vec![gpu],
@@ -1549,6 +1552,7 @@ fn test_app_state_with_headers(headers: Vec<PwmHeaderDescriptor>) -> Arc<AppStat
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
+        openfan_maintenance: Default::default(),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -1963,6 +1967,7 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
+        openfan_maintenance: Default::default(),
         amd_gpus: vec![unsupported],
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -2071,6 +2076,7 @@ fn test_app_state_with_amd_gpu_info(
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
+        openfan_maintenance: Default::default(),
         amd_gpus: vec![gpu],
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -2171,6 +2177,7 @@ fn test_app_state_with_amd_gpu(
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
+        openfan_maintenance: Default::default(),
         amd_gpus: vec![gpu],
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -3459,6 +3466,7 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
+        openfan_maintenance: Default::default(),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -3601,6 +3609,7 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
+        openfan_maintenance: Default::default(),
         amd_gpus: vec![pmfw],
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -3799,6 +3808,7 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
+        openfan_maintenance: Default::default(),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -3888,6 +3898,7 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
+        openfan_maintenance: Default::default(),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -9158,4 +9169,160 @@ async fn pwm_verification_records_are_published_per_header_and_advertised() {
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
+}
+
+// ── DEC-481: the OpenFan firmware update ─────────────────────────────
+
+/// `app_state_with_control`, with the control driving OpenFan channel 0.
+fn app_state_with_openfan_control(control_id: &str) -> Arc<AppState> {
+    let state = app_state_with_control(control_id);
+    if let Some(p) = state.active_profile.lock().as_mut() {
+        p.controls[0]
+            .members
+            .push(control_ofc_daemon::profile::ControlMember {
+                source: "openfan".into(),
+                member_id: "openfan:ch00".into(),
+                member_label: "Front".into(),
+                fan_zero_rpm: false,
+            });
+    }
+    state
+}
+
+/// What a start does to the shared state, without a controller to drive.
+fn claim_openfan_update(state: &Arc<AppState>) {
+    state
+        .cache
+        .set_openfan_link(control_ofc_daemon::health::state::OpenFanLink::Connected);
+    state
+        .cache
+        .try_begin_openfan_maintenance("ofmaint-it", "preparing")
+        .expect("free and connected");
+}
+
+fn assert_refused_for(body: &serde_json::Value, reason: &str) {
+    assert_eq!(body["error"]["code"], "validation_error", "{body}");
+    assert_eq!(body["error"]["retryable"], true, "{body}");
+    assert_eq!(body["error"]["details"]["reason"], reason, "{body}");
+}
+
+#[tokio::test]
+async fn openfan_update_routes_before_any_update() {
+    let (sock, _tx, _d) = start_test_server(test_app_state()).await;
+
+    let (_st, caps) = uds_get(&sock, "/capabilities").await;
+    assert_eq!(caps["control"]["openfan_firmware_maintenance"], true);
+
+    let (st, body) = uds_get(&sock, "/fans/openfan/maintenance").await;
+    assert_eq!(st, 404, "{body}");
+    assert_eq!(body["error"]["code"], "not_found");
+    let (st, _) = uds_delete(&sock, "/fans/openfan/maintenance").await;
+    assert_eq!(st, 404);
+
+    let (st, dev) = uds_get(&sock, "/fans/openfan/device").await;
+    assert_eq!(st, 200, "{dev}");
+    assert_eq!(dev["present"], false);
+    assert_eq!(dev["update_available"], false);
+    assert_eq!(dev["update_refusals"][0]["reason"], "openfan_not_connected");
+
+    let good = serde_json::json!({
+        "expected_usb_serial": "DE615CB14721492C",
+        "firmware": {"sha256": "ab".repeat(32), "size": 107_520},
+    });
+    let (st, body) = uds_post(&sock, "/fans/openfan/maintenance", &good).await;
+    assert_eq!(st, 409, "{body}");
+    assert_refused_for(&body, "openfan_not_connected");
+
+    let mut bad = good.clone();
+    bad["firmware"]["size"] = serde_json::json!(513);
+    let (st, body) = uds_post(&sock, "/fans/openfan/maintenance", &bad).await;
+    assert_eq!(st, 400, "{body}");
+
+    let (_st, status) = uds_get(&sock, "/status").await;
+    assert!(
+        status.get("openfan_link").is_none(),
+        "no controller, no link"
+    );
+    assert!(status.get("openfan_maintenance").is_none());
+}
+
+#[tokio::test]
+async fn a_running_update_shows_on_status_and_poll() {
+    let state = test_app_state();
+    claim_openfan_update(&state);
+    let (sock, _tx, _d) = start_test_server(state).await;
+    for path in ["/status", "/poll"] {
+        let (st, body) = uds_get(&sock, path).await;
+        assert_eq!(st, 200);
+        let status = if path == "/poll" {
+            &body["status"]
+        } else {
+            &body
+        };
+        assert_eq!(status["openfan_link"], "maintenance", "{path}");
+        let m = &status["openfan_maintenance"];
+        assert_eq!(m["run_id"], "ofmaint-it", "{path}");
+        assert_eq!(m["state"], "running");
+        assert_eq!(m["stage"], "preparing");
+        let openfan = status["subsystems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "openfan")
+            .unwrap()
+            .clone();
+        assert_eq!(openfan["status"], "warn", "{path}: {openfan}");
+        assert_eq!(openfan["reason"], "firmware update: preparing");
+    }
+}
+
+#[tokio::test]
+async fn a_running_update_refuses_what_would_touch_the_openfan_controller() {
+    let state = app_state_with_openfan_control("ctrl1");
+    claim_openfan_update(&state);
+    let (sock, _tx, _d) = start_test_server(state).await;
+
+    let (st, body) = uds_post(
+        &sock,
+        "/fans/openfan:ch00/identify",
+        &serde_json::json!({"action": "stop"}),
+    )
+    .await;
+    assert_eq!(st, 409, "{body}");
+    assert_refused_for(&body, "openfan_maintenance");
+    let (st, body) = uds_post(
+        &sock,
+        "/fans/openfan:ch00/identify",
+        &serde_json::json!({"action": "restore"}),
+    )
+    .await;
+    assert_eq!(st, 200, "a hold can always be cleared: {body}");
+
+    let (st, body) = uds_post(
+        &sock,
+        "/control/ctrl1/override",
+        &serde_json::json!({"pwm_percent": 80}),
+    )
+    .await;
+    assert_eq!(st, 409, "{body}");
+    assert_refused_for(&body, "openfan_maintenance");
+
+    let (st, body) = uds_post(&sock, "/fans/openfan/rescan", &serde_json::json!({})).await;
+    assert_eq!(st, 409, "{body}");
+    assert_refused_for(&body, "openfan_maintenance");
+}
+
+#[tokio::test]
+async fn a_running_update_leaves_other_fans_alone() {
+    // A control with no OpenFan member is still the user's to override.
+    let state = app_state_with_control("ctrl1");
+    claim_openfan_update(&state);
+    let (sock, _tx, _d) = start_test_server(state).await;
+    let (st, body) = uds_post(
+        &sock,
+        "/control/ctrl1/override",
+        &serde_json::json!({"pwm_percent": 80}),
+    )
+    .await;
+    assert_eq!(st, 200, "{body}");
 }

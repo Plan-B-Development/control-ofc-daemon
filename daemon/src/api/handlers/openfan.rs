@@ -597,10 +597,7 @@ fn start_openfan_calibration(
     let Some(pause) =
         super::begin_verify_pause(&state.cache, crate::constants::VERIFY_PAUSE_DEADMAN)
     else {
-        return Err(error_response(
-            StatusCode::CONFLICT,
-            &ErrorEnvelope::validation("a hardware verify or calibration is already in progress"),
-        ));
+        return Err(super::verify_slot_refusal(&state.cache));
     };
 
     let hold = cal::clamp_hold(hold_seconds, state.cache.openfan_poll_interval());
@@ -1009,6 +1006,12 @@ where
         );
     }
 
+    // DEC-481: a firmware update owns the controller and is watching its USB
+    // port itself; a probe now would open the very port it is waiting on.
+    if state.cache.openfan_maintenance_running() {
+        return super::openfan_maintenance_conflict();
+    }
+
     let timeout = state.openfan_runtime.timeout;
     let configured = state.running_config.serial.port.clone();
     // Enumerating candidates is a config read plus a sysfs/dev scan. It does NOT
@@ -1179,8 +1182,16 @@ where
                 // controller after `restore_hardware()` had already run.
                 let rt = task_state.openfan_runtime.clone();
                 let poll_cache = task_state.cache.clone();
+                let maintenance = task_state.openfan_maintenance.clone();
+                let adopted_on = port.clone();
                 match task_state.adopt_openfan_controller(ctrl, || {
                     tokio::spawn(async move {
+                        // DEC-481: published by the loop's own task, ahead of the
+                        // first `Connected` it reports, and not under the adoption
+                        // lock — which wants a bare `tokio::spawn`.
+                        let (lender, loans) = crate::serial::port_loan::loan_channel();
+                        poll_cache.set_openfan_port(&adopted_on);
+                        maintenance.set_lender(lender);
                         crate::polling::openfan_poll_loop(
                             poll_cache,
                             shared,
@@ -1188,6 +1199,7 @@ where
                             rt.interval,
                             rt.shutdown,
                             survey,
+                            loans,
                         )
                         .await;
                     })
@@ -1576,6 +1588,7 @@ mod tests {
             openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
             last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
             adopted_poll_tasks: Arc::new(parking_lot::Mutex::new(Default::default())),
+            openfan_maintenance: Default::default(),
             amd_gpus: Vec::new(),
             intel_gpus: Vec::new(),
             nvidia_gpus: Vec::new(),
@@ -2872,6 +2885,52 @@ mod tests {
             opened.lock().push(path.to_string());
             Ok(SilentTransport)
         }
+    }
+
+    /// DEC-481: a controller adopted by a rescan gets the lending channel a
+    /// boot-adopted one gets — its loop publishes the port and the lender
+    /// before its first `Connected` — so an update can borrow from it.
+    #[tokio::test]
+    async fn a_rescan_adoption_publishes_the_port_and_the_lending_channel() {
+        use crate::serial::port_loan::{borrow, LoanReturn};
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let state = adoption_state(rx);
+        assert!(state.openfan_maintenance.lender().is_none());
+        let frames = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let f = frames.clone();
+        let (code, body) = openfan_rescan_with(state.clone(), fake_enumerate, move |_: &str, _| {
+            Ok(EchoTransport(f.clone()))
+        })
+        .await;
+        assert_eq!(code, StatusCode::OK, "{:?}", body.0);
+        assert_eq!(body.0["adopted"], true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while state.openfan_maintenance.lender().is_none()
+            || state.cache.openfan_link() != Some(crate::health::state::OpenFanLink::Connected)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the loop never published"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(state.cache.openfan_port().as_deref(), Some("/dev/ttyFAKE0"));
+        let lender = state.openfan_maintenance.lender().unwrap();
+        let Ok(loan) = borrow(&lender, Duration::from_secs(2)).await else {
+            panic!("the adopted loop lends its port");
+        };
+        assert!(
+            loan.handle
+                .give_back(
+                    LoanReturn::Port {
+                        transport: loan.transport,
+                        path: "/dev/ttyFAKE0".into(),
+                    },
+                    Duration::from_secs(2),
+                )
+                .await
+        );
+        let _ = stop.send(true);
     }
 
     fn rescan_state() -> Arc<AppState> {

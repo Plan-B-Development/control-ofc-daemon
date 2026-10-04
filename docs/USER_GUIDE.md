@@ -311,6 +311,10 @@ invented for the gap.
 | `POST /hwmon/rescan` | Re-enumerate hwmon devices and return fresh header list |
 | `POST /fans/openfan/rescan` | Look for an OpenFanController and adopt it without restarting the daemon |
 | `GET /fans/openfan/roles` | Each OpenFan channel's role and whether the daemon protects it as a pump (`stop_permitted`, `effective_min_pwm_pct`) |
+| `GET /fans/openfan/device` | The OpenFAN controller's USB identity, its hardware and firmware reports, its link state, and whether a firmware update could start now — with each reason it could not (DEC-481, 3.8.0+) |
+| `POST /fans/openfan/maintenance` | Start an OpenFAN firmware update (DEC-481, 3.8.0+; `control.openfan_firmware_maintenance`). Body `{"expected_usb_serial": "<serial>", "firmware": {"sha256": "<hex>", "size": N, ...}}` — a fingerprint of the file, never a path. Parks every OpenFAN channel at 100 %, sends the board into its bootloader, waits up to 15 minutes for you to copy the file onto the `RPI-RP2` drive, then checks the board and restores control. `202` with the run id |
+| `GET /fans/openfan/maintenance` | The current or most recent firmware update: each stage's timing, the outcome and the before/after evidence. Survives a restart |
+| `DELETE /fans/openfan/maintenance` | Cancel a firmware update — only until the board is asked to enter its bootloader |
 | `POST /gpu/{gpu_id}/fan/reset` | Restore GPU fan to firmware automatic and re-enable zero-RPM |
 | `POST /gpu/{gpu_id}/fan/verify` | Behavioural test of GPU fan-control effectiveness; ~6 s, no lease (DEC-120). Drives a test speed biased upward, reads back the applied PMFW `fan_curve`/`pwm1` + RPM, then restores. Detects the silent failures static checks miss (`ppfeaturemask` bit 14 unset, SMU mismatch, BIOS overdrive lock). |
 | `POST /config/profile-search-dirs` | Add and/or remove directories in the profile search path (immediate; persists to `runtime.toml`). `remove` needs ≥ 2.23.0 (DEC-285) |
@@ -456,6 +460,30 @@ ls -la /dev/serial/by-id/
 # Set the stable path in daemon.toml
 # [serial]
 # port = "/dev/serial/by-id/usb-Karanovic_Research_OpenFan_...-if00"
+```
+
+### Updating the OpenFAN firmware
+
+From control-ofc-daemon 3.8.0 the GUI's **Update OpenFAN Firmware…** (Hardware page) installs a
+`.uf2` file you downloaded. The daemon parks every OpenFAN channel at 100 %, sends the board into
+its USB bootloader, waits while you copy the file onto the `RPI-RP2` drive, then checks the board
+and gives the fans back to the profile. It never writes the firmware itself and opens nothing but
+the board's own serial interface. While an update runs, OpenFAN writes are skipped rather than
+failed, calibrations and the other diagnostics are refused, and the `openfan` health entry says what
+is happening. A run that leaves the board in its bootloader keeps that entry critical, and OpenFAN
+writes off, until the board answers again; the run is recorded in
+`/var/lib/control-ofc/openfan-maintenance.json`, so a daemon restart reports it rather than forgets
+it. The steps, results and recovery are in the GUI manual's
+[Updating the OpenFAN firmware](https://github.com/Plan-B-Development/control-ofc-gui/blob/main/manual/openfan-controller.md#updating-the-openfan-firmware).
+
+By hand, with the daemon stopped — it holds the port:
+
+```bash
+sudo systemctl stop control-ofc-daemon
+ls /dev/serial/by-id/          # usb-Karanovic_Research_OpenFan_<serial>-if00 and -if02
+stty -F /dev/serial/by-id/usb-Karanovic_Research_OpenFan_<serial>-if00 1200
+# the RPI-RP2 drive appears: copy the .uf2 onto it; it disappears when the board restarts
+sudo systemctl start control-ofc-daemon
 ```
 
 ### Serial permissions

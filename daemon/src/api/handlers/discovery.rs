@@ -154,7 +154,8 @@ fn gather_preflight(
         role,
         pump_protected,
         effective_floor_pct,
-        slot_busy: state.cache.verify_active(),
+        // DEC-481: a firmware update refuses every claimant of the slot.
+        slot_busy: state.cache.verify_active() || state.cache.openfan_maintenance_running(),
         enable_revert_count,
         temperature,
         thermal_forcing: crate::api::calibration::thermal_force_state(&state.cache),
@@ -495,10 +496,7 @@ pub(crate) async fn start_control_path_discovery(
     let Some(verify_guard) =
         super::begin_verify_pause(&state.cache, crate::constants::VERIFY_PAUSE_DEADMAN)
     else {
-        return error_response(
-            StatusCode::CONFLICT,
-            &ErrorEnvelope::validation("a hardware verify or calibration is already in progress"),
-        );
+        return super::verify_slot_refusal(&state.cache);
     };
 
     // [SAFETY] The UNION predicate, never the wire `role` (DEC-312). This entry

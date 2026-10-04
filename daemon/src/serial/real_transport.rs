@@ -119,6 +119,21 @@ impl SerialTransport for RealSerialTransport {
             log::debug!("openfan: could not discard pending output before closing: {e}");
         }
     }
+
+    /// `tcsetattr` to 1200 baud (DEC-481). `cdc-acm` sends SET_LINE_CODING when
+    /// the line coding changes, and the OpenFan firmware's line-coding callback
+    /// answers a 1200 baud rate by rebooting into the USB bootloader — present
+    /// in the 2023 build and the 2026 source alike. The port closes when `self`
+    /// drops; queued output is discarded first, so the close does not wait on a
+    /// board that has already left the bus.
+    fn touch_1200_baud(mut self: Box<Self>) -> Result<(), SerialError> {
+        self.discard_pending_output();
+        self.writer
+            .set_baud_rate(1200)
+            .map_err(|e| SerialError::Protocol {
+                message: format!("could not switch the line to 1200 baud: {e}"),
+            })
+    }
 }
 
 /// List candidate serial ports without opening any `ttyACM`/`ttyUSB` (DEC-291).

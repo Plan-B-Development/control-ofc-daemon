@@ -497,6 +497,54 @@ fn controls_reason(skipped: &[SkippedControl]) -> String {
     format!("{n} {noun} not being commanded — {tail}")
 }
 
+/// The `openfan` entry while a firmware update holds the controller, or after
+/// one left the board outside normal control (DEC-481).
+///
+/// The update stops the polls, so the readings go stale by design: that is
+/// reported as `Warn` naming the stage while the stage is within its limit, and
+/// as `Crit` once it has overrun it by `OPENFAN_MAINT_OVERRUN_GRACE` — the
+/// update is stuck — or after a run that needs recovery, until the controller
+/// answers again. Only this entry changes: `overall` is still the worst of all
+/// four, so a genuine `Crit` anywhere else still shows. Applied whatever the
+/// presence, because a board stranded in its bootloader at a restart is not
+/// adopted, and "no controller connected" would hide it.
+fn openfan_maintenance_overlay(
+    state: &DaemonState,
+    now: Instant,
+    polled: SubsystemHealth,
+) -> SubsystemHealth {
+    use crate::health::state::OpenFanMaintenance;
+    let (status, reason) = match &state.openfan_maintenance {
+        None => return polled,
+        Some(OpenFanMaintenance::Running {
+            stage,
+            stage_deadline,
+            ..
+        }) => {
+            let overran = stage_deadline.is_some_and(|deadline| {
+                now > deadline + crate::constants::OPENFAN_MAINT_OVERRUN_GRACE
+            });
+            if overran {
+                (
+                    HealthStatus::Crit,
+                    format!("firmware update: {stage} has overrun its time limit"),
+                )
+            } else {
+                (HealthStatus::Warn, format!("firmware update: {stage}"))
+            }
+        }
+        Some(OpenFanMaintenance::NeedsRecovery { outcome, .. }) => (
+            HealthStatus::Crit,
+            format!("firmware update needs recovery: {outcome}"),
+        ),
+    };
+    SubsystemHealth {
+        status,
+        reason,
+        ..polled
+    }
+}
+
 /// Compute the health summary for the daemon.
 ///
 /// This function is pure: it takes the current state, config, and a reference
@@ -521,34 +569,38 @@ pub fn compute_health(
         // `overall_status` to "crit" on every hwmon-only machine. The entry stays
         // (dropping it would shift hwmon to index 0 and break the wire shape); it
         // reports the truth instead, which is that there is nothing here to poll.
-        match openfan {
-            OpenFanPresence::Present => poll_subsystem_health(
-                "openfan",
-                ts.openfan,
-                // F6: only channels a poll has actually MEASURED. `force_all_with_floor`
-                // writes `0..NUM_CHANNELS` unconditionally, so one thermal
-                // emergency mints an entry for every channel the firmware does
-                // not report — and those can never be covered by a later poll, so
-                // counting them would latch openfan at Crit for the process
-                // lifetime on exactly the short-frame hardware this fix targets.
-                // `rpm_polled` already exists for this "never actually measured"
-                // distinction and already gates `stall_detected`.
-                state
-                    .openfan_fans
-                    .values()
-                    .filter(|f| f.rpm_polled)
-                    .map(|f| f.updated_at),
-                now,
-                config.openfan_interval_ms,
-                &POLL_REASONS,
-            ),
-            OpenFanPresence::Absent => SubsystemHealth {
-                name: "openfan".into(),
-                status: HealthStatus::Ok,
-                age_ms: None,
-                reason: "no OpenFanController connected".into(),
+        openfan_maintenance_overlay(
+            state,
+            now,
+            match openfan {
+                OpenFanPresence::Present => poll_subsystem_health(
+                    "openfan",
+                    ts.openfan,
+                    // F6: only channels a poll has actually MEASURED. `force_all_with_floor`
+                    // writes `0..NUM_CHANNELS` unconditionally, so one thermal
+                    // emergency mints an entry for every channel the firmware does
+                    // not report — and those can never be covered by a later poll, so
+                    // counting them would latch openfan at Crit for the process
+                    // lifetime on exactly the short-frame hardware this fix targets.
+                    // `rpm_polled` already exists for this "never actually measured"
+                    // distinction and already gates `stall_detected`.
+                    state
+                        .openfan_fans
+                        .values()
+                        .filter(|f| f.rpm_polled)
+                        .map(|f| f.updated_at),
+                    now,
+                    config.openfan_interval_ms,
+                    &POLL_REASONS,
+                ),
+                OpenFanPresence::Absent => SubsystemHealth {
+                    name: "openfan".into(),
+                    status: HealthStatus::Ok,
+                    age_ms: None,
+                    reason: "no OpenFanController connected".into(),
+                },
             },
-        },
+        ),
         // hwmon is judged on LIVENESS ALONE, and the empty iterator is the whole
         // reason this is written out rather than mirroring the openfan arm.
         //
@@ -635,8 +687,8 @@ pub fn compute_health(
 mod tests {
     use super::*;
     use crate::health::state::{
-        CachedSensorReading, DaemonState, DeviceLabel, OpenFanState, SkipReason, SkippedControl,
-        SubsystemTimestamps,
+        CachedSensorReading, DaemonState, DeviceLabel, OpenFanMaintenance, OpenFanState,
+        SkipReason, SkippedControl, SubsystemTimestamps,
     };
     use crate::hwmon::types::SensorKind;
     use std::time::Duration;
@@ -1571,5 +1623,95 @@ mod tests {
             HealthStatus::Crit,
             "with a controller attached the same state is genuinely unhealthy"
         );
+    }
+
+    // ── DEC-481: the firmware update's overlay ───────────────────────
+
+    fn running(stage: &'static str, deadline: Option<Instant>) -> Option<OpenFanMaintenance> {
+        Some(OpenFanMaintenance::Running {
+            run_id: "r1".into(),
+            stage,
+            stage_deadline: deadline,
+            writes_suspended: true,
+        })
+    }
+
+    /// Readings an update has let go stale, which on their own are critical.
+    fn stale_openfan(now: Instant) -> DaemonState {
+        let mut s = state_with_live_engine(now);
+        let old = now - Duration::from_secs(120);
+        s.subsystem_timestamps.openfan = Some(old);
+        s.subsystem_timestamps.hwmon = Some(now);
+        s.openfan_fans.insert(0, openfan_at(0, old));
+        s
+    }
+
+    #[test]
+    fn a_running_update_is_a_warning_that_names_its_stage() {
+        let now = Instant::now();
+        let mut s = stale_openfan(now);
+        let without = compute_health(&s, &default_config(), now, OpenFanPresence::Present);
+        assert_eq!(
+            named(&without, "openfan").status,
+            HealthStatus::Crit,
+            "precondition: the stale readings alone are critical"
+        );
+        s.openfan_maintenance = running("waiting_for_file", Some(now + Duration::from_secs(60)));
+        let h = compute_health(&s, &default_config(), now, OpenFanPresence::Present);
+        let of = named(&h, "openfan");
+        assert_eq!(of.status, HealthStatus::Warn);
+        assert_eq!(of.reason, "firmware update: waiting_for_file");
+        assert_eq!(h.overall, HealthStatus::Warn);
+    }
+
+    #[test]
+    fn a_stage_past_its_limit_and_grace_is_critical() {
+        let now = Instant::now();
+        let grace = crate::constants::OPENFAN_MAINT_OVERRUN_GRACE;
+        let mut s = stale_openfan(now);
+        s.openfan_maintenance = running("checking", Some(now - grace + Duration::from_secs(1)));
+        let h = compute_health(&s, &default_config(), now, OpenFanPresence::Present);
+        assert_eq!(
+            named(&h, "openfan").status,
+            HealthStatus::Warn,
+            "within the grace"
+        );
+        s.openfan_maintenance = running("checking", Some(now - grace - Duration::from_secs(1)));
+        let h = compute_health(&s, &default_config(), now, OpenFanPresence::Present);
+        let of = named(&h, "openfan");
+        assert_eq!(of.status, HealthStatus::Crit);
+        assert!(of.reason.contains("overrun"), "{}", of.reason);
+    }
+
+    #[test]
+    fn a_board_needing_recovery_is_critical_even_with_no_controller_adopted() {
+        let now = Instant::now();
+        let mut s = state_with_live_engine(now);
+        let absent = compute_health(&s, &default_config(), now, OpenFanPresence::Absent);
+        assert_eq!(
+            named(&absent, "openfan").status,
+            HealthStatus::Ok,
+            "precondition: an absent controller is not a fault"
+        );
+        s.openfan_maintenance = Some(OpenFanMaintenance::NeedsRecovery {
+            run_id: "r1".into(),
+            outcome: "needs_recovery",
+        });
+        let h = compute_health(&s, &default_config(), now, OpenFanPresence::Absent);
+        let of = named(&h, "openfan");
+        assert_eq!(of.status, HealthStatus::Crit);
+        assert!(of.reason.contains("needs recovery"), "{}", of.reason);
+    }
+
+    #[test]
+    fn the_update_never_masks_another_subsystem() {
+        let now = Instant::now();
+        // An unstamped engine is critical (DEC-249).
+        let mut s = base_state();
+        s.openfan_maintenance = running("parking", Some(now + Duration::from_secs(10)));
+        let h = compute_health(&s, &default_config(), now, OpenFanPresence::Present);
+        assert_eq!(named(&h, "openfan").status, HealthStatus::Warn);
+        assert_eq!(engine_of(&h).status, HealthStatus::Crit);
+        assert_eq!(h.overall, HealthStatus::Crit, "a genuine Crit still shows");
     }
 }

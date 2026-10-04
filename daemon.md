@@ -48,6 +48,11 @@ daemon/src/
     real_transport.rs  — serialport impl + auto-detect
     protocol.rs        — OpenFan wire protocol encode/decode
     controller.rs      — FanController (set_pwm, read_rpm, last_commanded_pct)
+    port_loan.rs       — [SAFETY] lending the OpenFan port to a firmware update (DEC-481):
+                         the poll loop is the only code that swaps the port, between polls;
+                         a loan returns the port or nothing, and drop semantics hold that
+    usb_identity.rs    — read-only sysfs view of a tty's USB device (port path, ids,
+                         serial, cached config descriptor) and of RP2040 bootloaders
     adoption.rs        — [SAFETY] the single path deciding which port becomes the fan
                          controller, shared by boot adoption and POST /fans/openfan/rescan
                          (DEC-265). One copy on purpose — two would be two chances to skip
@@ -153,6 +158,8 @@ daemon/src/
       mod.rs           — AppState, shared helpers, submodule re-exports
       status.rs        — read endpoints (status, sensors, fans, poll, capabilities, history)
       openfan.rs       — OpenFan calibration handlers (DEC-452), rescan, post-boot adoption
+      openfan_firmware.rs — the firmware-update routes, the device answer, the atomic
+                         start checks and the boot-time recovery watch (DEC-481)
       gpu.rs           — AMD GPU fan set/reset endpoints
       hwmon_ctl.rs     — hwmon header list, rescan, PWM-verify + characterize endpoints
       validation.rs    — validation-session endpoints + the diagnostic orchestrator
@@ -239,6 +246,13 @@ daemon/src/
     backends.rs        — WriteBackend per fan backend (gating/coalescing)
     skipped.rs         — debounced tracking of controls that cannot be resolved (273-i)
   control_override.rs  — manual-override + fan-identify state (expiring, fencing-guarded, deadman; DEC-163/166)
+  openfan_maintenance/ — the OpenFAN firmware update (DEC-481)
+    mod.rs             — stage/outcome tokens, the run record, the slot, the claim guard
+    run.rs             — [SAFETY] the seven stages: prepare, park at 100 %, bootloader,
+                         file, return, check, restore control
+    journal.rs         — {state_dir}/openfan-maintenance.json, written before each action;
+                         an unfinished run is finished as interrupted at startup, never resumed
+    evidence.rs        — before/after/file comparison of the descriptor and info strings
   daemon_state.rs      — persistent state (active profile pointer)
   safety.rs            — ThermalSafetyRule (CPU emergency override)
   polling.rs           — hwmon + OpenFan polling loops
@@ -321,6 +335,54 @@ emergency (or a timed-out stop step) and the other headers. Other USB fan contro
 keep their `headers()` place. The force still shares one
 single-flight write slot with the engine's `apply`, so at the trip point it first waits
 for any hub writes an engine tick has in flight (`BRD-z`, recorded).
+
+## OpenFAN firmware update (DEC-481)
+
+The daemon coordinates the update; the user copies the `.uf2` onto the `RPI-RP2` drive. The
+daemon never writes firmware, never reads a file, never mounts anything and never opens any
+device but the board's own serial interface. Wire contract: GUI `docs/08` § OpenFan firmware
+update.
+
+- **Link state is separate from presence.** `StateCache::set_openfan_link` is the only writer of
+  `openfan_link` (`connected` | `unresponsive` | `reconnecting`, published as `maintenance` while
+  an update runs). A start requires `connected` and is decided again under the lock.
+- **Ownership is one decision.** `StateCache::try_begin_openfan_maintenance` claims the controller
+  under the lock the diagnostic pause uses: it refuses while a diagnostic holds the pause (even a
+  lapsed one), during a thermal emergency, while another update runs, or over a board the last run
+  left needing recovery (the link can still read `connected` until the poll loop has handled that
+  run's loan; a run that panicked drops its claim before its loan), and once it holds, every
+  route that would drive the controller or claim the pause is refused (`openfan_maintenance`; the
+  route table in `api/server.rs` tests classifies every route). A calibration's task and a
+  validation recording are refused too. An override or identify on an OpenFAN channel is decided
+  under the `override_table` guard its insert takes — the guard the start's release of such holds
+  takes after the claim — so none outlives the start. The `ClaimGuard` releases the claim on every
+  exit, panics included, by the same `outcome::when_interrupted` rule the journal uses.
+- **[SAFETY] Writes are suspended, never failed.** From parking until the port is back,
+  `openfan_writes_suspended()` makes the engine, the thermal force and every give-back skip OpenFan
+  writes. The run parks every channel at 100 % first, through the controller, so the board leaves
+  normal mode from the most either writer could ask for. hwmon and GPU writes are untouched; the
+  thermal ladder still forces them. After a run whose board needs recovery
+  (`needs_recovery`, `firmware_copied_board_not_back`) writes stay suspended until the poll loop
+  reports `connected`.
+- **Port lending.** The poll loop is the only code that replaces the port. The run borrows it
+  (`port_loan::borrow`, answered between polls within `OPENFAN_MAINT_BORROW_WAIT`; a borrower whose
+  wait runs out closes the channel and takes an answer already sent, so a loan that lands at the
+  deadline is never dropped with the port in it), sends `>07`, falls back to 1200 baud on the same
+  open port, and returns either the reopened returned board or nothing; a polling loop that gets
+  nothing back reconnects as it would after an unplug.
+- **One file wait per run.** `OPENFAN_MAINT_FILE_WAIT` is a single budget: a board that goes back
+  to its bootloader after its drive went away resumes it rather than starting it again, and the
+  `OPENFAN_MAINT_MAX_BOOTLOADER_RETURNS`th return ends the run `needs_recovery`, so neither the
+  claim nor the record grows without end.
+- **Health.** The `openfan` subsystem entry reports the run (`warn`), a stage overrun by
+  `OPENFAN_MAINT_OVERRUN_GRACE` (`crit`), or a board needing recovery (`crit`); every other entry
+  is untouched, so `overall_status` still shows a genuine `crit` elsewhere.
+- **Restart.** The journal is written before each action, on the blocking pool (it fsyncs). At
+  startup an unfinished run is
+  finished as interrupted (`when_interrupted`) and nothing is repeated. If it left a board needing
+  recovery and boot adopted no controller, the recovery overlay is restored only while that board
+  is still on its USB port, and `openfan_recovery_watch` watches that port read-only, adopting the
+  board through the rescan path once per return.
 
 ## Startup Sequence — OpenFan adoption (DEC-291 / DEC-361)
 

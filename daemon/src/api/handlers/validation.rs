@@ -410,6 +410,7 @@ fn start_error_response(e: StartError) -> (StatusCode, Json<serde_json::Value>) 
             StatusCode::SERVICE_UNAVAILABLE,
             &ErrorEnvelope::persistence_failed(&e),
         ),
+        StartError::OpenFanMaintenance => super::openfan_maintenance_conflict(),
     }
 }
 
