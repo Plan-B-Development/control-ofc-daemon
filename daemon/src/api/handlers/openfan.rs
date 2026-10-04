@@ -980,8 +980,6 @@ where
     use crate::serial::adoption::{
         first_openfan_port, same_port_set, serial_port_candidates_enumerated,
     };
-    use crate::serial::controller::FanController;
-    use crate::serial::transport::SerialTransport;
 
     // `OFN-t`, first thing and before anything touches the bus. The
     // authoritative check is the one inside `adopt_openfan_controller`, which
@@ -1147,63 +1145,37 @@ where
         let guard = guard;
 
         // Serial probing is blocking and can take seconds across several candidates.
+        let evidence = task_state.cache.clone();
         let probe = tokio::task::spawn_blocking(move || {
             // The SAME list the cooldown was evaluated against — recomputing it
             // here could probe a set the cooldown never saw, and stamp a set that
             // was never probed.
             let mut open = open;
-            first_openfan_port(&candidates, configured.as_deref(), timeout, |p| {
-                open(p, timeout)
-            })
+            first_openfan_port(
+                &candidates,
+                configured.as_deref(),
+                timeout,
+                |p| open(p, timeout),
+                // DEC-484: a board that opened but did not answer.
+                |p| {
+                    if let Some(node) = crate::serial::adoption::node_id(p) {
+                        evidence.record_openfan_unanswered(p, node);
+                    }
+                },
+            )
         })
         .await;
 
         let outcome = match probe {
             Ok(Some((port, transport))) => {
-                let boxed: Box<dyn SerialTransport + Send> = Box::new(transport);
-                let shared = Arc::new(parking_lot::Mutex::new(boxed));
-                let ctrl =
-                    FanController::new_shared(shared.clone(), task_state.cache.clone(), timeout);
-                let survey = crate::serial::adoption::ReconnectSurvey::new(
-                    survey_configured,
+                match adopt_probed(
+                    &task_state,
+                    Box::new(transport),
                     &port,
+                    survey_configured,
                     &survey_seed,
-                    crate::serial::adoption::node_id,
-                );
-
-                // The install, the DEC-266 conditional and the 277-c handle
-                // registration all happen inside `adopt_openfan_controller`,
-                // under ONE lock (`OFN-t`). They used to be three statements
-                // here, and the shutdown check that belongs with them was
-                // nowhere at all — `main` drains the handle list *before*
-                // `finish_shutdown` sets the shutdown watch, so an adoption
-                // completing in between registered a poll loop that nothing
-                // would ever join, and one completing later could install a
-                // controller after `restore_hardware()` had already run.
-                let rt = task_state.openfan_runtime.clone();
-                let poll_cache = task_state.cache.clone();
-                let maintenance = task_state.openfan_maintenance.clone();
-                let adopted_on = port.clone();
-                match task_state.adopt_openfan_controller(ctrl, || {
-                    tokio::spawn(async move {
-                        // DEC-481: published by the loop's own task, ahead of the
-                        // first `Connected` it reports, and not under the adoption
-                        // lock — which wants a bare `tokio::spawn`.
-                        let (lender, loans) = crate::serial::port_loan::loan_channel();
-                        poll_cache.set_openfan_port(&adopted_on);
-                        maintenance.set_lender(lender);
-                        crate::polling::openfan_poll_loop(
-                            poll_cache,
-                            shared,
-                            rt.timeout,
-                            rt.interval,
-                            rt.shutdown,
-                            survey,
-                            loans,
-                        )
-                        .await;
-                    })
-                }) {
+                    None,
+                ) {
                     AdoptOutcome::Adopted => {
                         // Deliberately no trigger in the wording: this path is reached both by
                         // `POST /fans/openfan/rescan` and by the post-boot adoption loop,
@@ -1229,6 +1201,16 @@ where
                              down — not adopted; it will be picked up on the next start"
                         );
                         RescanOutcome::ShuttingDown
+                    }
+                    AdoptOutcome::MaintenanceRunning => {
+                        // DEC-484: an update of a silent board claimed the
+                        // controller while this probe ran. It waits for the
+                        // probe, finds the board answering, and hands it over.
+                        log::info!(
+                            "OpenFanController found on {port} while a firmware update holds \
+                             the controller — not adopted; the update takes it"
+                        );
+                        RescanOutcome::MaintenanceRunning
                     }
                 }
             }
@@ -1272,6 +1254,7 @@ where
                 message: "an OpenFanController is already connected".into(),
             },
         ),
+        Ok(RescanOutcome::MaintenanceRunning) => super::openfan_maintenance_conflict(),
         // Deliberately NOT reported as `NotFound`: a controller was found and
         // identified, and telling the operator otherwise is the log/report
         // dishonesty the `OFN-*` register exists for (`OFN-c`). Same 503
@@ -1309,8 +1292,72 @@ enum RescanOutcome {
     /// Registration had closed before the probe finished — the daemon is
     /// shutting down, so nothing was installed (`OFN-t`).
     ShuttingDown,
+    /// A firmware update claimed the controller while the probe ran
+    /// (DEC-484); nothing was installed.
+    MaintenanceRunning,
     NotFound,
     ProbeFailed,
+}
+
+/// Install a controller a probe identified on `port` and start its poll loop,
+/// through [`AppState::adopt_openfan_controller`] — the rescan's adoption and,
+/// with `owner`, the one a silent board's update makes of the board it brought
+/// back (DEC-484). The poll loop's reconnect survey is seeded from `seed`, the
+/// candidates the port was chosen from.
+pub(super) fn adopt_probed(
+    state: &Arc<AppState>,
+    transport: Box<dyn crate::serial::transport::SerialTransport + Send>,
+    port: &str,
+    configured: Option<String>,
+    seed: &[String],
+    owner: Option<&str>,
+) -> AdoptOutcome {
+    let timeout = state.openfan_runtime.timeout;
+    let shared = Arc::new(parking_lot::Mutex::new(transport));
+    let ctrl = crate::serial::controller::FanController::new_shared(
+        shared.clone(),
+        state.cache.clone(),
+        timeout,
+    );
+    let survey = crate::serial::adoption::ReconnectSurvey::new(
+        configured,
+        port,
+        seed,
+        crate::serial::adoption::node_id,
+    );
+
+    // The install, the DEC-266 conditional and the 277-c handle registration
+    // all happen inside `adopt_openfan_controller`, under ONE lock (`OFN-t`).
+    // They used to be three statements in the rescan, and the shutdown check
+    // that belongs with them was nowhere at all — `main` drains the handle list
+    // *before* `finish_shutdown` sets the shutdown watch, so an adoption
+    // completing in between registered a poll loop that nothing would ever
+    // join, and one completing later could install a controller after
+    // `restore_hardware()` had already run.
+    let rt = state.openfan_runtime.clone();
+    let poll_cache = state.cache.clone();
+    let maintenance = state.openfan_maintenance.clone();
+    let adopted_on = port.to_string();
+    state.adopt_openfan_controller(ctrl, owner, || {
+        tokio::spawn(async move {
+            // DEC-481: published by the loop's own task, ahead of the first
+            // `Connected` it reports, and not under the adoption lock — which
+            // wants a bare `tokio::spawn`.
+            let (lender, loans) = crate::serial::port_loan::loan_channel();
+            poll_cache.set_openfan_port(&adopted_on);
+            maintenance.set_lender(lender);
+            crate::polling::openfan_poll_loop(
+                poll_cache,
+                shared,
+                rt.timeout,
+                rt.interval,
+                rt.shutdown,
+                survey,
+                loans,
+            )
+            .await;
+        })
+    })
 }
 
 /// Releases the rescan single-flight flag when the *probe* ends.
@@ -1585,7 +1632,7 @@ mod tests {
             control_paths: Arc::new(parking_lot::RwLock::new(Default::default())),
             pwm_baselines: Default::default(),
             pwm_verification: Default::default(),
-            openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+            openfan_rescanning: Default::default(),
             last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
             adopted_poll_tasks: Arc::new(parking_lot::Mutex::new(Default::default())),
             openfan_maintenance: Default::default(),
@@ -2316,7 +2363,8 @@ mod tests {
              drain returns came from somewhere this test does not model"
         );
 
-        let outcome = state.adopt_openfan_controller(silent_controller(&state), spawn_stub_loop);
+        let outcome =
+            state.adopt_openfan_controller(silent_controller(&state), None, spawn_stub_loop);
 
         assert_eq!(
             outcome,
@@ -2343,7 +2391,8 @@ mod tests {
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let state = adoption_state(rx);
 
-        let outcome = state.adopt_openfan_controller(silent_controller(&state), spawn_stub_loop);
+        let outcome =
+            state.adopt_openfan_controller(silent_controller(&state), None, spawn_stub_loop);
 
         assert_eq!(outcome, AdoptOutcome::Adopted);
         assert!(
@@ -2368,6 +2417,38 @@ mod tests {
         }
     }
 
+    /// DEC-484: while a firmware update holds the controller, only that run
+    /// adopts one — the board it brought back. Any other adoption (a rescan,
+    /// the post-boot search) installs nothing.
+    #[tokio::test]
+    async fn an_adoption_while_an_update_runs_is_the_updates_own_or_nothing() {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let state = adoption_state(rx);
+        state
+            .cache
+            .try_begin_silent_openfan_maintenance("r1", "preparing")
+            .expect("nothing answers");
+
+        for owner in [None, Some("r0")] {
+            assert_eq!(
+                state.adopt_openfan_controller(silent_controller(&state), owner, spawn_stub_loop),
+                AdoptOutcome::MaintenanceRunning,
+                "{owner:?}"
+            );
+        }
+        assert!(state.openfan().is_none());
+        assert!(state.adopted_poll_tasks.lock().is_empty());
+
+        assert_eq!(
+            state.adopt_openfan_controller(silent_controller(&state), Some("r1"), spawn_stub_loop),
+            AdoptOutcome::Adopted
+        );
+        assert!(state.openfan().is_some());
+        for h in state.adopted_poll_tasks.lock().close_and_drain() {
+            h.abort();
+        }
+    }
+
     /// DEC-266's arm, which must not regress while the gate is added: a second
     /// adoption never replaces a live controller.
     #[tokio::test]
@@ -2376,13 +2457,13 @@ mod tests {
         let state = adoption_state(rx);
 
         assert_eq!(
-            state.adopt_openfan_controller(silent_controller(&state), spawn_stub_loop),
+            state.adopt_openfan_controller(silent_controller(&state), None, spawn_stub_loop),
             AdoptOutcome::Adopted
         );
         let first = state.openfan().expect("the first adoption installed");
 
         assert_eq!(
-            state.adopt_openfan_controller(silent_controller(&state), spawn_stub_loop),
+            state.adopt_openfan_controller(silent_controller(&state), None, spawn_stub_loop),
             AdoptOutcome::AlreadyAdopted,
             "the loser of the install race must discard its probe, not overwrite \
              the winner — the engine only re-reads the slot while it has no \
@@ -2885,6 +2966,54 @@ mod tests {
             opened.lock().push(path.to_string());
             Ok(SilentTransport)
         }
+    }
+
+    /// DEC-484: a silent board's update holds the controller with no link at
+    /// all; a rescan then refuses before it opens anything, as it does during
+    /// a connected board's update.
+    #[tokio::test]
+    async fn a_rescan_during_a_silent_boards_update_opens_nothing() {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let state = adoption_state(rx);
+        state
+            .cache
+            .try_begin_silent_openfan_maintenance("r1", "preparing")
+            .expect("nothing answers");
+        let opened = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (code, body) = openfan_rescan_with(
+            state.clone(),
+            fake_enumerate,
+            recording_opener(opened.clone()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT, "{:?}", body.0);
+        assert_eq!(
+            body.0["error"]["details"]["reason"],
+            super::super::OPENFAN_MAINTENANCE_REASON
+        );
+        assert!(opened.lock().is_empty());
+
+        // The update over, the same rescan probes — and a port that opened
+        // without an answer is the evidence a silent board is known by.
+        state.cache.end_openfan_maintenance("r1", None);
+        let node = tempfile::NamedTempFile::new().unwrap();
+        let port = node.path().to_str().unwrap().to_string();
+        let p = port.clone();
+        let (code, body) = openfan_rescan_with(
+            state.clone(),
+            move || vec![p.clone()],
+            recording_opener(opened.clone()),
+        )
+        .await;
+        assert_ne!(code, StatusCode::CONFLICT, "{:?}", body.0);
+        assert_eq!(opened.lock().as_slice(), [port.as_str()]);
+        assert_eq!(
+            state.cache.openfan_unanswered(),
+            [(
+                port.clone(),
+                crate::serial::adoption::node_id(&port).expect("it exists")
+            )]
+        );
     }
 
     /// DEC-481: a controller adopted by a rescan gets the lending channel a

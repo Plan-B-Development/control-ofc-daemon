@@ -42,6 +42,9 @@ pub fn loan_channel() -> (LoanSender, LoanReceiver) {
 /// A firmware update's request for the port.
 pub struct PortLoanRequest {
     reply: oneshot::Sender<Result<PortLoan, LoanRefusal>>,
+    /// Lend even while the loop's last poll failed (DEC-484): an update of a
+    /// board that does not answer takes the slot whatever it holds.
+    accept_disconnected: bool,
 }
 
 /// The port, on loan. `transport` belongs to the borrower until it gives a
@@ -93,15 +96,37 @@ impl LoanRefusal {
 }
 
 /// Ask the poll loop for its port, waiting at most `wait` for each of the two
-/// steps (the request reaching the loop, and its answer).
+/// steps (the request reaching the loop, and its answer). Refused unless the
+/// loop's last poll succeeded.
 ///
 /// The loop handles a request between polls, so `wait` should cover one poll
 /// at the serial timeout. A wait that runs out loses no port: an answer the
 /// loop sent before the borrower gave up is taken, and one it had not sent yet
 /// fails to send, so the loop puts the port straight back.
 pub async fn borrow(lender: &LoanSender, wait: Duration) -> Result<PortLoan, LoanRefusal> {
+    request(lender, wait, false).await
+}
+
+/// As [`borrow`], whatever the loop's link (DEC-484): the update of a board
+/// that does not answer parks the loop so its reconnect search stops opening
+/// the board. The transport lent may be [`DisconnectedTransport`] — a
+/// placeholder ([`SerialTransport::is_placeholder`]) — or a port whose board
+/// has stopped answering.
+pub async fn borrow_any(lender: &LoanSender, wait: Duration) -> Result<PortLoan, LoanRefusal> {
+    request(lender, wait, true).await
+}
+
+async fn request(
+    lender: &LoanSender,
+    wait: Duration,
+    accept_disconnected: bool,
+) -> Result<PortLoan, LoanRefusal> {
     let (reply, mut answer) = oneshot::channel();
-    match tokio::time::timeout(wait, lender.send(PortLoanRequest { reply })).await {
+    let ask = PortLoanRequest {
+        reply,
+        accept_disconnected,
+    };
+    match tokio::time::timeout(wait, lender.send(ask)).await {
         Ok(Ok(())) => {}
         Ok(Err(_)) => return Err(LoanRefusal::NoPollLoop),
         Err(_) => return Err(LoanRefusal::Timeout),
@@ -159,7 +184,8 @@ pub enum LoanEnd {
 
 /// The poll loop's half: lend the port in `slot` to `request`'s borrower and
 /// wait for the hand-back, or refuse unless the loop is `connected` — its last
-/// poll succeeded, so it holds a port that answers.
+/// poll succeeded, so it holds a port that answers — or the request accepts a
+/// loop that is not ([`borrow_any`]).
 ///
 /// Only the poll loop calls this, and only between polls, so no poll or
 /// reconnect attempt of its own can be in flight. The swap runs on the blocking
@@ -172,7 +198,7 @@ pub async fn lend(
     connected: bool,
     shutdown: &mut watch::Receiver<bool>,
 ) -> LoanEnd {
-    if !connected {
+    if !connected && !request.accept_disconnected {
         let _ = request.reply.send(Err(LoanRefusal::NotConnected));
         return LoanEnd::Refused;
     }
@@ -281,6 +307,37 @@ mod tests {
         assert_eq!(name_of(&mut **slot.lock()), "real");
     }
 
+    /// DEC-484: an update of a board that does not answer borrows whatever
+    /// the slot holds — the loop is parked all the same, and what comes back
+    /// is installed as from any other loan.
+    #[tokio::test]
+    async fn a_silent_boards_update_borrows_from_a_loop_that_is_not_connected() {
+        let slot = slot_with("reconnecting placeholder");
+        let (lender, mut loans) = loan_channel();
+        let (_stop, mut shutdown) = watch::channel(false);
+        let borrower = tokio::spawn(async move {
+            let mut loan = borrow_any(&lender, Duration::from_secs(5)).await.unwrap();
+            assert_eq!(name_of(&mut *loan.transport), "reconnecting placeholder");
+            loan.handle
+                .give_back(
+                    LoanReturn::Port {
+                        transport: Box::new(Named("answering")),
+                        path: "/dev/ttyACM9".into(),
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+        let request = loans.recv().await.expect("a request");
+        let LoanEnd::Returned { settled, .. } = lend(&slot, request, false, &mut shutdown).await
+        else {
+            panic!("lent while not connected, and the port came back");
+        };
+        assert_eq!(name_of(&mut **slot.lock()), "answering");
+        settled.send(()).unwrap();
+        assert!(borrower.await.unwrap());
+    }
+
     #[tokio::test]
     async fn a_lent_port_leaves_the_placeholder_until_it_is_handed_back() {
         let slot = slot_with("real");
@@ -376,7 +433,13 @@ mod tests {
         let (_stop, mut shutdown) = watch::channel(false);
         // The request reaches the loop, then the borrower stops waiting.
         let (reply, answer) = oneshot::channel();
-        lender.send(PortLoanRequest { reply }).await.unwrap();
+        lender
+            .send(PortLoanRequest {
+                reply,
+                accept_disconnected: false,
+            })
+            .await
+            .unwrap();
         drop(answer);
         let request = loans.recv().await.expect("a request");
         assert!(matches!(
@@ -396,7 +459,13 @@ mod tests {
         let (lender, mut loans) = loan_channel();
         let (_stop, mut shutdown) = watch::channel(false);
         let (reply, answer) = oneshot::channel();
-        lender.send(PortLoanRequest { reply }).await.unwrap();
+        lender
+            .send(PortLoanRequest {
+                reply,
+                accept_disconnected: false,
+            })
+            .await
+            .unwrap();
         let request = loans.recv().await.expect("a request");
         let lending = {
             let slot = slot.clone();
@@ -439,7 +508,13 @@ mod tests {
         let (lender, mut loans) = loan_channel();
         let (_stop, mut shutdown) = watch::channel(false);
         let (reply, answer) = oneshot::channel();
-        lender.send(PortLoanRequest { reply }).await.unwrap();
+        lender
+            .send(PortLoanRequest {
+                reply,
+                accept_disconnected: false,
+            })
+            .await
+            .unwrap();
         assert!(matches!(late_answer(answer), Err(LoanRefusal::Timeout)));
         let request = loans.recv().await.expect("a request");
         assert!(matches!(

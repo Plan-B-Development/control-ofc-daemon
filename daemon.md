@@ -52,7 +52,8 @@ daemon/src/
                          the poll loop is the only code that swaps the port, between polls;
                          a loan returns the port or nothing, and drop semantics hold that
     usb_identity.rs    — read-only sysfs view of a tty's USB device (port path, ids,
-                         serial, cached config descriptor) and of RP2040 bootloaders
+                         serial, cached config descriptor), of a board's serial
+                         interfaces, of the OpenFAN identity and of RP2040 bootloaders
     uf2.rs             — the daemon's own parse of a UF2 image it is about to write:
                          RP2040 family, 256-byte pages, inside the board's 4 MiB flash (DEC-483)
     picoboot.rs        — [SAFETY] PICOBOOT client to an RP2040 bootloader over usbfs (nusb):
@@ -165,7 +166,8 @@ daemon/src/
       status.rs        — read endpoints (status, sensors, fans, poll, capabilities, history)
       openfan.rs       — OpenFan calibration handlers (DEC-452), rescan, post-boot adoption
       openfan_firmware.rs — the firmware-update routes, the device answer, the atomic
-                         start checks and the boot-time recovery watch (DEC-481)
+                         start checks, the boot-time recovery watch (DEC-481) and the
+                         silent-board watch (DEC-484)
       gpu.rs           — AMD GPU fan set/reset endpoints
       hwmon_ctl.rs     — hwmon header list, rescan, PWM-verify + characterize endpoints
       validation.rs    — validation-session endpoints + the diagnostic orchestrator
@@ -252,12 +254,16 @@ daemon/src/
     backends.rs        — WriteBackend per fan backend (gating/coalescing)
     skipped.rs         — debounced tracking of controls that cannot be resolved (273-i)
   control_override.rs  — manual-override + fan-identify state (expiring, fencing-guarded, deadman; DEC-163/166)
-  openfan_maintenance/ — the OpenFAN firmware update (DEC-481, DEC-483)
+  openfan_maintenance/ — the OpenFAN firmware update (DEC-481, DEC-483, DEC-484)
     mod.rs             — stage/outcome tokens, the run record, the slot, the claim guard
     firmware.rs        — the published releases by SHA-256 (FW_01 refused), the verdict on
                          an upload, the staged file a daemon write takes a copy of
     run.rs             — [SAFETY] the eight stages: prepare, park at 100 %, bootloader,
-                         write (daemon writes only), file, return, check, restore control
+                         write (daemon writes only), file, return, check, restore control;
+                         a silent board's run asks, signals and waits for BOOT + RESET
+                         instead of parking (DEC-484)
+    silent.rs          — which OpenFAN boards are silent: probe evidence still naming the
+                         node it was, read against sysfs, opening nothing (DEC-484)
     journal.rs         — {state_dir}/openfan-maintenance.json, written before each action;
                          an unfinished run is finished as interrupted at startup, never resumed
     evidence.rs        — before/after/file comparison of the descriptor and info strings
@@ -344,7 +350,7 @@ keep their `headers()` place. The force still shares one
 single-flight write slot with the engine's `apply`, so at the trip point it first waits
 for any hub writes an engine tick has in flight (`BRD-z`, recorded).
 
-## OpenFAN firmware update (DEC-481, DEC-483)
+## OpenFAN firmware update (DEC-481, DEC-483, DEC-484)
 
 The daemon coordinates the update; the firmware is written either by the user, copying the
 `.uf2` onto the `RPI-RP2` drive, or — for a published release the daemon knows, when the start
@@ -408,6 +414,33 @@ to write, the PICOBOOT interface of the bootloader on the board's USB port. Wire
   recovery and boot adopted no controller, the recovery overlay is restored only while that board
   is still on its USB port, and `openfan_recovery_watch` watches that port read-only, adopting the
   board through the rescan path once per return.
+- **A silent board (DEC-484; not yet run on hardware).** An OpenFAN board on USB that does not
+  answer is known only by evidence: `adoption::first_openfan_port` reports a candidate that opened
+  but failed the handshake, and every prober (boot, the rescan, the post-boot search, the poll
+  loop's reconnect search) records it with its `NodeId` (`record_openfan_unanswered`, at most 16).
+  `silent::silent_boards` keeps the entries whose path still names that node and whose USB device
+  carries the OpenFAN identity, and `openfan_silent_watch` (every 2 s, read-only, while no
+  controller answers and no run runs) publishes the first as `openfan_silent_board` and prunes the
+  rest. `"board": "silent"` claims through `try_begin_silent_openfan_maintenance` — no link
+  needed, refused against a `connected` one, under `adopted_poll_tasks` too, so an adoption is
+  either seen or refused — and suspends writes at once; nothing is parked. A recovery the claim
+  replaces comes back with `release_unchanged` when the run changes nothing and hands nothing
+  over — in memory only: the journal holds the silent run, so a restart forgets that recovery.
+  The run waits up to `OPENFAN_MAINT_PROBE_WAIT` for the rescan's single-flight flag
+  (`AppState::openfan_rescanning`, an `Arc`) and holds it with a `GateHold` until it ends;
+  `adopt_openfan_controller` refuses every adoption but the run's own while a run holds the
+  controller, and an adopted controller's poll loop is parked with `port_loan::borrow_any`, which
+  a loop that is not connected still answers. It asks the board once more — on the lent port only
+  while `StateCache::openfan_port` names this board's node, so a loop that has not yet closed
+  another board's port never has that board signalled; an answer hands it over unsignalled —
+  touches 1200 baud without `>07`, and falls back to `waiting_for_boot_button`
+  (`OPENFAN_MAINT_BOOT_BUTTON_WAIT`, published with `OPENFAN_MAINT_BOOTLOADER_WAIT` added), whose
+  cancel and deadline wait through an empty port for as long as a bootloader takes to appear and
+  end only once one more look still finds the board where it was. From the bootloader the tail is
+  shared; `hand_over` gives the port back to the loan or adopts the board (`adopt_probed`, owner =
+  the run). A run with no poll loop that leaves the board needing recovery hands it to the recovery
+  watch, one per board (`MaintenanceSlot::hold_recovery_watch`). `set_openfan_port` — every
+  adoption, reconnect and hand-back — drops the evidence for the node a controller answers on.
 
 ## Startup Sequence — OpenFan adoption (DEC-291 / DEC-361)
 

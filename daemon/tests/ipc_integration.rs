@@ -117,7 +117,7 @@ fn test_app_state_inner(engine_ticked: bool, runtime_cfg: std::path::PathBuf) ->
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         pwm_verification: Default::default(),
-        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: Default::default(),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
         openfan_maintenance: Default::default(),
@@ -907,7 +907,7 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         pwm_verification: Default::default(),
-        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: Default::default(),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
         openfan_maintenance: Default::default(),
@@ -1193,7 +1193,7 @@ fn test_app_state_with_nvidia_gpu(
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         pwm_verification: Default::default(),
-        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: Default::default(),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
         openfan_maintenance: Default::default(),
@@ -1577,7 +1577,7 @@ fn test_app_state_with_headers(headers: Vec<PwmHeaderDescriptor>) -> Arc<AppStat
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         pwm_verification: Default::default(),
-        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: Default::default(),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
         openfan_maintenance: Default::default(),
@@ -1992,7 +1992,7 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         pwm_verification: Default::default(),
-        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: Default::default(),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
         openfan_maintenance: Default::default(),
@@ -2101,7 +2101,7 @@ fn test_app_state_with_amd_gpu_info(
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         pwm_verification: Default::default(),
-        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: Default::default(),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
         openfan_maintenance: Default::default(),
@@ -2202,7 +2202,7 @@ fn test_app_state_with_amd_gpu(
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         pwm_verification: Default::default(),
-        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: Default::default(),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
         openfan_maintenance: Default::default(),
@@ -3491,7 +3491,7 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         pwm_verification: Default::default(),
-        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: Default::default(),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
         openfan_maintenance: Default::default(),
@@ -3634,7 +3634,7 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         pwm_verification: Default::default(),
-        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: Default::default(),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
         openfan_maintenance: Default::default(),
@@ -3833,7 +3833,7 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         pwm_verification: Default::default(),
-        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: Default::default(),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
         openfan_maintenance: Default::default(),
@@ -3923,7 +3923,7 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         pwm_verification: Default::default(),
-        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: Default::default(),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
         openfan_maintenance: Default::default(),
@@ -9240,6 +9240,7 @@ async fn openfan_update_routes_before_any_update() {
 
     let (_st, caps) = uds_get(&sock, "/capabilities").await;
     assert_eq!(caps["control"]["openfan_firmware_maintenance"], true);
+    assert_eq!(caps["control"]["openfan_firmware_silent_update"], true);
 
     let (st, body) = uds_get(&sock, "/fans/openfan/maintenance").await;
     assert_eq!(st, 404, "{body}");
@@ -9261,6 +9262,14 @@ async fn openfan_update_routes_before_any_update() {
     assert_eq!(st, 409, "{body}");
     assert_refused_for(&body, "openfan_not_connected");
 
+    // DEC-484: no probe has had no answer from a board, so none is silent.
+    assert!(dev.get("silent_board").is_none(), "{dev}");
+    let mut silent = good.clone();
+    silent["board"] = serde_json::json!("silent");
+    let (st, body) = uds_post(&sock, "/fans/openfan/maintenance", &silent).await;
+    assert_eq!(st, 409, "{body}");
+    assert_refused_for(&body, "board_not_silent");
+
     let mut bad = good.clone();
     bad["firmware"]["size"] = serde_json::json!(513);
     let (st, body) = uds_post(&sock, "/fans/openfan/maintenance", &bad).await;
@@ -9272,6 +9281,7 @@ async fn openfan_update_routes_before_any_update() {
         "no controller, no link"
     );
     assert!(status.get("openfan_maintenance").is_none());
+    assert!(status.get("openfan_silent_board").is_none());
 }
 
 /// DEC-483: an upload through the real router — judged, and bounded at 1 MiB

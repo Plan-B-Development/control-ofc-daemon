@@ -138,7 +138,11 @@ pub fn post_boot_adoption_window(configured: bool) -> Duration {
 /// (DEC-243) and persists in `runtime.toml`, so this was durable across reboots.
 ///
 /// A candidate that opens but fails the handshake is skipped, not fatal: the
-/// next candidate — in practice the auto-detected one — is tried.
+/// next candidate — in practice the auto-detected one — is tried. It is also
+/// reported to `unanswered` (DEC-484): an OpenFAN board whose firmware does not
+/// answer Control-OFC is known by that evidence, never by its USB ids alone.
+/// A candidate that does not open is not reported — that proves nothing about
+/// what is behind it.
 ///
 /// Pure over the injected `open` so the accept/reject rule is unit-testable
 /// without a serial device, matching `serial_port_candidates`. The verification
@@ -149,6 +153,7 @@ pub fn first_openfan_port<T: crate::serial::transport::SerialTransport>(
     configured: Option<&str>,
     timeout: Duration,
     mut open: impl FnMut(&str) -> Result<T, crate::error::SerialError>,
+    mut unanswered: impl FnMut(&str),
 ) -> Option<(String, T)> {
     for port in candidates {
         // OFN-c: a rejected CONFIGURED port is a fault — the user named that
@@ -174,6 +179,11 @@ pub fn first_openfan_port<T: crate::serial::transport::SerialTransport>(
                          — not using it"
                     ),
                 }
+                // Closed before it is reported: the report may lead to a
+                // firmware update opening this node, and the open here holds
+                // its exclusive lock.
+                drop(transport);
+                unanswered(port);
             }
             Err(e) if user_named => {
                 log::warn!("Failed to open configured serial port {port}: {e}")

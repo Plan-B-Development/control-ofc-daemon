@@ -16,6 +16,11 @@ use crate::health::state::*;
 /// `polling.poll_interval_ms` default.
 const DEFAULT_HWMON_POLL_INTERVAL_MS: u64 = 1000;
 
+/// The most unanswered probes kept as silent-board evidence (DEC-484): far
+/// more serial devices than a machine has, so a bus of strangers cannot grow
+/// the list without end.
+pub const OPENFAN_UNANSWERED_CAP: usize = 16;
+
 /// Multiple of the poll interval past which a CPU reading is treated as no
 /// longer current (DEC-267).
 ///
@@ -853,11 +858,15 @@ impl StateCache {
     }
 
     /// Record the device path the controller was adopted on.
+    /// The node the OpenFan controller answers on — set at each adoption,
+    /// reconnect and hand-back. A board that answers there is not silent, so
+    /// any probe evidence that it did not answer goes (DEC-484).
     pub fn set_openfan_port(&self, path: &str) {
         let mut state = self.inner.write();
         if state.openfan_port.as_deref() != Some(path) {
             state.openfan_port = Some(path.to_string());
         }
+        state.openfan_unanswered.retain(|(p, _)| p != path);
     }
 
     pub fn openfan_port(&self) -> Option<String> {
@@ -913,6 +922,53 @@ impl StateCache {
             writes_suspended: false,
         });
         Ok(())
+    }
+
+    /// Claim the OpenFan controller for an update of a board that does not
+    /// answer (DEC-484) — under the same write guard as
+    /// [`Self::try_begin_openfan_maintenance`], so an update and a diagnostic can
+    /// never both start.
+    ///
+    /// Unlike a connected board's update, this needs no working link — the
+    /// board's silence is the point — and it may replace a recovery the last
+    /// run left, which is returned so a run that changes nothing can put it back
+    /// ([`Self::end_openfan_maintenance_restoring`]). It refuses while the poll
+    /// loop reports `Connected`: a controller that answers is updated as a
+    /// connected board, parked first.
+    ///
+    /// [SAFETY] OpenFan writes are suspended from the claim. Nothing reaches a
+    /// board that does not answer, so the suspension costs the thermal force no
+    /// reach; it keeps the engine from failing a write a second on a port that
+    /// is gone.
+    pub fn try_begin_silent_openfan_maintenance(
+        &self,
+        run_id: &str,
+        first_stage: &'static str,
+    ) -> Result<Option<(String, &'static str)>, MaintenanceRefusal> {
+        let mut state = self.inner.write();
+        if state.openfan_maintenance_running() {
+            return Err(MaintenanceRefusal::MaintenanceActive);
+        }
+        if state.openfan_link == Some(OpenFanLink::Connected) {
+            return Err(MaintenanceRefusal::BoardAnswers);
+        }
+        if state.verify_in_progress {
+            return Err(MaintenanceRefusal::DiagnosticActive);
+        }
+        if state.thermal_override_state.as_deref() == Some("emergency") {
+            return Err(MaintenanceRefusal::ThermalEmergency);
+        }
+        let prior = match state.openfan_maintenance.take() {
+            Some(OpenFanMaintenance::NeedsRecovery { run_id, outcome }) => Some((run_id, outcome)),
+            _ => None,
+        };
+        state.openfan_maintenance = Some(OpenFanMaintenance::Running {
+            run_id: run_id.to_string(),
+            stage: first_stage,
+            stage_deadline: None,
+            writes_suspended: true,
+        });
+        Ok(prior)
     }
 
     /// Suspend OpenFan writes for the run that owns the controller, from the
@@ -1027,6 +1083,87 @@ impl StateCache {
                 state.openfan_maintenance = None;
             }
         }
+    }
+
+    /// Release a silent board's update that changed nothing (DEC-484), putting
+    /// back the recovery its claim replaced: the board is as the last run left
+    /// it. One decision under the guard, so OpenFan writes are never resumed in
+    /// between. A stale `run_id` is ignored.
+    pub fn end_openfan_maintenance_restoring(&self, run_id: &str, prior: (String, &'static str)) {
+        let mut state = self.inner.write();
+        if !matches!(
+            &state.openfan_maintenance,
+            Some(OpenFanMaintenance::Running { run_id: id, .. }) if id == run_id
+        ) {
+            return;
+        }
+        log::warn!(
+            "OpenFan firmware update {run_id} changed nothing — the board still needs the \
+             recovery firmware update {} left it needing ({})",
+            prior.0,
+            prior.1
+        );
+        state.openfan_maintenance = Some(OpenFanMaintenance::NeedsRecovery {
+            run_id: prior.0,
+            outcome: prior.1,
+        });
+    }
+
+    /// Note a serial device an adoption probe opened that did not answer the
+    /// identity handshake, and the node it was (DEC-484). One entry per path,
+    /// the latest node; at most [`OPENFAN_UNANSWERED_CAP`], oldest first out.
+    pub fn record_openfan_unanswered(&self, path: &str, node: crate::serial::adoption::NodeId) {
+        let mut state = self.inner.write();
+        let list = &mut state.openfan_unanswered;
+        list.retain(|(p, _)| p != path);
+        list.push((path.to_string(), node));
+        let excess = list.len().saturating_sub(OPENFAN_UNANSWERED_CAP);
+        list.drain(..excess);
+    }
+
+    /// The probe evidence, oldest first.
+    pub fn openfan_unanswered(&self) -> Vec<(String, crate::serial::adoption::NodeId)> {
+        self.inner.read().openfan_unanswered.clone()
+    }
+
+    /// Drop the evidence `keep` rejects — a node that went away or now names
+    /// another device.
+    pub fn retain_openfan_unanswered(
+        &self,
+        keep: impl Fn(&str, crate::serial::adoption::NodeId) -> bool,
+    ) {
+        let mut state = self.inner.write();
+        state.openfan_unanswered.retain(|(p, n)| keep(p, *n));
+    }
+
+    /// Publish the silent board, or none (DEC-484). Takes only a read guard
+    /// when nothing changed.
+    pub fn set_openfan_silent_board(&self, board: Option<SilentBoardEntry>) {
+        if self.inner.read().openfan_silent_board == board {
+            return;
+        }
+        let mut state = self.inner.write();
+        // The port, never the serial: a support bundle carries this log whole,
+        // and the board's serial is kept out of it (DEC-483).
+        match (&state.openfan_silent_board, &board) {
+            (None, Some(b)) => log::warn!(
+                "An OpenFAN board on USB port {} does not answer Control-OFC — its firmware can \
+                 be updated from the Hardware page",
+                b.usb_port
+            ),
+            (Some(b), None) => {
+                log::info!(
+                    "The OpenFAN board on USB port {} no longer reads as silent",
+                    b.usb_port
+                )
+            }
+            _ => {}
+        }
+        state.openfan_silent_board = board;
+    }
+
+    pub fn openfan_silent_board(&self) -> Option<SilentBoardEntry> {
+        self.inner.read().openfan_silent_board.clone()
     }
 
     /// At startup, for a run this start found interrupted after it had asked
@@ -2962,6 +3099,22 @@ mod tests {
             .unwrap();
         cache.restore_openfan_recovery("r0", "needs_recovery");
         assert!(cache.openfan_maintenance_running());
+    }
+
+    /// DEC-484: a controller answering on a node is not silent there — that
+    /// node's probe evidence goes, and another node's stays.
+    #[test]
+    fn a_controller_answering_on_a_node_drops_that_nodes_silent_evidence() {
+        use crate::serial::adoption::NodeId;
+        let cache = StateCache::new();
+        cache.record_openfan_unanswered("/dev/ttyACM0", NodeId { dev: 5, ino: 1 });
+        cache.record_openfan_unanswered("/dev/ttyACM1", NodeId { dev: 5, ino: 2 });
+        assert_eq!(cache.openfan_unanswered().len(), 2, "precondition");
+        cache.set_openfan_port("/dev/ttyACM0");
+        assert_eq!(
+            cache.openfan_unanswered(),
+            [("/dev/ttyACM1".to_string(), NodeId { dev: 5, ino: 2 })]
+        );
     }
 
     /// A run that panicked releases its claim before its loan, so it ends

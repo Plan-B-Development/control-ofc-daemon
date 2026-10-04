@@ -422,6 +422,9 @@ pub(super) enum AdoptOutcome {
     /// Registration has closed — the daemon is shutting down, so nothing was
     /// installed and no loop was started.
     ShuttingDown,
+    /// A firmware update holds the controller (DEC-484); only that run may
+    /// install one, so nothing was installed and no loop was started.
+    MaintenanceRunning,
 }
 
 /// Shared application state passed to all handlers.
@@ -535,7 +538,12 @@ pub struct AppState {
     /// Two racing probes would open the same tty, and the loser would install
     /// a controller over the winner's — orphaning a poll loop on a transport
     /// nothing writes through.
-    pub openfan_rescanning: AtomicBool,
+    ///
+    /// Shared (`Arc`) since DEC-484: an update of a silent OpenFAN board holds
+    /// it from before it signals the board until it has handed the board over,
+    /// so no probe — the user's rescan, the post-boot search, the recovery
+    /// watch, all of which run through the rescan — opens the board meanwhile.
+    pub openfan_rescanning: Arc<AtomicBool>,
     /// What the last completed `POST /fans/openfan/rescan` probe saw (register
     /// row 10-e). `openfan_rescanning` above bounds **concurrency**; this bounds
     /// **repetition**, which is a different hazard: every probe asserts DTR on
@@ -775,14 +783,32 @@ impl AppState {
     /// and rejected: it would spawn the poll loop *before* the install race is
     /// decided, so a losing probe's loop could write RPM into the shared cache
     /// before it was aborted.
+    ///
+    /// **And while a firmware update holds the controller, only that run
+    /// installs one** (DEC-484): `owner` names the run adopting the silent
+    /// board it brought back; every other adoption passes `None` and is refused
+    /// with [`AdoptOutcome::MaintenanceRunning`]. The run's claim is read under
+    /// the cache's own guard, so a claim that lands after this check finds the
+    /// controller installed, and an update of a silent board then finds the
+    /// board answering.
     fn adopt_openfan_controller(
         &self,
         controller: FanController,
+        owner: Option<&str>,
         start_poll_loop: impl FnOnce() -> tokio::task::JoinHandle<()>,
     ) -> AdoptOutcome {
         let mut adopted = self.adopted_poll_tasks.lock();
         if adopted.is_closed() {
             return AdoptOutcome::ShuttingDown;
+        }
+        let held_by_another = self.cache.read_with(|s| match &s.openfan_maintenance {
+            Some(crate::health::state::OpenFanMaintenance::Running { run_id, .. }) => {
+                owner != Some(run_id.as_str())
+            }
+            _ => false,
+        });
+        if held_by_another {
+            return AdoptOutcome::MaintenanceRunning;
         }
 
         // DEC-266: check AND set under one write guard. The caller's
@@ -1200,17 +1226,29 @@ where
     }
 }
 
-/// `status.openfan_link` and `status.openfan_maintenance` (DEC-481), read under
-/// the same guard as the health entry they explain.
+/// `status.openfan_link`, `status.openfan_maintenance` (DEC-481) and
+/// `status.openfan_silent_board` (DEC-484), read under the same guard as the
+/// health entry they explain.
 pub(crate) struct OpenFanStatusEntries {
     pub link: Option<String>,
     pub maintenance: Option<OpenFanMaintenanceSummary>,
+    pub silent_board: Option<OpenFanSilentBoardEntry>,
 }
 
 pub(crate) fn build_openfan_status_entries(snap: &DaemonState) -> OpenFanStatusEntries {
     use crate::health::state::OpenFanMaintenance;
     OpenFanStatusEntries {
         link: snap.openfan_link_wire().map(str::to_string),
+        // Not while an update runs: the run is what the client shows then, and
+        // the watch may not have looked since it started.
+        silent_board: snap
+            .openfan_silent_board
+            .as_ref()
+            .filter(|_| !snap.openfan_maintenance_running())
+            .map(|b| OpenFanSilentBoardEntry {
+                usb_serial: b.usb_serial.clone(),
+                usb_port: b.usb_port.clone(),
+            }),
         maintenance: snap.openfan_maintenance.as_ref().map(|m| match m {
             OpenFanMaintenance::Running { run_id, stage, .. } => OpenFanMaintenanceSummary {
                 run_id: run_id.clone(),
@@ -1365,6 +1403,7 @@ pub(crate) fn build_status_response(
         // DEC-481: under the same guard as `health`'s `openfan` entry.
         openfan_link: openfan.link,
         openfan_maintenance: openfan.maintenance,
+        openfan_silent_board: openfan.silent_board,
     }
 }
 
@@ -1445,6 +1484,44 @@ mod tests {
             (m.state.as_str(), m.outcome.as_deref(), m.run_id.as_str()),
             ("needs_recovery", Some("needs_recovery"), "r1")
         );
+    }
+
+    /// DEC-484: the silent board is published while no update runs, and not
+    /// while one does — the run is what the client shows then.
+    #[test]
+    fn a_silent_board_is_published_except_while_an_update_runs() {
+        use crate::health::state::{OpenFanMaintenance, SilentBoardEntry};
+        let mut snap = DaemonState {
+            openfan_silent_board: Some(SilentBoardEntry {
+                usb_serial: "DE615CB14721492C".into(),
+                usb_port: "8-8".into(),
+            }),
+            ..DaemonState::default()
+        };
+        let b = build_openfan_status_entries(&snap).silent_board.unwrap();
+        assert_eq!(
+            (b.usb_serial.as_str(), b.usb_port.as_str()),
+            ("DE615CB14721492C", "8-8")
+        );
+        snap.openfan_maintenance = Some(OpenFanMaintenance::NeedsRecovery {
+            run_id: "r0".into(),
+            outcome: "needs_recovery",
+        });
+        assert!(
+            build_openfan_status_entries(&snap).silent_board.is_some(),
+            "a board left needing recovery may be the silent one"
+        );
+        let cache = crate::health::cache::StateCache::new();
+        cache.set_openfan_silent_board(snap.openfan_silent_board.clone());
+        cache
+            .try_begin_silent_openfan_maintenance("r1", "preparing")
+            .unwrap();
+        let running = cache.read_with(|s| s.clone());
+        assert!(running.openfan_maintenance_running(), "precondition");
+        assert!(running.openfan_silent_board.is_some(), "precondition");
+        assert!(build_openfan_status_entries(&running)
+            .silent_board
+            .is_none());
     }
 
     #[test]

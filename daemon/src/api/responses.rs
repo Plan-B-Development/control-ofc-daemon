@@ -188,6 +188,21 @@ pub struct StatusResponse {
     /// `GET /fans/openfan/maintenance`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openfan_maintenance: Option<OpenFanMaintenanceSummary>,
+    /// An OpenFAN board on USB whose firmware does not answer Control-OFC, while
+    /// no controller does (DEC-484): an adoption probe opened it and got no
+    /// answer. Its firmware can be updated (`"board": "silent"` on the start).
+    /// Omitted otherwise, and while an update runs (additive).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openfan_silent_board: Option<OpenFanSilentBoardEntry>,
+}
+
+/// `status.openfan_silent_board` (DEC-484).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OpenFanSilentBoardEntry {
+    /// The board's USB serial: what the start's `expected_usb_serial` names.
+    pub usb_serial: String,
+    /// Its physical USB port (`8-8`).
+    pub usb_port: String,
 }
 
 /// `status.openfan_maintenance` (DEC-481).
@@ -1356,6 +1371,14 @@ pub struct ControlCapability {
     /// opt-in drop-in — is `daemon_write.available`, not this.
     #[serde(default)]
     pub openfan_firmware_write: bool,
+    /// The daemon can update a board that does not answer (DEC-484):
+    /// `status.openfan_silent_board`, `silent_board` on
+    /// `GET /fans/openfan/device`, `board: "silent"` on the start, the
+    /// `waiting_for_boot_button` stage, the `boot_button` trigger and `board`
+    /// on the record. A client shows the update for a silent board only when
+    /// this is true.
+    #[serde(default)]
+    pub openfan_firmware_silent_update: bool,
 }
 
 /// Per-device-group capability info.
@@ -1717,6 +1740,27 @@ pub struct OpenFanDeviceResponse {
     pub update_refusals: Vec<OpenFanUpdateRefusal>,
     /// Whether the daemon could write the firmware itself (DEC-483).
     pub daemon_write: OpenFanDaemonWrite,
+    /// An OpenFAN board on USB that does not answer, while no controller does
+    /// (DEC-484), and whether its update could start now. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub silent_board: Option<OpenFanSilentBoard>,
+}
+
+/// `silent_board` on `GET /fans/openfan/device` (DEC-484).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OpenFanSilentBoard {
+    /// The board as sysfs shows it; `usb.serial` is what the start's
+    /// `expected_usb_serial` names.
+    pub usb: crate::serial::usb_identity::UsbDevice,
+    /// The serial interface the update signals on.
+    pub interface_number: u8,
+    /// That interface's device path.
+    pub tty: String,
+    /// Whether `POST /fans/openfan/maintenance` with `board: "silent"` would
+    /// pass its checks now. Informational — the POST decides again.
+    pub update_available: bool,
+    /// Why not, when it would not.
+    pub update_refusals: Vec<OpenFanUpdateRefusal>,
 }
 
 /// `daemon_write` on `GET /fans/openfan/device` (DEC-483).
@@ -3683,10 +3727,33 @@ mod tests {
                 reason: Some("no_usb_access".into()),
                 message: Some("install the drop-in".into()),
             },
+            silent_board: Some(OpenFanSilentBoard {
+                usb: usb.clone(),
+                interface_number: 0,
+                tty: "/dev/ttyACM1".into(),
+                update_available: false,
+                update_refusals: vec![OpenFanUpdateRefusal {
+                    reason: "bootloader_present".into(),
+                    message: "a board is already in its USB bootloader".into(),
+                }],
+            }),
         };
         expect(
             &serde_json::to_value(&device).unwrap(),
             "OpenFanDeviceResponse",
+        );
+        // DEC-484: the silent board, on the device answer and on `/status`.
+        expect(
+            &serde_json::to_value(device.silent_board.as_ref().unwrap()).unwrap(),
+            "OpenFanSilentBoard",
+        );
+        let silent_entry = OpenFanSilentBoardEntry {
+            usb_serial: "DE615CB14721492C".into(),
+            usb_port: "8-8".into(),
+        };
+        expect(
+            &serde_json::to_value(&silent_entry).unwrap(),
+            "OpenFanSilentBoardEntry",
         );
         expect(
             &serde_json::to_value(&device.daemon_write).unwrap(),
@@ -3995,6 +4062,7 @@ mod tests {
             advisories: Vec::new(),
             openfan_link: None,
             openfan_maintenance: None,
+            openfan_silent_board: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["api_version"], 1);
@@ -4062,6 +4130,7 @@ mod tests {
             advisories: Vec::new(),
             openfan_link: None,
             openfan_maintenance: None,
+            openfan_silent_board: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["readiness"]["overall"], "warning");
@@ -4103,6 +4172,7 @@ mod tests {
             advisories: Vec::new(),
             openfan_link: None,
             openfan_maintenance: None,
+            openfan_silent_board: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(
@@ -4144,6 +4214,7 @@ mod tests {
             advisories: Vec::new(),
             openfan_link: None,
             openfan_maintenance: None,
+            openfan_silent_board: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["skipped_controls"][0]["control_id"], "ctl-front");
@@ -4185,6 +4256,7 @@ mod tests {
             advisories: Vec::new(),
             openfan_link: None,
             openfan_maintenance: None,
+            openfan_silent_board: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(

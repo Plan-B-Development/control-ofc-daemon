@@ -313,7 +313,7 @@ invented for the gap.
 | `GET /fans/openfan/roles` | Each OpenFan channel's role and whether the daemon protects it as a pump (`stop_permitted`, `effective_min_pwm_pct`) |
 | `GET /fans/openfan/device` | The OpenFAN controller's USB identity, its hardware and firmware reports, its link state, and whether a firmware update could start now — with each reason it could not (DEC-481, 3.8.0+). `daemon_write` says whether the daemon may write the firmware itself: `{"available": false, "reason": "no_usb_access", ...}` until the opt-in drop-in is installed (DEC-483) |
 | `PUT /fans/openfan/firmware` | Upload a firmware file — the raw `.uf2` bytes, at most 1 MiB (DEC-483, 3.8.0+; `control.openfan_firmware_write`). Answers `{sha256, size, release?, verdict, reason?, message}`: `verdict` is `daemon_write` (a published release the daemon knows — it keeps the file to write it), `manual_copy` (`unknown_build` or `invalid_image` — copied by hand) or `refused` (`firmware_known_broken`: the 2023 FW_01 binary). Touches no hardware |
-| `POST /fans/openfan/maintenance` | Start an OpenFAN firmware update (DEC-481, 3.8.0+; `control.openfan_firmware_maintenance`). Body `{"expected_usb_serial": "<serial>", "firmware": {"sha256": "<hex>", "size": N, ...}, "write": "manual"}` — a fingerprint of the file, never a path. Parks every OpenFAN channel at 100 %, sends the board into its bootloader, waits up to 15 minutes for you to copy the file onto the `RPI-RP2` drive, then checks the board and restores control. With `"write": "daemon"` (DEC-483) the daemon writes the file uploaded with `PUT /fans/openfan/firmware` itself and reads it back, and you copy nothing unless that write falls back to the copy. The FW_01 binary is refused (`firmware_known_broken`). `202` with the run id |
+| `POST /fans/openfan/maintenance` | Start an OpenFAN firmware update (DEC-481, 3.8.0+; `control.openfan_firmware_maintenance`). Body `{"expected_usb_serial": "<serial>", "firmware": {"sha256": "<hex>", "size": N, ...}, "write": "manual"}` — a fingerprint of the file, never a path. Parks every OpenFAN channel at 100 %, sends the board into its bootloader, waits up to 15 minutes for you to copy the file onto the `RPI-RP2` drive, then checks the board and restores control. With `"write": "daemon"` (DEC-483) the daemon writes the file uploaded with `PUT /fans/openfan/firmware` itself and reads it back, and you copy nothing unless that write falls back to the copy. With `"board": "silent"` (DEC-484; `control.openfan_firmware_silent_update`) it updates the board named in `openfan_silent_board` instead: nothing is parked, and if the 1200-baud signal does not move the board you press BOOT + RESET. The FW_01 binary is refused (`firmware_known_broken`). `202` with the run id |
 | `GET /fans/openfan/maintenance` | The current or most recent firmware update: each stage's timing, the outcome and the before/after evidence. Survives a restart |
 | `DELETE /fans/openfan/maintenance` | Cancel a firmware update — only until the board is asked to enter its bootloader |
 | `POST /gpu/{gpu_id}/fan/reset` | Restore GPU fan to firmware automatic and re-enable zero-RPM |
@@ -474,6 +474,13 @@ is happening. A run that leaves the board in its bootloader keeps that entry cri
 writes off, until the board answers again; the run is recorded in
 `/var/lib/control-ofc/openfan-maintenance.json`, so a daemon restart reports it rather than forgets
 it.
+
+**A board that does not answer (DEC-484).** An OpenFAN board can be on USB and still not answer —
+the 2023 FW_01 build, a firmware with other commands, a hung one. Once a probe has opened it and
+had no answer, the daemon names it in `/status` (`openfan_silent_board`) and the same window updates
+it: nothing is parked, because the board takes no commands; the daemon sends the 1200-baud signal
+and, if that does not move the board, waits up to 10 minutes for you to hold BOOT and press RESET.
+Once the board answers, the daemon takes it over as the controller. Not yet tried on real hardware.
 
 **Letting the daemon write the firmware itself (opt-in, DEC-483).** For a published OpenFAN
 release it knows by fingerprint, the daemon can write the file for you through the bootloader's

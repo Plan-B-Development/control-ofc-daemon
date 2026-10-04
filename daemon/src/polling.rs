@@ -971,6 +971,12 @@ fn reconnect_via_survey<T: SerialTransport + Send + 'static>(
             configured.as_deref(),
             timeout,
             open,
+            // DEC-484: the evidence that tells a silent OpenFAN board apart.
+            |p| {
+                if let Some(node) = observe(p) {
+                    cache.record_openfan_unanswered(p, node);
+                }
+            },
         )?;
         chosen = Some(found.0.clone());
         Some(found)
@@ -1434,6 +1440,74 @@ mod tests {
             );
             assert_eq!(opened, vec!["/dev/ttyACM2"], "attempt {attempt}");
         }
+    }
+
+    /// DEC-484: an attempt that opened the controller's node and had no answer
+    /// leaves the evidence a silent board is known by; an attempt that could
+    /// not open it proves nothing and leaves none.
+    #[test]
+    fn a_reconnect_attempt_that_gets_no_answer_records_the_node_it_opened() {
+        use crate::serial::adoption::{NodeId, ReconnectSurvey};
+        let node = |p: &str| (p == "/dev/ttyACM0").then_some(NodeId { dev: 5, ino: 1 });
+        let seed = vec!["/dev/ttyACM0".to_string()];
+        let survey =
+            parking_lot::Mutex::new(ReconnectSurvey::new(None, "/dev/ttyACM0", &seed, node));
+        let enumerate = || vec!["/dev/ttyACM0".to_string()];
+        let cache = StateCache::new();
+        let now = std::time::Instant::now();
+
+        let mut opened = 0;
+        let found = reconnect_via_survey(
+            &cache,
+            Duration::from_millis(50),
+            &survey,
+            enumerate,
+            node,
+            |_| {
+                opened += 1;
+                Err::<ReplayTransport, _>(crate::error::SerialError::Timeout { timeout_ms: 1 })
+            },
+            now,
+        );
+        assert!(found.is_none());
+        assert_eq!(opened, 1, "precondition: the node was tried");
+        assert!(cache.openfan_unanswered().is_empty());
+
+        let found = reconnect_via_survey(
+            &cache,
+            Duration::from_millis(50),
+            &survey,
+            enumerate,
+            node,
+            |_| Ok(ReplayTransport(Default::default())),
+            now,
+        );
+        assert!(found.is_none());
+        assert_eq!(
+            cache.openfan_unanswered(),
+            [("/dev/ttyACM0".to_string(), NodeId { dev: 5, ino: 1 })]
+        );
+
+        // The board answers there again: it is not silent, and the evidence
+        // that said so goes with the reconnect.
+        let survey =
+            parking_lot::Mutex::new(ReconnectSurvey::new(None, "/dev/ttyACM0", &seed, node));
+        let found = reconnect_via_survey(
+            &cache,
+            Duration::from_millis(50),
+            &survey,
+            enumerate,
+            node,
+            // Identified twice: by the probe, then by the adoption.
+            |_| {
+                let mut replies = openfan_replies();
+                replies.0.extend(openfan_replies().0);
+                Ok(replies)
+            },
+            now,
+        );
+        assert!(found.is_some(), "precondition: re-found");
+        assert!(cache.openfan_unanswered().is_empty());
     }
 
     #[test]

@@ -29,6 +29,24 @@
   id, verified, fallback reason) and `GET /fans/openfan/device` carries `daemon_write` — whether the
   daemon may open USB devices, asked of `access(2)` without opening any. New dependencies: `nusb` (usbfs,
   pure Rust) and `sha2`; the flash-id helper is picotool's, BSD-3-Clause (`NOTICE.md`) (DEC-483).
+- **An OpenFAN board on USB that does not answer can be updated: `"board": "silent"` on the start,
+  advertised as `control.openfan_firmware_silent_update`.** A board is silent only on evidence — an
+  adoption probe (at boot, a rescan, the post-boot search, the poll loop's reconnect search) opened its
+  serial device and had no answer, and it is still that node — and only while no controller answers;
+  `/status` and `/poll` name it in `openfan_silent_board` (`{usb_serial, usb_port}`), refreshed every 2 s
+  by a read-only watch, and `GET /fans/openfan/device` describes it in `silent_board`. The update parks
+  nothing — the board takes no commands — and holds every OpenFan probe off the board: it waits for one
+  already running, holds the rescan's single-flight flag, and parks an adopted controller's poll loop on
+  the port loan. It asks the board once more (one that answers is handed back, never signalled), sends
+  the 1200-baud signal on its serial interface without `>07`, and when that does not bring the
+  bootloader waits up to 10 minutes in the new `waiting_for_boot_button` stage for BOOT + RESET,
+  cancellable until the bootloader appears. From there it is the usual run, daemon write or copy by hand;
+  the answering board goes back to its poll loop or is adopted as the controller, and a board with no
+  poll loop that ends needing recovery is watched for as after a restart. It may start over a board the
+  last update left needing recovery, and puts that recovery back when it changes nothing (until a daemon
+  restart, after which the board reads as silent again). The run record
+  carries `board` (`connected` | `silent`), and `bootloader_trigger` gains `boot_button`. New refusal
+  `board_not_silent`. Not yet run on hardware (DEC-484).
 - **`/status` and `/poll` carry `openfan_link`** (`connected` | `unresponsive` | `reconnecting` |
   `maintenance`; omitted with no controller) **and `openfan_maintenance`** (`{run_id, stage, state,
   outcome?}` while an update holds the controller, or while the board it left needs recovery).

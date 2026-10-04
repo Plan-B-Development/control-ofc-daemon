@@ -10,7 +10,8 @@
 //! - `DELETE /fans/openfan/maintenance` — stop one before the port is borrowed.
 //!
 //! The update itself is [`crate::openfan_maintenance`]; this module checks,
-//! claims and starts it, and serves its record.
+//! claims and starts it, and serves its record. It also runs the silent-board
+//! watch (DEC-484), which publishes `status.openfan_silent_board`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -24,12 +25,16 @@ use serde::Deserialize;
 
 use super::{error_response, json_ok, AppState};
 use crate::api::responses::*;
-use crate::health::state::{MaintenanceRefusal, OpenFanLink};
-use crate::openfan_maintenance::run::{ExpectedChannels, Opener, RunEnv, StageLimits};
-use crate::openfan_maintenance::{
-    firmware, journal, next_run_id, stage, CachedInfo, CancelOutcome, ClaimGuard, FirmwareClaim,
-    FirmwareWrite, MaintenanceRecord,
+use crate::health::state::{MaintenanceRefusal, OpenFanLink, OpenFanMaintenance};
+use crate::openfan_maintenance::run::{
+    AdoptFn, ExpectedChannels, Opener, RunEnv, SilentTarget, StageLimits, Target,
 };
+use crate::openfan_maintenance::silent::{self, SilentBoard};
+use crate::openfan_maintenance::{
+    firmware, journal, next_run_id, stage, AliveGuard, CachedInfo, CancelOutcome, ClaimGuard,
+    FirmwareClaim, FirmwareWrite, MaintenanceRecord,
+};
+use crate::serial::adoption::NodeId;
 use crate::serial::picoboot;
 use crate::serial::protocol::{FW_INFO_OPCODE, HW_INFO_OPCODE, NUM_CHANNELS};
 use crate::serial::uf2;
@@ -59,6 +64,17 @@ pub enum WriteMethod {
     Daemon,
 }
 
+/// Which board an update is for (DEC-484).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardKind {
+    /// The adopted controller, which answers: parked, then sent `>07`.
+    #[default]
+    Connected,
+    /// A board on USB that does not answer (`status.openfan_silent_board`).
+    Silent,
+}
+
 /// `POST /fans/openfan/maintenance`.
 #[derive(Debug, Deserialize)]
 pub struct MaintenanceStartRequest {
@@ -69,6 +85,9 @@ pub struct MaintenanceStartRequest {
     /// Absent from a Phase 1 client: the copy by hand.
     #[serde(default)]
     pub write: WriteMethod,
+    /// Absent from a client before DEC-484: the connected board.
+    #[serde(default)]
+    pub board: BoardKind,
 }
 
 /// A 409 with `details.reason`, retryable — the shape of every refusal here.
@@ -143,7 +162,29 @@ pub(crate) struct MaintenanceIo {
     pub open: Opener,
     pub picoboot: picoboot::Opener,
     pub limits: StageLimits,
+    /// Which node a device path names now (DEC-484): the silent-board
+    /// evidence is checked against it.
+    pub observe: Observe,
+    /// What watches for a silent board, with no poll loop, that its run left
+    /// outside normal control (DEC-484); production is
+    /// [`openfan_recovery_watch`].
+    pub recovery_watch: RecoveryWatch,
 }
+
+/// Watches for the board a run left outside normal control, until it is
+/// adopted or the daemon stops.
+pub(crate) type RecoveryWatch = Arc<
+    dyn Fn(
+            Arc<AppState>,
+            MaintenanceRecord,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Reads a device path's node now; production is
+/// [`crate::serial::adoption::node_id`].
+pub(crate) type Observe = Arc<dyn Fn(&str) -> Option<NodeId> + Send + Sync>;
 
 impl MaintenanceIo {
     fn production() -> Self {
@@ -154,8 +195,37 @@ impl MaintenanceIo {
             open: real_opener(),
             picoboot: picoboot::usb_opener(),
             limits: StageLimits::production(),
+            observe: Arc::new(crate::serial::adoption::node_id),
+            recovery_watch: Arc::new(|state: Arc<AppState>, record| {
+                let shutdown = state.openfan_runtime.shutdown.clone();
+                Box::pin(openfan_recovery_watch(state, record, shutdown))
+            }),
         }
     }
+}
+
+/// Whether no OpenFan controller answers (DEC-484): none was adopted, or its
+/// poll loop has given up on the port and is searching for it. A loop still
+/// retrying a port it holds is not yet reason to call the board silent.
+fn no_controller_answers(state: &AppState) -> bool {
+    state.openfan().is_none() || state.cache.openfan_link() == Some(OpenFanLink::Reconnecting)
+}
+
+/// The silent boards now (DEC-484): none while a controller answers or an
+/// update runs, or while no probe has left evidence. Reads sysfs off the
+/// runtime; opens nothing.
+async fn silent_now(state: &AppState, sys: &Path, observe: Observe) -> Vec<SilentBoard> {
+    if !no_controller_answers(state) || state.cache.openfan_maintenance_running() {
+        return Vec::new();
+    }
+    let evidence = state.cache.openfan_unanswered();
+    if evidence.is_empty() {
+        return Vec::new();
+    }
+    let sys = sys.to_path_buf();
+    tokio::task::spawn_blocking(move || silent::silent_boards(&sys, &evidence, |p| observe(p)))
+        .await
+        .unwrap_or_default()
 }
 
 /// Whether the daemon may open USB devices, off the runtime.
@@ -197,11 +267,52 @@ async fn read_usb(sys: &Path, port: Option<String>) -> (Option<TtyIdentity>, Vec
     .unwrap_or((None, Vec::new()))
 }
 
-/// Every reason an update could not start now, without claiming anything.
-/// The POST decides again, atomically.
+/// Every reason an update of the connected board could not start now, without
+/// claiming anything. The POST decides again, atomically.
 fn preview_refusals(
     state: &AppState,
     identity: Option<&TtyIdentity>,
+    bootloaders: &[UsbDevice],
+) -> Vec<OpenFanUpdateRefusal> {
+    if state.openfan().is_none() {
+        return vec![OpenFanUpdateRefusal {
+            reason: "openfan_not_connected".into(),
+            message: "no OpenFan controller is connected".into(),
+        }];
+    }
+    let (link, recovering) = state.cache.read_with(|s| {
+        (
+            s.openfan_link,
+            matches!(
+                s.openfan_maintenance,
+                Some(crate::health::state::OpenFanMaintenance::NeedsRecovery { .. })
+            ),
+        )
+    });
+    let link_refusal =
+        if link != Some(OpenFanLink::Connected) || state.openfan_maintenance.lender().is_none() {
+            Some(MaintenanceRefusal::LinkNotReady(link))
+        } else if recovering {
+            Some(MaintenanceRefusal::RecoveryPending)
+        } else {
+            None
+        };
+    let mut out = standing_refusals(state, link_refusal, bootloaders);
+    if identity.is_none() {
+        out.push(OpenFanUpdateRefusal {
+            reason: "usb_identity_unavailable".into(),
+            message: "the controller's USB identity could not be read from sysfs".into(),
+        });
+    }
+    out
+}
+
+/// What refuses an update of either board now, in the order a window lists
+/// them; `link` is the connected board's refusal over its link, if any. A
+/// silent board's update needs no link (DEC-484).
+fn standing_refusals(
+    state: &AppState,
+    link: Option<MaintenanceRefusal>,
     bootloaders: &[UsbDevice],
 ) -> Vec<OpenFanUpdateRefusal> {
     let mut out = Vec::new();
@@ -211,21 +322,9 @@ fn preview_refusals(
             message,
         })
     };
-    if state.openfan().is_none() {
-        add(
-            "openfan_not_connected",
-            "no OpenFan controller is connected".into(),
-        );
-        return out;
-    }
-    let (link, running, recovering, verify_held, emergency) = state.cache.read_with(|s| {
+    let (running, verify_held, emergency) = state.cache.read_with(|s| {
         (
-            s.openfan_link,
             s.openfan_maintenance_running(),
-            matches!(
-                s.openfan_maintenance,
-                Some(crate::health::state::OpenFanMaintenance::NeedsRecovery { .. })
-            ),
             s.verify_in_progress,
             s.thermal_override_state.as_deref() == Some("emergency"),
         )
@@ -236,11 +335,7 @@ fn preview_refusals(
             MaintenanceRefusal::MaintenanceActive.message(),
         );
     }
-    if link != Some(OpenFanLink::Connected) || state.openfan_maintenance.lender().is_none() {
-        let r = MaintenanceRefusal::LinkNotReady(link);
-        add(r.reason(), r.message());
-    } else if recovering {
-        let r = MaintenanceRefusal::RecoveryPending;
+    if let Some(r) = link {
         add(r.reason(), r.message());
     }
     if verify_held {
@@ -266,12 +361,6 @@ fn preview_refusals(
     if !bootloaders.is_empty() {
         add("bootloader_present", bootloader_message(bootloaders));
     }
-    if identity.is_none() {
-        add(
-            "usb_identity_unavailable",
-            "the controller's USB identity could not be read from sysfs".into(),
-        );
-    }
     out
 }
 
@@ -292,6 +381,7 @@ pub async fn openfan_device_handler(
         &state,
         Path::new(usb::SYSFS_ROOT),
         Path::new(picoboot::USB_DEV_ROOT),
+        Arc::new(crate::serial::adoption::node_id),
     )
     .await
 }
@@ -300,6 +390,7 @@ async fn describe_device(
     state: &AppState,
     sys: &Path,
     dev: &Path,
+    observe: Observe,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let controller = state.openfan();
     let (link, running) = state.cache.read_with(|s| {
@@ -346,6 +437,21 @@ async fn describe_device(
 
     let refusals = preview_refusals(state, identity.as_ref(), &bootloaders);
     let daemon_write = daemon_write(usb_access(dev).await);
+    // DEC-484: the board on USB that does not answer, while no controller does.
+    let silent_board = silent_now(state, sys, observe)
+        .await
+        .into_iter()
+        .next()
+        .map(|b| {
+            let refusals = standing_refusals(state, None, &bootloaders);
+            OpenFanSilentBoard {
+                usb: b.usb,
+                interface_number: b.interface_number,
+                tty: b.tty,
+                update_available: refusals.is_empty(),
+                update_refusals: refusals,
+            }
+        });
     json_ok(
         StatusCode::OK,
         OpenFanDeviceResponse {
@@ -360,6 +466,7 @@ async fn describe_device(
             update_available: refusals.is_empty(),
             update_refusals: refusals,
             daemon_write,
+            silent_board,
         },
     )
 }
@@ -493,14 +600,9 @@ async fn start_update(
     io: MaintenanceIo,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if *state.openfan_runtime.shutdown.borrow() || state.openfan_maintenance.is_closed() {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &ErrorEnvelope::hardware_unavailable(
-                "the daemon is shutting down — no firmware update was started",
-            ),
-        );
+        return shutting_down();
     }
-    let write = body.write;
+    let (write, board) = (body.write, body.board);
     let (serial, firmware) = match validated(body) {
         Ok(v) => v,
         Err(e) => return bad_request(e),
@@ -528,6 +630,29 @@ async fn start_update(
             Some(staged)
         }
     };
+    match board {
+        BoardKind::Connected => start_connected(state, serial, firmware, job, io).await,
+        BoardKind::Silent => start_silent(state, serial, firmware, job, io).await,
+    }
+}
+
+fn shutting_down() -> (StatusCode, Json<serde_json::Value>) {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &ErrorEnvelope::hardware_unavailable(
+            "the daemon is shutting down — no firmware update was started",
+        ),
+    )
+}
+
+/// The update of the adopted controller, which answers (DEC-481).
+async fn start_connected(
+    state: &Arc<AppState>,
+    serial: String,
+    firmware: FirmwareClaim,
+    job: Option<firmware::Staged>,
+    io: MaintenanceIo,
+) -> (StatusCode, Json<serde_json::Value>) {
     let Some(controller) = state.openfan() else {
         return refused(
             "openfan_not_connected",
@@ -583,10 +708,213 @@ async fn start_update(
         return refused(r.reason(), r.message());
     }
     let claim = ClaimGuard::new(state.cache.clone(), run_id.clone());
+    let target = Target::Connected { controller, lender };
+    launch(
+        state,
+        run_id,
+        serial,
+        firmware,
+        job,
+        io,
+        Launch {
+            claim,
+            alive,
+            target,
+            board: crate::openfan_maintenance::board::CONNECTED,
+        },
+    )
+    .await
+}
+
+/// The update of a board on USB that does not answer (DEC-484). It needs no
+/// adopted controller; it needs the board to be the silent one the user saw.
+async fn start_silent(
+    state: &Arc<AppState>,
+    serial: String,
+    firmware: FirmwareClaim,
+    job: Option<firmware::Staged>,
+    io: MaintenanceIo,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // One run's task at a time, for its whole life.
+    let Some(alive) = state.openfan_maintenance.claim() else {
+        let r = MaintenanceRefusal::MaintenanceActive;
+        return refused(r.reason(), r.message());
+    };
+    if state.openfan_calibration.is_alive() {
+        return refused(
+            "calibration_active",
+            "an OpenFan calibration is running — wait for it to finish",
+        );
+    }
+    let (_, bootloaders) = read_usb(&io.sys_root, None).await;
+    if !bootloaders.is_empty() {
+        return refused("bootloader_present", bootloader_message(&bootloaders));
+    }
+    let silent = silent_now(state, &io.sys_root, io.observe.clone()).await;
+    let Some(board) = silent.into_iter().find(|b| b.usb_serial() == serial) else {
+        let message = if no_controller_answers(state) {
+            format!(
+                "no OpenFAN board with USB serial {serial} is on USB without answering — the \
+                 daemon calls a board silent only once a probe has opened it and had no answer"
+            )
+        } else {
+            MaintenanceRefusal::BoardAnswers.message()
+        };
+        return refused(MaintenanceRefusal::BoardAnswers.reason(), message);
+    };
+
+    // [SAFETY] The claim, under the lock the diagnostic pause uses. It needs
+    // no link — the board's silence is the point — and suspends OpenFan writes
+    // at once: nothing reaches a board that does not answer. Made under the
+    // adoption lock too: an adoption either installed its controller first,
+    // and is seen here, or finds the claim and installs nothing — never a
+    // controller beside the run with no lender to park its poll loop.
+    let run_id = next_run_id();
+    let prior = {
+        let _adoptions = state.adopted_poll_tasks.lock();
+        if !no_controller_answers(state) {
+            let r = MaintenanceRefusal::BoardAnswers;
+            return refused(r.reason(), r.message());
+        }
+        match state
+            .cache
+            .try_begin_silent_openfan_maintenance(&run_id, stage::PREPARING)
+        {
+            Ok(prior) => prior,
+            Err(r) => return refused(r.reason(), r.message()),
+        }
+    };
+    let claim = ClaimGuard::with_prior(state.cache.clone(), run_id.clone(), prior);
+    // A poll loop runs only for an adopted controller; its lender then parks it.
+    let lender = state
+        .openfan()
+        .and_then(|_| state.openfan_maintenance.lender());
+    // With no poll loop, nothing else would look for the board once the run
+    // ends: the boot search and the post-boot loop have long given up.
+    let after = lender.is_none().then(|| {
+        (
+            run_id.clone(),
+            io.limits.sysfs_poll,
+            io.recovery_watch.clone(),
+        )
+    });
+    let adopt_state = state.clone();
+    let adopt_run = run_id.clone();
+    let configured = state.running_config.serial.port.clone();
+    let adopt: AdoptFn = Arc::new(move |transport, path: String| {
+        // On the blocking pool: the reconnect survey is seeded from the
+        // candidates present now, as every adoption seeds it.
+        let seed = crate::serial::real_transport::enumerate_serial_candidates();
+        let outcome = super::openfan::adopt_probed(
+            &adopt_state,
+            transport,
+            &path,
+            configured.clone(),
+            &seed,
+            Some(&adopt_run),
+        );
+        if outcome == super::AdoptOutcome::Adopted {
+            log::info!("OpenFanController adopted on {path} after its firmware update");
+        }
+        outcome == super::AdoptOutcome::Adopted
+    });
+    let target = Target::Silent(SilentTarget {
+        usb_port: board.usb_port().to_string(),
+        interface_number: board.interface_number,
+        lender,
+        probe_gate: state.openfan_rescanning.clone(),
+        adopt,
+    });
+    let answer = launch(
+        state,
+        run_id,
+        serial,
+        firmware,
+        job,
+        io,
+        Launch {
+            claim,
+            alive,
+            target,
+            board: crate::openfan_maintenance::board::SILENT,
+        },
+    )
+    .await;
+    if let Some((run_id, poll, watch)) = after.filter(|_| answer.0 == StatusCode::ACCEPTED) {
+        tokio::spawn(after_silent_run(state.clone(), run_id, poll, watch));
+    }
+    answer
+}
+
+/// Once a silent board's run with no poll loop has ended (DEC-484): when it
+/// left the board outside normal control and no controller was adopted,
+/// nothing else watches for the board, so the startup recovery watch runs now,
+/// as it would after a restart, and adopts the board once it answers. Read-only
+/// until then; ends at shutdown.
+async fn after_silent_run(
+    state: Arc<AppState>,
+    run_id: String,
+    poll: Duration,
+    watch: RecoveryWatch,
+) {
+    let mut shutdown = state.openfan_runtime.shutdown.clone();
+    while state.openfan_maintenance.is_alive() {
+        if *shutdown.borrow() {
+            return;
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep(poll) => {}
+        }
+    }
+    let left_outside = matches!(
+        state.cache.openfan_maintenance(),
+        Some(OpenFanMaintenance::NeedsRecovery { run_id: ref r, .. }) if *r == run_id
+    );
+    let Some(record) = state
+        .openfan_maintenance
+        .record()
+        .filter(|r| r.run_id == run_id)
+    else {
+        return;
+    };
+    if !left_outside || state.openfan().is_some() || *shutdown.borrow() {
+        return;
+    }
+    watch(state, record).await;
+}
+
+/// What a start hands [`launch`] once it holds the claim.
+struct Launch {
+    claim: ClaimGuard,
+    alive: AliveGuard,
+    target: Target,
+    /// A [`crate::openfan_maintenance::board`] token for the record.
+    board: &'static str,
+}
+
+/// After the claim, for either board: the checks that must follow it, the
+/// overrides, the record, and the run's task.
+async fn launch(
+    state: &Arc<AppState>,
+    run_id: String,
+    serial: String,
+    firmware: FirmwareClaim,
+    job: Option<firmware::Staged>,
+    io: MaintenanceIo,
+    parts: Launch,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Launch {
+        claim,
+        alive,
+        target,
+        board,
+    } = parts;
     // After the claim, never before: a session start checks the claim under
     // the recorder's slot lock, which `is_recording` takes too.
     if state.validation.is_recording() {
-        claim.release(None);
+        claim.release_unchanged();
         return refused(
             "validation_recording",
             "a validation session is recording — stop it first",
@@ -594,6 +922,7 @@ async fn start_update(
     }
     release_openfan_overrides(state, &run_id);
     let mut record = MaintenanceRecord::new(run_id.clone(), serial, firmware);
+    record.board = board.to_string();
     record.firmware_write = job
         .as_ref()
         .map(|j| FirmwareWrite::new(j.release.name, j.image.byte_count()));
@@ -606,8 +935,7 @@ async fn start_update(
     let env = RunEnv {
         cache: state.cache.clone(),
         slot: state.openfan_maintenance.clone(),
-        controller,
-        lender,
+        target,
         sys_root: io.sys_root,
         journal_path: io.journal_path,
         limits: io.limits,
@@ -630,16 +958,11 @@ async fn start_update(
     });
     if !registered {
         if let Some((_, claim, _)) = parts.take() {
-            claim.release(None);
+            claim.release_unchanged();
         }
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &ErrorEnvelope::hardware_unavailable(
-                "the daemon is shutting down — no firmware update was started",
-            ),
-        );
+        return shutting_down();
     }
-    log::info!("OpenFan firmware update {run_id} started{how}");
+    log::info!("OpenFan firmware update {run_id} started for the {board} board{how}");
     json_ok(
         StatusCode::ACCEPTED,
         OpenFanMaintenanceStartResponse {
@@ -699,6 +1022,66 @@ pub async fn openfan_maintenance_cancel_handler(
             StatusCode::NOT_FOUND,
             &ErrorEnvelope::not_found("no OpenFan firmware update is running"),
         ),
+    }
+}
+
+/// The silent-board watch (DEC-484): publishes `status.openfan_silent_board`
+/// for as long as the daemon runs, and keeps the probe evidence to nodes that
+/// are still what they were. Read-only — it opens nothing — and it reads sysfs
+/// only while a probe's evidence stands and no controller answers. Ends on the
+/// shutdown watch.
+pub async fn openfan_silent_watch(
+    state: Arc<AppState>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    silent_watch_with(
+        state,
+        PathBuf::from(usb::SYSFS_ROOT),
+        Arc::new(crate::serial::adoption::node_id),
+        crate::constants::OPENFAN_SILENT_WATCH_POLL,
+        shutdown,
+    )
+    .await;
+}
+
+/// The watch, with sysfs, the node reader and the clock injected.
+async fn silent_watch_with(
+    state: Arc<AppState>,
+    sys: PathBuf,
+    observe: Observe,
+    poll: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        let evidence = state.cache.openfan_unanswered();
+        if !evidence.is_empty() {
+            let o = observe.clone();
+            let gone = tokio::task::spawn_blocking(move || {
+                evidence
+                    .into_iter()
+                    .filter(|(p, n)| o(p) != Some(*n))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            if !gone.is_empty() {
+                state.cache.retain_openfan_unanswered(|p, n| {
+                    !gone.iter().any(|(gp, gn)| gp == p && *gn == n)
+                });
+            }
+        }
+        let found = silent_now(&state, &sys, observe.clone()).await;
+        state
+            .cache
+            .set_openfan_silent_board(found.first().map(SilentBoard::entry));
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep(poll) => {}
+        }
     }
 }
 
@@ -774,7 +1157,51 @@ pub async fn openfan_recovery_watch(
     record: MaintenanceRecord,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    let rescan = state.clone();
+    recovery_watch_with(
+        state,
+        record,
+        PathBuf::from(usb::SYSFS_ROOT),
+        RECOVERY_WATCH_POLL,
+        shutdown,
+        move || {
+            let state = rescan.clone();
+            async move {
+                let _ = super::openfan_rescan_handler(State(state)).await;
+            }
+        },
+    )
+    .await;
+}
+
+/// [`openfan_recovery_watch`], with sysfs, the clock and the adoption injected.
+///
+/// One watch per board (DEC-484): each run that leaves a silent board outside
+/// normal control with no poll loop starts one, and the board needs only one —
+/// a second would poll sysfs beside it and rescan beside it on the board's
+/// return, and nothing would ever end it before an adoption.
+async fn recovery_watch_with<A, F>(
+    state: Arc<AppState>,
+    record: MaintenanceRecord,
+    sys: PathBuf,
+    poll: Duration,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    attempt: A,
+) where
+    A: FnMut() -> F,
+    F: std::future::Future<Output = ()>,
+{
     let (Some(port), Some(interface)) = (record.usb_port.clone(), record.interface_number) else {
+        return;
+    };
+    let Some(_hold) = state
+        .openfan_maintenance
+        .hold_recovery_watch(&port, &record.expected_usb_serial)
+    else {
+        log::info!(
+            "OpenFan firmware update {}: USB port {port} is already watched for the board",
+            record.run_id
+        );
         return;
     };
     log::info!(
@@ -783,19 +1210,14 @@ pub async fn openfan_recovery_watch(
     );
     let adopted = state.clone();
     watch_for_return(
-        PathBuf::from(usb::SYSFS_ROOT),
+        sys,
         port,
         record.expected_usb_serial,
         interface,
-        RECOVERY_WATCH_POLL,
+        poll,
         shutdown,
         move || adopted.openfan().is_some(),
-        move || {
-            let state = state.clone();
-            async move {
-                let _ = super::openfan_rescan_handler(State(state)).await;
-            }
-        },
+        attempt,
     )
     .await;
 }
@@ -861,7 +1283,28 @@ mod tests {
                 info: None,
             },
             write: WriteMethod::Manual,
+            board: BoardKind::Connected,
         }
+    }
+
+    /// DEC-484: a client before the silent update sends no `board` and means
+    /// the connected one; a board the daemon does not know is no request.
+    #[test]
+    fn a_start_names_its_board_or_means_the_connected_one() {
+        let body = |board: Option<&str>| {
+            let mut v = serde_json::json!({
+                "expected_usb_serial": SERIAL,
+                "firmware": {"sha256": "ab".repeat(32), "size": 512},
+            });
+            if let Some(b) = board {
+                v["board"] = b.into();
+            }
+            serde_json::from_value::<MaintenanceStartRequest>(v).map(|r| r.board)
+        };
+        assert_eq!(body(None).unwrap(), BoardKind::Connected);
+        assert_eq!(body(Some("connected")).unwrap(), BoardKind::Connected);
+        assert_eq!(body(Some("silent")).unwrap(), BoardKind::Silent);
+        assert!(body(Some("sideways")).is_err());
     }
 
     #[test]
@@ -925,6 +1368,7 @@ mod tests {
     use crate::openfan_maintenance::{outcome, STATE_FINISHED};
     use crate::serial::usb_identity::fixture::Sysfs;
     use std::collections::VecDeque;
+    use std::sync::atomic::Ordering;
 
     const SERIAL: &str = "DE615CB14721492C";
     const TTY: &str = "/dev/ttyACM91";
@@ -992,15 +1436,52 @@ mod tests {
                     borrow_wait: Duration::from_millis(200),
                     sysfs_poll: Duration::from_millis(10),
                     check_retry: Duration::from_millis(20),
+                    probe_wait: Duration::from_millis(500),
+                    boot_button_wait: Duration::from_secs(10),
                     ..StageLimits::production()
                 },
+                observe: bench_nodes(),
+                recovery_watch: Arc::new(|_, _| Box::pin(async {})),
             }
         }
 
+        /// `io()` whose recovery watch records each run it is handed.
+        fn io_watched(&self, watched: Arc<parking_lot::Mutex<Vec<String>>>) -> MaintenanceIo {
+            MaintenanceIo {
+                recovery_watch: Arc::new(move |_, record: MaintenanceRecord| {
+                    watched.lock().push(record.run_id);
+                    Box::pin(async {})
+                }),
+                ..self.io()
+            }
+        }
+
+        /// `GET /fans/openfan/device` against the fixture.
+        async fn describe(&self) -> (StatusCode, Json<serde_json::Value>) {
+            describe_device(&self.state, self.sys.root(), self.dev.path(), bench_nodes()).await
+        }
+
         async fn start(&self, body: MaintenanceStartRequest) -> (StatusCode, serde_json::Value) {
-            let (st, Json(v)) = start_update(&self.state, body, self.io()).await;
+            self.start_io(body, self.io()).await
+        }
+
+        async fn start_io(
+            &self,
+            body: MaintenanceStartRequest,
+            io: MaintenanceIo,
+        ) -> (StatusCode, serde_json::Value) {
+            let (st, Json(v)) = start_update(&self.state, body, io).await;
             (st, v)
         }
+    }
+
+    /// The nodes the fixture board's serial devices are, as `stat` would say.
+    fn bench_nodes() -> Observe {
+        Arc::new(|path: &str| match path {
+            "/dev/ttyACM91" => Some(NodeId { dev: 5, ino: 91 }),
+            "/dev/ttyACM92" => Some(NodeId { dev: 5, ino: 92 }),
+            _ => None,
+        })
     }
 
     /// An adopted, connected controller with its poll loop's lender in place.
@@ -1037,6 +1518,70 @@ mod tests {
         }
     }
 
+    /// An OpenFAN board on USB that a probe opened and had no answer from: no
+    /// controller was adopted. The serial device does not open on the bench.
+    fn silent_fixture() -> Fixture {
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let state = test_state(stop_rx);
+        let sys = Sysfs::new();
+        sys.add_openfan("8-8", SERIAL, 0x80, "ttyACM91", "ttyACM92");
+        state.cache.record_openfan_unanswered(TTY, NODE_91);
+        let (_lender, loans) = crate::serial::port_loan::loan_channel();
+        let dev = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dev.path().join("001")).unwrap();
+        std::fs::write(dev.path().join("001/001"), b"").unwrap();
+        Fixture {
+            state,
+            sys,
+            dev,
+            journal: tempfile::tempdir().unwrap(),
+            frames: Arc::default(),
+            _loans: loans,
+            _stop: stop,
+        }
+    }
+
+    const NODE_91: NodeId = NodeId { dev: 5, ino: 91 };
+
+    /// Install a controller that answers, as an adoption does.
+    fn adopt_answering(f: &Fixture) {
+        let ctrl = crate::serial::controller::FanController::new(
+            Box::new(Answering {
+                frames: f.frames.clone(),
+                replies: VecDeque::new(),
+            }),
+            f.state.cache.clone(),
+            Duration::from_millis(50),
+        );
+        *f.state.fan_controller.write() = Some(Arc::new(parking_lot::Mutex::new(ctrl)));
+    }
+
+    fn silent() -> MaintenanceStartRequest {
+        MaintenanceStartRequest {
+            board: BoardKind::Silent,
+            ..good()
+        }
+    }
+
+    async fn run_ends(f: &Fixture) -> MaintenanceRecord {
+        let slot = f.state.openfan_maintenance.clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while slot.is_alive() {
+            assert!(Instant::now() < deadline, "the run must end");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        slot.record().expect("a run was started")
+    }
+
+    async fn run_reaches(f: &Fixture, stage: &str) {
+        let slot = f.state.openfan_maintenance.clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while slot.record().is_none_or(|r| r.stage != stage) {
+            assert!(Instant::now() < deadline, "the run never reached {stage}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     fn test_state(shutdown: tokio::sync::watch::Receiver<bool>) -> Arc<AppState> {
         let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
         Arc::new(AppState {
@@ -1064,7 +1609,7 @@ mod tests {
             control_paths: Arc::new(parking_lot::RwLock::new(Default::default())),
             pwm_baselines: Default::default(),
             pwm_verification: Default::default(),
-            openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+            openfan_rescanning: Default::default(),
             last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
             adopted_poll_tasks: Arc::new(parking_lot::Mutex::new(Default::default())),
             openfan_maintenance: Default::default(),
@@ -1238,7 +1783,7 @@ mod tests {
     #[tokio::test]
     async fn the_device_answer_reports_identity_reports_and_whether_an_update_could_start() {
         let f = fixture();
-        let (st, Json(v)) = describe_device(&f.state, f.sys.root(), f.dev.path()).await;
+        let (st, Json(v)) = f.describe().await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["present"], true);
         assert_eq!(v["link"], "connected");
@@ -1253,11 +1798,11 @@ mod tests {
 
         // A second look within the reuse window asks the board nothing.
         let asked = f.frames.lock().len();
-        let _ = describe_device(&f.state, f.sys.root(), f.dev.path()).await;
+        let _ = f.describe().await;
         assert_eq!(f.frames.lock().len(), asked);
 
         let _calibration = f.state.openfan_calibration.claim().unwrap();
-        let (_, Json(v)) = describe_device(&f.state, f.sys.root(), f.dev.path()).await;
+        let (_, Json(v)) = f.describe().await;
         assert_eq!(v["update_available"], false);
         assert_eq!(v["update_refusals"][0]["reason"], "calibration_active");
     }
@@ -1269,7 +1814,7 @@ mod tests {
             .cache
             .try_begin_openfan_maintenance("r1", stage::PREPARING)
             .unwrap();
-        let (_, Json(v)) = describe_device(&f.state, f.sys.root(), f.dev.path()).await;
+        let (_, Json(v)) = f.describe().await;
         assert_eq!(v["link"], "maintenance");
         assert!(v.get("hw_info").is_none() && v.get("fw_info").is_none());
         assert!(f.frames.lock().is_empty());
@@ -1288,7 +1833,7 @@ mod tests {
         f.state
             .cache
             .end_openfan_maintenance("r1", Some(outcome::NEEDS_RECOVERY));
-        let (_, Json(v)) = describe_device(&f.state, f.sys.root(), f.dev.path()).await;
+        let (_, Json(v)) = f.describe().await;
         assert_eq!(v["link"], "connected", "the stale link this guards");
         assert_eq!(v["update_available"], false, "{v}");
         assert_eq!(v["update_refusals"][0]["reason"], "openfan_link_not_ready");
@@ -1299,6 +1844,299 @@ mod tests {
         let (st, body) = f.start(good()).await;
         assert_eq!(st, StatusCode::CONFLICT, "{body}");
         assert_eq!(reason(&body), "openfan_link_not_ready");
+    }
+
+    // ── A silent board (DEC-484) ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_silent_board_is_offered_on_a_probes_evidence_while_nothing_answers() {
+        let f = silent_fixture();
+        let (st, Json(v)) = f.describe().await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["present"], false);
+        assert_eq!(v["update_refusals"][0]["reason"], "openfan_not_connected");
+        let b = &v["silent_board"];
+        assert_eq!(b["usb"]["serial"], SERIAL, "{v}");
+        assert_eq!(b["usb"]["port"], "8-8");
+        assert_eq!(
+            (b["interface_number"].as_u64(), b["tty"].as_str()),
+            (Some(0), Some(TTY))
+        );
+        assert_eq!(b["update_available"], true);
+        assert_eq!(b["update_refusals"], serde_json::json!([]));
+
+        // What refuses any update refuses this one.
+        let calibration = f.state.openfan_calibration.claim().unwrap();
+        let (_, Json(v)) = f.describe().await;
+        assert_eq!(v["silent_board"]["update_available"], false);
+        assert_eq!(
+            v["silent_board"]["update_refusals"][0]["reason"],
+            "calibration_active"
+        );
+        drop(calibration);
+
+        // A controller that answers: no board is silent.
+        adopt_answering(&f);
+        f.state.cache.set_openfan_link(OpenFanLink::Connected);
+        let (_, Json(v)) = f.describe().await;
+        assert_eq!(v["present"], true, "precondition");
+        assert!(v.get("silent_board").is_none(), "{v}");
+        // One its poll loop has given up on, and is searching for: it is.
+        f.state.cache.set_openfan_link(OpenFanLink::Reconnecting);
+        let (_, Json(v)) = f.describe().await;
+        assert_eq!(v["silent_board"]["usb"]["serial"], SERIAL, "{v}");
+
+        // Evidence about a node that is no longer there proves nothing.
+        f.state.cache.retain_openfan_unanswered(|_, _| false);
+        f.state
+            .cache
+            .record_openfan_unanswered(TTY, NodeId { dev: 5, ino: 7 });
+        let (_, Json(v)) = f.describe().await;
+        assert!(v.get("silent_board").is_none(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn a_silent_start_needs_the_board_that_was_offered_and_claims_nothing_otherwise() {
+        let f = silent_fixture();
+
+        let (st, v) = f
+            .start(MaintenanceStartRequest {
+                expected_usb_serial: "AAAAAAAAAAAAAAAA".into(),
+                ..silent()
+            })
+            .await;
+        assert_eq!((st, reason(&v)), (StatusCode::CONFLICT, "board_not_silent"));
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("AAAAAAAAAAAAAAAA"),
+            "{v}"
+        );
+
+        f.sys.add_bootloader("9-1", "sdy");
+        let (st, v) = f.start(silent()).await;
+        assert_eq!(
+            (st, reason(&v)),
+            (StatusCode::CONFLICT, "bootloader_present")
+        );
+        f.sys.remove_device("9-1");
+
+        f.state
+            .cache
+            .record_engine_tick("emergency", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
+        let (st, v) = f.start(silent()).await;
+        assert_eq!(
+            (st, reason(&v)),
+            (StatusCode::CONFLICT, "thermal_emergency")
+        );
+        f.state
+            .cache
+            .record_engine_tick("normal", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
+
+        adopt_answering(&f);
+        f.state.cache.set_openfan_link(OpenFanLink::Connected);
+        let (st, v) = f.start(silent()).await;
+        assert_eq!((st, reason(&v)), (StatusCode::CONFLICT, "board_not_silent"));
+        assert_eq!(
+            v["error"]["message"],
+            MaintenanceRefusal::BoardAnswers.message()
+        );
+        // Gone again; the link it left is what a search would show.
+        *f.state.fan_controller.write() = None;
+        f.state.cache.set_openfan_link(OpenFanLink::Reconnecting);
+
+        f.state.cache.retain_openfan_unanswered(|_, _| false);
+        let (st, v) = f.start(silent()).await;
+        assert_eq!(
+            (st, reason(&v)),
+            (StatusCode::CONFLICT, "board_not_silent"),
+            "no probe has had no answer from it"
+        );
+
+        assert!(
+            f.state.cache.openfan_maintenance().is_none(),
+            "nothing was claimed"
+        );
+        assert!(!f.state.openfan_maintenance.is_alive());
+        assert!(f.state.openfan_maintenance.record().is_none());
+        assert!(!f.state.openfan_rescanning.load(Ordering::SeqCst));
+        assert!(f.frames.lock().is_empty());
+
+        // Presence: the evidence back, the same start is taken.
+        f.state.cache.record_openfan_unanswered(TTY, NODE_91);
+        let (st, v) = f.start(silent()).await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+        let (st, _) = openfan_maintenance_cancel_handler(State(f.state.clone())).await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        run_ends(&f).await;
+    }
+
+    /// No controller, no poll loop: the run holds the probes off, finds the
+    /// board's serial device will not open, and asks for the buttons; a cancel
+    /// there changes nothing.
+    #[tokio::test]
+    async fn a_silent_start_runs_with_no_controller_and_holds_probes_off_until_it_ends() {
+        let f = silent_fixture();
+        let (st, v) = f.start(silent()).await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+        assert_eq!(v["stage"], stage::PREPARING);
+        run_reaches(&f, stage::WAITING_FOR_BOOT_BUTTON).await;
+
+        let r = f.state.openfan_maintenance.record().unwrap();
+        assert_eq!(r.board, crate::openfan_maintenance::board::SILENT);
+        assert_eq!(r.bootloader_trigger.as_deref(), Some("boot_button"));
+        assert!(
+            r.notes.iter().any(|n| n.contains("could not be opened")),
+            "{:?}",
+            r.notes
+        );
+        // [SAFETY] Writes are off and no probe may open the board.
+        assert!(f.state.cache.openfan_writes_suspended());
+        assert!(f.state.openfan_rescanning.load(Ordering::SeqCst));
+        let (_, Json(dev)) = f.describe().await;
+        assert!(dev.get("silent_board").is_none(), "{dev}");
+        let (st, again) = f.start(silent()).await;
+        assert_eq!(
+            (st, reason(&again)),
+            (StatusCode::CONFLICT, "maintenance_active")
+        );
+
+        let (st, _) = openfan_maintenance_cancel_handler(State(f.state.clone())).await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        let r = run_ends(&f).await;
+        assert_eq!(r.outcome.as_deref(), Some(outcome::NO_FIRMWARE_CHANGE));
+        assert!(r.cancelled);
+        assert_eq!(
+            journal::load(&f.journal.path().join(JOURNAL_FILE)).map(|j| j.board),
+            Some("silent".to_string())
+        );
+        assert!(!f.state.openfan_rescanning.load(Ordering::SeqCst));
+        assert!(f.state.cache.openfan_maintenance().is_none());
+        assert!(!f.state.cache.openfan_writes_suspended());
+    }
+
+    /// No poll loop was running for the board, so once its run leaves it
+    /// outside normal control the recovery watch looks for it, as after a
+    /// restart. A run that changed nothing hands nothing over.
+    #[tokio::test]
+    async fn a_silent_run_that_leaves_the_board_outside_control_is_watched_for_after() {
+        let f = silent_fixture();
+        let watched: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+
+        let (st, v) = f.start_io(silent(), f.io_watched(watched.clone())).await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+        run_reaches(&f, stage::WAITING_FOR_BOOT_BUTTON).await;
+        let (st, _) = openfan_maintenance_cancel_handler(State(f.state.clone())).await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        let r = run_ends(&f).await;
+        assert_eq!(r.outcome.as_deref(), Some(outcome::NO_FIRMWARE_CHANGE));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            watched.lock().is_empty(),
+            "nothing was left outside control"
+        );
+
+        let mut io = f.io_watched(watched.clone());
+        io.limits.file_wait = Duration::from_millis(300);
+        let (st, v) = f.start_io(silent(), io).await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+        let run_id = v["run_id"].as_str().unwrap().to_string();
+        run_reaches(&f, stage::WAITING_FOR_BOOT_BUTTON).await;
+        // The user presses the buttons, and copies nothing.
+        f.sys.remove_device("8-8");
+        f.sys.add_bootloader("8-8", "sdx");
+        let r = run_ends(&f).await;
+        assert_eq!(r.outcome.as_deref(), Some(outcome::NEEDS_RECOVERY), "{r:?}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while watched.lock().is_empty() {
+            assert!(Instant::now() < deadline, "the watch never took over");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*watched.lock(), [run_id]);
+    }
+
+    /// The board the last run left needing recovery is the board a silent
+    /// update is for: it starts over the recovery, and puts it back when it
+    /// changed nothing.
+    #[tokio::test]
+    async fn a_silent_start_takes_a_recoverys_place_and_puts_it_back_when_nothing_changed() {
+        let f = silent_fixture();
+        f.state
+            .cache
+            .restore_openfan_recovery("r0", outcome::FIRMWARE_COPIED_BOARD_NOT_BACK);
+        let (_, Json(v)) = f.describe().await;
+        assert_eq!(v["silent_board"]["update_available"], true, "{v}");
+
+        let (st, v) = f.start(silent()).await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+        run_reaches(&f, stage::WAITING_FOR_BOOT_BUTTON).await;
+        let (st, _) = openfan_maintenance_cancel_handler(State(f.state.clone())).await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        run_ends(&f).await;
+        assert!(matches!(
+            f.state.cache.openfan_maintenance(),
+            Some(OpenFanMaintenance::NeedsRecovery { run_id, .. }) if run_id == "r0"
+        ));
+        assert!(f.state.cache.openfan_writes_suspended());
+    }
+
+    #[tokio::test]
+    async fn the_silent_watch_publishes_the_board_while_its_evidence_stands() {
+        let f = silent_fixture();
+        let ino = Arc::new(std::sync::atomic::AtomicU64::new(91));
+        let i = ino.clone();
+        let observe: Observe = Arc::new(move |p: &str| {
+            (p == TTY).then(|| NodeId {
+                dev: 5,
+                ino: i.load(Ordering::SeqCst),
+            })
+        });
+        let watch = tokio::spawn(silent_watch_with(
+            f.state.clone(),
+            f.sys.root().to_path_buf(),
+            observe,
+            Duration::from_millis(10),
+            f._stop.subscribe(),
+        ));
+        let cache = f.state.cache.clone();
+        let published = |want: bool| {
+            let cache = cache.clone();
+            async move {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while cache.openfan_silent_board().is_some() != want {
+                    assert!(Instant::now() < deadline, "never published={want}");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        };
+
+        published(true).await;
+        let entry = cache.openfan_silent_board().unwrap();
+        assert_eq!(
+            (entry.usb_serial.as_str(), entry.usb_port.as_str()),
+            (SERIAL, "8-8")
+        );
+
+        adopt_answering(&f);
+        f.state.cache.set_openfan_link(OpenFanLink::Connected);
+        published(false).await;
+        f.state.cache.set_openfan_link(OpenFanLink::Reconnecting);
+        published(true).await;
+
+        // The node goes: its evidence goes with it, for good.
+        ino.store(92, Ordering::SeqCst);
+        published(false).await;
+        assert!(f.state.cache.openfan_unanswered().is_empty());
+        ino.store(91, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(cache.openfan_silent_board().is_none());
+
+        f._stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), watch)
+            .await
+            .expect("the watch ends on the shutdown watch")
+            .unwrap();
     }
 
     fn interrupted_record(port: &str) -> MaintenanceRecord {
@@ -1447,6 +2285,68 @@ mod tests {
             .unwrap();
     }
 
+    /// DEC-484: one watch per board, however many runs left it outside normal
+    /// control. A second for the same board ends at once while the first
+    /// watches; another board gets its own; and a board whose watch ended can
+    /// be watched for again.
+    #[tokio::test]
+    async fn a_board_already_watched_for_gets_no_second_watch() {
+        let (_stop, rx) = tokio::sync::watch::channel(false);
+        let state = test_state(rx);
+        let sys = Sysfs::new();
+        let watch = |port: &str, stop: tokio::sync::watch::Receiver<bool>| {
+            recovery_watch_with(
+                state.clone(),
+                interrupted_record(port),
+                sys.root().to_path_buf(),
+                Duration::from_millis(5),
+                stop,
+                || async {},
+            )
+        };
+        let watched = |port: &'static str| {
+            let slot = state.openfan_maintenance.clone();
+            async move {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !slot.recovery_watched(port, SERIAL) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for the watch on {port}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+        };
+        async fn ends<F: std::future::Future>(
+            task: F,
+        ) -> Result<F::Output, tokio::time::error::Elapsed> {
+            tokio::time::timeout(Duration::from_secs(5), task).await
+        }
+
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let first = tokio::spawn(watch("8-8", rx.clone()));
+        watched("8-8").await;
+        ends(watch("8-8", rx.clone()))
+            .await
+            .expect("a second watch for the same board ends at once");
+        assert!(!first.is_finished(), "the first still watches");
+        let other = tokio::spawn(watch("8-9", rx.clone()));
+        watched("8-9").await;
+
+        stop.send(true).unwrap();
+        ends(first).await.expect("ends at shutdown").unwrap();
+        ends(other).await.expect("ends at shutdown").unwrap();
+        assert!(
+            !state.openfan_maintenance.recovery_watched("8-8", SERIAL),
+            "an ended watch lets its board go"
+        );
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let again = tokio::spawn(watch("8-8", rx));
+        watched("8-8").await;
+        stop.send(true).unwrap();
+        ends(again).await.expect("ends at shutdown").unwrap();
+    }
+
     // ── The daemon writes the firmware itself (DEC-483) ──────────────
 
     async fn upload(f: &Fixture, data: Vec<u8>) -> (StatusCode, serde_json::Value) {
@@ -1586,10 +2486,10 @@ mod tests {
     #[tokio::test]
     async fn the_device_answer_says_whether_the_daemon_can_write() {
         let f = fixture();
-        let (_, Json(v)) = describe_device(&f.state, f.sys.root(), f.dev.path()).await;
+        let (_, Json(v)) = f.describe().await;
         assert_eq!(v["daemon_write"], serde_json::json!({ "available": true }));
         std::fs::remove_file(f.dev.path().join("001/001")).unwrap();
-        let (_, Json(v)) = describe_device(&f.state, f.sys.root(), f.dev.path()).await;
+        let (_, Json(v)) = f.describe().await;
         assert_eq!(v["daemon_write"]["available"], false);
         assert_eq!(v["daemon_write"]["reason"], "no_usb_access");
         assert!(v["daemon_write"]["message"]

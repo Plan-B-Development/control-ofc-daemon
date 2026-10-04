@@ -528,6 +528,27 @@ pub struct DaemonState {
     /// it left behind (DEC-481). Under this lock so that starting an update and
     /// claiming the diagnostic pause are one decision.
     pub openfan_maintenance: Option<OpenFanMaintenance>,
+    /// Serial devices an adoption probe opened that did not answer the identity
+    /// handshake, each with the node it was then (DEC-484). The evidence that
+    /// an OpenFAN board on USB runs firmware that does not answer Control-OFC —
+    /// never its USB ids alone. Written only by
+    /// [`crate::health::cache::StateCache::record_openfan_unanswered`]; an entry
+    /// whose node changed is dropped by the silent-board watch.
+    pub openfan_unanswered: Vec<(String, crate::serial::adoption::NodeId)>,
+    /// The OpenFAN board on USB that does not answer while no controller does
+    /// (DEC-484), as the silent-board watch last found it. Published on
+    /// `/status` and `/poll`.
+    pub openfan_silent_board: Option<SilentBoardEntry>,
+}
+
+/// An OpenFAN board on USB whose firmware does not answer Control-OFC
+/// (DEC-484): `status.openfan_silent_board`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SilentBoardEntry {
+    /// The board's USB serial — its flash chip's unique id.
+    pub usb_serial: String,
+    /// Its physical USB port (`8-8`).
+    pub usb_port: String,
 }
 
 /// What the OpenFan poll loop last observed of its serial link (DEC-481).
@@ -606,6 +627,9 @@ pub enum MaintenanceRefusal {
     DiagnosticActive,
     /// The thermal or coolant emergency is forcing the fans.
     ThermalEmergency,
+    /// An update for a silent board (DEC-484), but the controller answers: it
+    /// is updated as a connected board.
+    BoardAnswers,
 }
 
 impl MaintenanceRefusal {
@@ -616,6 +640,7 @@ impl MaintenanceRefusal {
             Self::LinkNotReady(_) | Self::RecoveryPending => "openfan_link_not_ready",
             Self::DiagnosticActive => "diagnostic_active",
             Self::ThermalEmergency => "thermal_emergency",
+            Self::BoardAnswers => "board_not_silent",
         }
     }
 
@@ -638,6 +663,9 @@ impl MaintenanceRefusal {
             Self::ThermalEmergency => {
                 "a thermal emergency is forcing the fans — wait until it has cleared".into()
             }
+            Self::BoardAnswers => "the OpenFan controller answers — update it as a connected \
+                                   board"
+                .into(),
         }
     }
 }
@@ -746,6 +774,8 @@ impl Default for DaemonState {
             openfan_link: None,
             openfan_port: None,
             openfan_maintenance: None,
+            openfan_unanswered: Vec::new(),
+            openfan_silent_board: None,
         }
     }
 }

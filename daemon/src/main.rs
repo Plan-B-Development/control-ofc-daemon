@@ -2335,6 +2335,13 @@ async fn async_main(cli: CliOptions) {
                 }
                 RealSerialTransport::open(p, serial_timeout)
             },
+            // DEC-484: a board that opened but did not answer is the evidence
+            // that tells a silent OpenFAN board apart.
+            |p| {
+                if let Some(node) = control_ofc_daemon::serial::adoption::node_id(p) {
+                    cache.record_openfan_unanswered(p, node);
+                }
+            },
         ) {
             log::info!("OpenFanController connected on {port}");
             // DEC-481: the node a firmware update reads the board's USB identity
@@ -2638,7 +2645,7 @@ async fn async_main(cli: CliOptions) {
         control_paths: Arc::new(parking_lot::RwLock::new(Arc::new(control_paths_at_boot))),
         pwm_baselines: Arc::new(parking_lot::RwLock::new(Arc::new(pwm_baselines_at_boot))),
         pwm_verification: Arc::new(parking_lot::RwLock::new(Arc::new(pwm_verification_at_boot))),
-        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: Default::default(),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
         openfan_maintenance: Default::default(),
@@ -3036,6 +3043,15 @@ async fn async_main(cli: CliOptions) {
             poll_shutdown_tx.subscribe(),
         ));
     }
+
+    // DEC-484: an OpenFAN board on USB that does not answer is published on
+    // `/status`, so the GUI can offer its firmware update. Not drained, for the
+    // reasons above: it opens nothing, writes no hardware, and ends on the
+    // shutdown watch.
+    tokio::spawn(control_ofc_daemon::api::handlers::openfan_silent_watch(
+        app_state.clone(),
+        poll_shutdown_tx.subscribe(),
+    ));
 
     log::info!("Daemon ready — waiting for shutdown signal");
 
@@ -4137,6 +4153,7 @@ mod tests {
     fn each_candidate_is_opened_at_most_once_per_attempt() {
         let candidates = ports(&["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyACM1"]);
         let mut opened: Vec<String> = Vec::new();
+        let mut unanswered: Vec<String> = Vec::new();
         let chosen = control_ofc_daemon::serial::adoption::first_openfan_port(
             &candidates,
             None,
@@ -4145,9 +4162,14 @@ mod tests {
                 opened.push(p.to_string());
                 Ok(ScriptedPort::wrong_device())
             },
+            |p| unanswered.push(p.to_string()),
         );
 
         assert!(chosen.is_none(), "no candidate identifies in this fixture");
+        assert_eq!(
+            unanswered, opened,
+            "DEC-484: each one opened and did not answer, and each is reported"
+        );
         assert_eq!(
             opened,
             vec!["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyACM1"],
@@ -4224,6 +4246,7 @@ mod tests {
         // sitting next in the candidate list. Writes to an indifferent device
         // return Ok, so nothing surfaced: the thermal emergency's `force_all_with_floor`
         // reported success while driving nothing.
+        let mut unanswered: Vec<String> = Vec::new();
         let chosen = control_ofc_daemon::serial::adoption::first_openfan_port(
             &ports(&["/dev/ttyACM9", "/dev/ttyACM0"]),
             None,
@@ -4235,6 +4258,7 @@ mod tests {
                     ScriptedPort::ok()
                 })
             },
+            |p| unanswered.push(p.to_string()),
         );
 
         assert_eq!(
@@ -4242,6 +4266,11 @@ mod tests {
             Some("/dev/ttyACM0".to_string()),
             "a port that opens but does not answer ReadAllRpm must be skipped, \
              not adopted — and must not stop later candidates being tried"
+        );
+        assert_eq!(
+            unanswered,
+            ["/dev/ttyACM9"],
+            "DEC-484: only the one that opened and did not answer is reported"
         );
     }
 
@@ -4255,6 +4284,7 @@ mod tests {
             None,
             Duration::from_millis(50),
             |_| Ok(ScriptedPort::wrong_device()),
+            |_| {},
         );
         assert!(chosen.is_none());
     }
@@ -4263,6 +4293,7 @@ mod tests {
     fn an_unopenable_candidate_does_not_stop_the_search() {
         // Pre-existing behaviour, pinned: a port that cannot be opened at all is
         // skipped and the next candidate is still tried.
+        let mut unanswered: Vec<String> = Vec::new();
         let chosen = control_ofc_daemon::serial::adoption::first_openfan_port(
             &ports(&["/dev/ttyACM9", "/dev/ttyACM0"]),
             None,
@@ -4276,8 +4307,13 @@ mod tests {
                     Ok(ScriptedPort::ok())
                 }
             },
+            |p| unanswered.push(p.to_string()),
         );
         assert_eq!(chosen.map(|(p, _)| p), Some("/dev/ttyACM0".to_string()));
+        assert!(
+            unanswered.is_empty(),
+            "DEC-484: a port that did not open proves nothing about what is behind it"
+        );
     }
 
     // ── Boot-time profile resolution fail-safe (DEC-165) ─────────────────

@@ -82,7 +82,7 @@ fn validation_app_state(
         control_paths: Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         pwm_verification: Default::default(),
-        openfan_rescanning: AtomicBool::new(false),
+        openfan_rescanning: Default::default(),
         last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: Arc::new(parking_lot::Mutex::new(Default::default())),
         openfan_maintenance: Default::default(),

@@ -41,6 +41,14 @@ pub trait SerialTransport {
             message: "this transport cannot change its line speed".to_string(),
         })
     }
+
+    /// Whether this stands in for a port that is not open — what the poll
+    /// loop's slot holds while it searches for the controller, or while the
+    /// port is lent (DEC-484). An update of a board that does not answer opens
+    /// the board's node itself rather than use a placeholder.
+    fn is_placeholder(&self) -> bool {
+        false
+    }
 }
 
 /// What the shared transport slot holds while the poll loop is looking for a
@@ -70,6 +78,10 @@ impl SerialTransport for DisconnectedTransport {
             message: Self::MESSAGE.to_string(),
         })
     }
+
+    fn is_placeholder(&self) -> bool {
+        true
+    }
 }
 
 /// What the shared transport slot holds while the poll loop has lent the port
@@ -96,6 +108,10 @@ impl SerialTransport for MaintenanceTransport {
         Err(SerialError::Protocol {
             message: Self::MESSAGE.to_string(),
         })
+    }
+
+    fn is_placeholder(&self) -> bool {
+        true
     }
 }
 

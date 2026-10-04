@@ -115,6 +115,18 @@ pub const OPENFAN_MAINT_OVERRUN_GRACE: Duration = Duration::from_secs(10);
 /// How often sysfs is re-read while the update watches the board.
 pub const OPENFAN_MAINT_SYSFS_POLL: Duration = Duration::from_millis(200);
 
+/// A silent board that did not leave for its bootloader on the 1200-baud
+/// signal (DEC-484): how long the user has to hold BOOT and press RESET.
+pub const OPENFAN_MAINT_BOOT_BUTTON_WAIT: Duration = Duration::from_secs(10 * 60);
+
+/// A silent board's update waits at most this long for an adoption probe
+/// already running to finish before it signals the board (DEC-484).
+pub const OPENFAN_MAINT_PROBE_WAIT: Duration = Duration::from_secs(30);
+
+/// How often the silent-board watch looks again (DEC-484). It reads sysfs
+/// only while a probe's evidence stands and no controller answers.
+pub const OPENFAN_SILENT_WATCH_POLL: Duration = Duration::from_secs(2);
+
 const _: () =
     assert!(OPENFAN_MAINT_BOOTLOADER_WAIT.as_secs() >= OPENFAN_MAINT_TRIGGER_WAIT.as_secs());
 

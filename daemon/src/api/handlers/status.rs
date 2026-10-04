@@ -505,6 +505,8 @@ pub async fn capabilities_handler(
             cpu_fan_role_floor: true,
             openfan_firmware_maintenance: true,
             openfan_firmware_write: true,
+            // DEC-484: an update of a board that does not answer.
+            openfan_firmware_silent_update: true,
         },
     })
 }

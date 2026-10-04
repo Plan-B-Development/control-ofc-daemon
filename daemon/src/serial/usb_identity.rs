@@ -26,6 +26,15 @@ pub const RP2040_VENDOR_ID: &str = "2e8a";
 /// The RP2040 boot ROM's USB product id (the `RPI-RP2` drive).
 pub const RP2040_BOOTLOADER_PRODUCT_ID: &str = "0003";
 
+/// The Pico SDK's generic CDC product id, which the OpenFAN firmware uses.
+pub const OPENFAN_PRODUCT_ID: &str = "000a";
+
+/// The manufacturer and product strings every OpenFAN firmware build carries —
+/// the 2023 FW_01 binary and the 2026 releases alike (DEC-484). A generic
+/// Pico board running the SDK reports `Raspberry Pi` / `Pico`.
+pub const OPENFAN_MANUFACTURER: &str = "Karanovic Research";
+pub const OPENFAN_PRODUCT: &str = "OpenFan";
+
 /// The largest `descriptors` file read; a real one is a few hundred bytes.
 const MAX_DESCRIPTORS_BYTES: u64 = 64 * 1024;
 
@@ -50,6 +59,20 @@ impl UsbDevice {
     /// Whether this is an RP2040 in its USB bootloader.
     pub fn is_rp2040_bootloader(&self) -> bool {
         self.vendor_id == RP2040_VENDOR_ID && self.product_id == RP2040_BOOTLOADER_PRODUCT_ID
+    }
+
+    /// Whether this is an OpenFAN board running its firmware, by every string
+    /// the firmware sets (DEC-484): the ids, the manufacturer, the product, and
+    /// a serial — the flash chip's unique id, which tells two boards apart. Ids
+    /// alone would take in any RP2040 project using the SDK's USB serial.
+    pub fn is_openfan_board(&self) -> bool {
+        self.vendor_id == RP2040_VENDOR_ID
+            && self.product_id == OPENFAN_PRODUCT_ID
+            && self.manufacturer.as_deref() == Some(OPENFAN_MANUFACTURER)
+            && self.product.as_deref() == Some(OPENFAN_PRODUCT)
+            && self.serial.as_deref().is_some_and(|s| {
+                !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric())
+            })
     }
 }
 
@@ -132,6 +155,36 @@ pub fn tty_for(sys: &Path, port: &str, interface_number: u8) -> Option<String> {
             .map(|t| format!("/dev/{t}"));
     }
     None
+}
+
+/// Every serial interface of the device at `port`: its interface number and
+/// its device path, by interface number.
+pub fn ttys_of(sys: &Path, port: &str) -> Vec<(u8, String)> {
+    let Some(dir) = device_dir(sys, port) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let prefix = format!("{port}:");
+    let mut ttys: Vec<(u8, String)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if !name.starts_with(&prefix) {
+                return None;
+            }
+            let ifnum = read_interface_number(&entry.path())?;
+            let tty = fs::read_dir(entry.path().join("tty"))
+                .ok()?
+                .flatten()
+                .filter_map(|t| t.file_name().into_string().ok())
+                .find(|t| t.starts_with("tty"))?;
+            Some((ifnum, format!("/dev/{tty}")))
+        })
+        .collect();
+    ttys.sort();
+    ttys
 }
 
 /// The whole-disk block devices (`sdb`) that belong to the device at `port` —
@@ -470,6 +523,72 @@ mod tests {
             Some("DE615CB14721492C"),
             "vendor and product ids alone prove nothing"
         );
+    }
+
+    #[test]
+    fn an_openfan_board_is_known_by_every_string_its_firmware_sets() {
+        let sys = desk();
+        // Another Pico SDK project on the same ids, and the board itself.
+        sys.add_device(
+            "3-2",
+            "2e8a",
+            "000a",
+            "Raspberry Pi",
+            "Pico",
+            "E6614103E7452D2F",
+            &descriptors(2),
+        );
+        let board = device_at(sys.root(), "8-8").unwrap();
+        let pico = device_at(sys.root(), "3-2").unwrap();
+        assert!(board.is_openfan_board());
+        assert_eq!(
+            (pico.vendor_id.as_str(), pico.product_id.as_str()),
+            (board.vendor_id.as_str(), board.product_id.as_str()),
+            "the ids alone cannot tell them apart"
+        );
+        assert!(!pico.is_openfan_board());
+        let steam = device_at(sys.root(), "1-3").unwrap();
+        assert!(!steam.is_openfan_board());
+        for broken in [
+            UsbDevice {
+                serial: None,
+                ..board.clone()
+            },
+            UsbDevice {
+                serial: Some("DE61/5C".into()),
+                ..board.clone()
+            },
+            UsbDevice {
+                manufacturer: None,
+                ..board.clone()
+            },
+        ] {
+            assert!(!broken.is_openfan_board(), "{broken:?}");
+        }
+        sys.remove_device("8-8");
+        sys.add_bootloader("8-8", "sdb");
+        assert!(
+            !device_at(sys.root(), "8-8").unwrap().is_openfan_board(),
+            "a board in its bootloader is not running its firmware"
+        );
+    }
+
+    #[test]
+    fn every_serial_interface_of_a_board_is_listed_by_number() {
+        let sys = desk();
+        assert_eq!(
+            ttys_of(sys.root(), "8-8"),
+            [
+                (0, "/dev/ttyACM1".to_string()),
+                (2, "/dev/ttyACM2".to_string())
+            ]
+        );
+        assert_eq!(
+            ttys_of(sys.root(), "1-3"),
+            [(0, "/dev/ttyACM0".to_string())]
+        );
+        assert!(ttys_of(sys.root(), "9-9").is_empty(), "no such device");
+        assert!(ttys_of(sys.root(), "../8-8").is_empty());
     }
 
     #[test]
