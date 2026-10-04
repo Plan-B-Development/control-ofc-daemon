@@ -318,6 +318,10 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
     // failure paths and are skipped from the wire when empty so older
     // clients ignore them.
     let expected_chips = diagnostics::expected_chips_for_board(&board.vendor, &board.name);
+    // `BRD-j`: the subset of `expected_chips` that carries no fan header, from
+    // the same table row — so a client can word a missing one as lost
+    // temperatures and voltages rather than lost fan headers.
+    let expected_fanless_chips = diagnostics::fanless_chips_for_board(&board.vendor, &board.name);
     let kernel_detected_chips = diagnostics::read_kernel_detected_chips();
 
     // `X87-d`: the board's own firmware-declared counts, where `it87` exports
@@ -383,6 +387,7 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
                 .as_deref()
                 .and_then(crate::hwmon::chip_db::cap_env_fact),
             expected_chips,
+            expected_fanless_chips,
             board_firmware_counts,
             kernel_detected_chips,
             module_collisions,

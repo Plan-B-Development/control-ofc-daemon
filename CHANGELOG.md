@@ -8,6 +8,10 @@
   same object as `devices.amd_gpu` but about its own card, so a client no longer judges a second card's
   fan by the primary card's `fan_control_method` / `fan_write_supported`. Always emitted (`[]` with no
   AMD GPU); `devices.amd_gpu` is unchanged and keeps the kernel advisories (`GPU-b`).
+- **`GET /diagnostics/hardware` names the expected chips that carry no fan header:
+  `expected_fanless_chips`.** A subset of `expected_chips`, from the same board-table row, omitted when
+  empty. Each row now declares it; today only the B450 AORUS PRO's IT8792E is listed (it87 #21), so a
+  client can say a missing one costs temperatures and voltages rather than fan headers (`BRD-j`).
 
 ### Changed
 

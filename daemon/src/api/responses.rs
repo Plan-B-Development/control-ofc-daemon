@@ -1723,6 +1723,20 @@ pub struct HardwareDiagnosticsResponse {
     /// the wire and the GUI's `_filter_fields` parser tolerates it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_chips: Vec<String>,
+    /// The chips in `expected_chips` that carry **no fan header** on this
+    /// board (`BRD-j`, daemon >= 3.7.0), from the same curated row. A missing
+    /// one costs temperatures and voltages, not fan headers, and a client
+    /// words its alert so. Empty — and omitted from the wire — when the board
+    /// is unknown, when every expected chip carries fans, and when the table
+    /// does not know: so absence never means "fanless", and an older daemon
+    /// reads as "carries fans", the alert's existing wording.
+    ///
+    /// Where `board_firmware_counts` declares more fan headers than
+    /// `hwmon.total_headers`, that measured deficit outranks this curated claim
+    /// (a matching count cannot clear it: `total_headers` includes AIO and USB
+    /// fan controllers).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_fanless_chips: Vec<String>,
     /// What the board's **firmware** declares it has, read from the Gigabyte SIV
     /// descriptor `it87` exports (`X87-d`, daemon >= 2.36.0).
     ///
@@ -3323,6 +3337,7 @@ mod tests {
             board,
             kernel_release: Some("6.18.2-1-cachyos".into()),
             expected_chips: vec!["it8696".into()],
+            expected_fanless_chips: vec!["it8696".into()],
             board_firmware_counts: Some(crate::hwmon::gigabyte_siv::GigabyteSiv {
                 platform: 1,
                 special: 0,
@@ -3547,6 +3562,7 @@ mod tests {
                 },
                 kernel_release: Some("6.18.2-1-cachyos".into()),
                 expected_chips: Vec::new(),
+                expected_fanless_chips: Vec::new(),
                 board_firmware_counts: None,
                 kernel_detected_chips: Vec::new(),
                 module_collisions: Vec::new(),
