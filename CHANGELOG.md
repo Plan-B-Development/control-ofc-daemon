@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [4.0.0] — 2026-10-04
+
+Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor. GUI 4.0.0 adds **Update OpenFAN
+Firmware…** on the Hardware page, which drives the endpoints below; an older GUI does not offer it. The major
+version marks the OpenFAN firmware update; nothing is removed or renamed — no endpoint, field, capability or
+configuration key — and each addition is advertised by its own capability flag.
+
 ### Added
 
 - **OpenFAN firmware update: `GET /fans/openfan/device` and `POST`/`GET`/`DELETE
