@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [3.7.0] — 2026-10-04
+
+Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor. GUI 3.6.1 judges a second AMD
+GPU's fan by its own card where this daemon advertises `devices.amd_gpus`, and says a missing chip with no fan
+header costs only temperatures and voltages where it reports `expected_fanless_chips`; an older GUI does neither.
+
 ### Added
 
 - **`/capabilities` describes every AMD GPU: `devices.amd_gpus`.** One entry per detected AMD GPU, the
