@@ -373,7 +373,9 @@ to write, the PICOBOOT interface of the bootloader on the board's USB port. Wire
   normal mode from the most either writer could ask for. hwmon and GPU writes are untouched; the
   thermal ladder still forces them. After a run whose board needs recovery
   (`needs_recovery`, `firmware_copied_board_not_back`) writes stay suspended until the poll loop
-  reports `connected`.
+  reports `connected`. While they are suspended `/fans` and `/poll` give the channels no
+  `stall_detected`: no tach is read after the parking duty, so a channel with no fan would read as
+  stalled.
 - **Port lending.** The poll loop is the only code that replaces the port. The run borrows it
   (`port_loan::borrow`, answered between polls within `OPENFAN_MAINT_BORROW_WAIT`; a borrower whose
   wait runs out closes the channel and takes an answer already sent, so a loan that lands at the

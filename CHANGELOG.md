@@ -36,7 +36,8 @@
 ### Changed
 
 - **While a firmware update holds the OpenFAN controller**, the engine, the thermal force and every
-  give-back skip OpenFAN writes rather than fail them. The diagnostics, the OpenFan calibration, a
+  give-back skip OpenFAN writes rather than fail them, and `/fans` and `/poll` give the OpenFAN channels
+  no `stall_detected`: no tach is read after the 100 % they are parked at. The diagnostics, the OpenFan calibration, a
   validation session start, an OpenFan rescan, and an override or identify on an OpenFAN channel are
   refused with `409 validation_error`, `details.reason: "openfan_maintenance"`, and overrides and identify
   holds on OpenFAN channels are released as it starts. The `openfan` health entry reports the update:

@@ -215,10 +215,14 @@ fn hwmon_stall_verdict(snap: &DaemonState, id: &str, now: Instant) -> Option<boo
 pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntry> {
     let mut fans: Vec<FanEntry> = Vec::new();
 
-    // OpenFanController fans
+    // OpenFanController fans. No stall verdict while an update holds them
+    // (DEC-481): their last command is its parking duty, and no tach is read
+    // after it until the poll loop has the port back — nor while the board
+    // awaits recovery — so a channel with no fan would read as stalled.
+    let held_by_update = snap.openfan_writes_suspended();
     for (ch, fan) in &snap.openfan_fans {
         let age_ms = now.duration_since(fan.updated_at).as_millis() as u64;
-        let stall = if fan.rpm_polled {
+        let stall = if fan.rpm_polled && !held_by_update {
             fan.last_commanded_pwm
                 .map(|pwm| fan.rpm == 0 && pwm > constants::STALL_PWM_THRESHOLD)
         } else {
@@ -1578,6 +1582,56 @@ mod tests {
         assert_eq!(
             ch3.stall_detected, None,
             "precondition: an unpolled channel already reported no stall verdict"
+        );
+    }
+
+    /// An update parks every OpenFan channel at 100 % and then lends the port
+    /// (DEC-481): no tach is read after that command until the poll loop has
+    /// the port back, nor while a board awaits recovery. A verdict then paired
+    /// the parking duty with a reading taken before it, so a channel with no
+    /// fan read as stalled for the whole update.
+    #[test]
+    fn an_update_holding_the_openfan_channels_gives_no_stall_verdict() {
+        use crate::health::state::OpenFanMaintenance;
+        use crate::openfan_maintenance::{outcome, stage};
+
+        let verdict = |maintenance: Option<OpenFanMaintenance>| {
+            let mut state = DaemonState::default();
+            state.openfan_fans.insert(
+                0,
+                crate::health::state::OpenFanState {
+                    channel: 0,
+                    rpm: 0,
+                    last_commanded_pwm: Some(100),
+                    updated_at: Instant::now(),
+                    rpm_polled: true,
+                    poll_seq: 1,
+                },
+            );
+            state.openfan_maintenance = maintenance;
+            build_fan_entries(&state, Instant::now())[0].stall_detected
+        };
+        let running = |writes_suspended| OpenFanMaintenance::Running {
+            run_id: "r1".into(),
+            stage: stage::PARKING,
+            stage_deadline: None,
+            writes_suspended,
+        };
+
+        assert_eq!(verdict(None), Some(true), "precondition: 0 RPM at 100 %");
+        assert_eq!(
+            verdict(Some(running(false))),
+            Some(true),
+            "before the channels are parked the poll loop still reads them"
+        );
+        assert_eq!(verdict(Some(running(true))), None, "parked, the port lent");
+        assert_eq!(
+            verdict(Some(OpenFanMaintenance::NeedsRecovery {
+                run_id: "r1".into(),
+                outcome: outcome::NEEDS_RECOVERY,
+            })),
+            None,
+            "a board awaiting recovery is not polled"
         );
     }
 
