@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [4.1.0] — 2026-10-07
+
+Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 4.1.0 is the matching
+release. A hardening release: nothing is removed or renamed, and no capability flag is added. Two answers
+are new — a retryable `500 internal_error` when a profile read takes longer than 2 s, and a retryable
+`503 hardware_unavailable` with `details.reason: "hwmon_controller_busy"` — and the profile search-dir
+list and profile store are now bounded (below).
+
 ### Security
 
 - **A profile search directory can no longer be used to read other files.** Any local user can register a
