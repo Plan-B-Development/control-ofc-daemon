@@ -109,157 +109,237 @@ fn confining_root(home: PathBuf) -> Option<PathBuf> {
     Some(home)
 }
 
-/// Decide whether a non-root client may add the given profile search
-/// directories (DEC-205).
-///
-/// `dirs` are the directories being added; they have already passed the cheap
-/// absolute-path + no-`..` text pre-filter in the handler. `peer_uid` is the
-/// client's effective uid from `SO_PEERCRED` (`None` if it could not be read).
-/// `home_for_uid` resolves a uid to its home directory (see
-/// [`home_dir_for_uid`]).
-///
-/// Rules:
-/// - **root (uid 0) is exempt** — unrestricted, preserving the pre-DEC-205
-///   admin/CLI behaviour.
-/// - a **non-root** caller may only add directories that *exist*, canonicalize
-///   successfully (resolving symlinks/`..`), and lie within its own home
-///   directory.
-/// - if the uid or its home cannot be resolved, **fail closed** (reject).
-///
-/// Returns `Ok(())` if every directory is permitted, or `Err(message)` with a
-/// user-facing reason for the first rejected directory.
-pub(crate) fn confine_added_dirs(
-    dirs: &[String],
-    peer_uid: Option<u32>,
-    home_for_uid: impl Fn(u32) -> Option<PathBuf>,
-) -> Result<(), String> {
-    // Nothing to confine. Matters since the endpoint accepts `remove` alone
-    // (DEC-285): without this, a remove-only request from a caller whose uid or
-    // home cannot be resolved is refused with "refusing to ADD profile search
-    // directories", which is simply not what was asked. Fails closed either way
-    // — this is message truthfulness, and it matches the sibling predicate.
-    if dirs.is_empty() || peer_uid == Some(0) {
-        return Ok(());
-    }
-
-    // Non-root: identify the caller, or fail closed.
-    let Some(uid) = peer_uid else {
-        return Err(
-            "cannot identify the requesting user (SO_PEERCRED unavailable); \
-             refusing to add profile search directories"
-                .to_string(),
-        );
-    };
-    let Some(home) = home_for_uid(uid).and_then(confining_root) else {
-        return Err(format!(
-            "cannot resolve the home directory for uid {uid}; \
-             refusing to add profile search directories"
-        ));
-    };
-    // Canonicalize the home root too, so a symlinked home (e.g. /home ->
-    // /var/home) compares consistently with the canonicalized candidates.
-    let home = home.canonicalize().unwrap_or(home);
-    let roots = [home.clone()];
-
-    for dir in dirs {
-        // Canonicalize resolves symlinks and `.`/`..`, closing the text-only
-        // bypass the pre-filter cannot. It requires the directory to exist and
-        // be accessible — a confined caller may only add real directories.
-        let canonical = match Path::new(dir).canonicalize() {
-            Ok(c) => c,
-            Err(_) => {
-                return Err(format!(
-                    "profile search directory must exist and be readable: {dir}"
-                ));
-            }
-        };
-        if !path_is_within(&canonical, &roots) {
-            return Err(format!(
-                "profile search directory must be within your home directory ({}): {dir}",
-                home.display()
-            ));
-        }
-    }
-
-    Ok(())
+/// Who is editing the search path, for confinement (DEC-205): root is
+/// unconfined; anyone else is confined to their own home, by its raw and its
+/// real spelling.
+#[derive(Debug, Clone)]
+pub(crate) enum Confinement {
+    Unconfined,
+    Home { home: PathBuf, roots: Vec<PathBuf> },
 }
 
-/// Decide whether a non-root client may *remove* the given profile search
-/// directories (DEC-285).
+impl Confinement {
+    /// Fail closed when the caller cannot be identified or has no home that
+    /// confines anything. Filesystem access (the home's real path) for a
+    /// non-root caller: run it off the async workers.
+    pub(crate) fn of(
+        peer_uid: Option<u32>,
+        home_for_uid: impl Fn(u32) -> Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let action = "edit";
+        if peer_uid == Some(0) {
+            return Ok(Self::Unconfined);
+        }
+        let Some(uid) = peer_uid else {
+            return Err(format!(
+                "cannot identify the requesting user (SO_PEERCRED unavailable); \
+                 refusing to {action} profile search directories"
+            ));
+        };
+        let Some(home) = home_for_uid(uid).and_then(confining_root) else {
+            return Err(format!(
+                "cannot resolve the home directory for uid {uid}; \
+                 refusing to {action} profile search directories"
+            ));
+        };
+        // A symlinked home (/home -> /var/home) is matched in both spellings.
+        let mut roots = vec![home.clone()];
+        if let Ok(real) = home.canonicalize() {
+            if real != home {
+                roots.push(real);
+            }
+        }
+        Ok(Self::Home { home, roots })
+    }
+
+    /// Lexical: `path` must already be the value being decided on. Never
+    /// resolve it again here — a second resolution can differ from the first
+    /// (security review of FFA-c).
+    pub(crate) fn permits(&self, path: &Path) -> bool {
+        match self {
+            Self::Unconfined => true,
+            Self::Home { roots, .. } => path_is_within(path, roots),
+        }
+    }
+
+    fn outside_home(&self, dir: &str) -> String {
+        let home = match self {
+            Self::Unconfined => Path::new("/"),
+            Self::Home { home, .. } => home.as_path(),
+        };
+        format!(
+            "profile search directory must be within your home directory ({}): {dir}",
+            home.display()
+        )
+    }
+}
+
+/// Resolve and confine the profile search directories being added (DEC-205),
+/// returning the form each is stored in (FFA-c).
 ///
-/// Deliberately NOT [`confine_added_dirs`]. That predicate canonicalizes, which
-/// requires the directory to exist and be readable — and a search-dir entry
-/// worth pruning is very often one that no longer exists: a profiles folder the
-/// user moved, or a stale entry an older GUI left behind when it re-registered
-/// a new path without retiring the old one. Reusing the add predicate would
-/// make exactly the entries this operation exists to clean up the ones it
-/// refuses to touch.
+/// `dirs` have already passed the absolute-path + no-`..` shape check.
+/// `peer_uid` is the client's uid from `SO_PEERCRED` (`None` if it could not be
+/// read); `home_for_uid` resolves a uid to its home (see [`home_dir_for_uid`]).
 ///
-/// Containment is therefore **lexical**, which is the right match for what is
-/// stored: the add path canonicalizes to *validate* but persists the raw string
-/// the caller sent. The handler's shape pre-filter has already rejected
-/// relative paths and any `..`, so a lexical `starts_with` cannot be walked out
-/// of. Both the raw and canonicalized spellings of the caller's home are
-/// accepted as roots, because a symlinked home (`/home` -> `/var/home`) can
-/// legitimately have been stored either way.
+/// Each directory is resolved **once**, and that real path is both what is
+/// confined and what is stored. Resolving it again for the check would let a
+/// directory swapped in between be stored unconfined.
+///
+/// Rules:
+/// - **root (uid 0) is exempt**, preserving the pre-DEC-205 admin/CLI
+///   behaviour; a directory root names that does not exist is stored in its
+///   lexical normal form.
+/// - a **non-root** caller may only add directories that exist and whose real
+///   path lies within its own home directory.
+/// - if the uid or its home cannot be resolved, **fail closed**.
+///
+/// A refusal names the directory as the caller sent it, never its real path:
+/// the daemon resolves as root, so the real path of a link inside a directory
+/// the caller cannot read, or of `/proc/<pid>/cwd`, would otherwise leak
+/// (DEC-173).
+pub(crate) fn confine_adds(dirs: &[String], who: &Confinement) -> Result<Vec<String>, String> {
+    dirs.iter()
+        .map(|dir| match (resolve_client_path(Path::new(dir)), who) {
+            (Ok(real), _) if who.permits(&real) => Ok(real.display().to_string()),
+            (Ok(_), _) => Err(who.outside_home(dir)),
+            (Err(_), Confinement::Unconfined) => {
+                Ok(crate::profile_store::normalize_lexically(Path::new(dir))
+                    .display()
+                    .to_string())
+            }
+            (Err(_), Confinement::Home { .. }) => Err(format!(
+                "profile search directory must exist and be readable: {dir}"
+            )),
+        })
+        .collect()
+}
+
+/// Confine the profile search directories being removed (DEC-285), returning
+/// every spelling a stored entry may match.
+///
+/// Deliberately NOT [`confine_added_dirs`]: a search-dir entry worth pruning is
+/// very often one that no longer exists — a profiles folder the user moved, or
+/// a stale entry an older GUI left behind — so removal must not require the
+/// directory to exist.
+///
+/// A directory passes on its spelling as sent (lexically within the caller's
+/// home) or on its real path, which `real_path_of` supplies when the caller
+/// resolved it. The real path is needed because daemons ≤ 4.0.0 stored the raw
+/// string of an addition they had confined by its real path, so an entry added
+/// through a symlink (or under a `systemd-homed` layout where `pw_dir` and
+/// `$HOME` spell the home differently) would otherwise be storable and never
+/// removable. The real path is checked as given, never resolved again, and
+/// added as a spelling only when it too is the caller's to remove: otherwise
+/// `~/link -> <another user's dir>` would prune that user's entry.
+///
+/// No filesystem access except through `real_path_of` and the home lookup, so
+/// a removal of a directory that stopped answering does not hang (FFA-b): the
+/// caller resolves best-effort and passes `None` for what it could not.
 ///
 /// Same rules otherwise: root (uid 0) is exempt, and an unresolvable uid or
-/// home fails closed.
-pub(crate) fn confine_removed_dirs(
+/// home fails closed (in [`Confinement::of`]).
+pub(crate) fn confine_removals(
+    dirs: &[String],
+    who: &Confinement,
+    real_path_of: impl Fn(&str) -> Option<PathBuf>,
+) -> Result<Vec<String>, String> {
+    let mut spellings = Vec::with_capacity(dirs.len() * 2);
+    for dir in dirs {
+        let as_sent = who.permits(Path::new(dir));
+        let real = real_path_of(dir).filter(|real| who.permits(real));
+        if !as_sent && real.is_none() {
+            return Err(who.outside_home(dir));
+        }
+        spellings.push(dir.clone());
+        if let Some(real) = real {
+            spellings.push(real.display().to_string());
+        }
+    }
+    Ok(spellings)
+}
+
+/// The predicates the handler composes, as one call each — tests only. An empty
+/// list confines nothing, so an unidentifiable caller is not refused for an
+/// edit it did not make (the handler likewise skips a list that is empty).
+#[cfg(test)]
+fn confine_added_dirs(
     dirs: &[String],
     peer_uid: Option<u32>,
     home_for_uid: impl Fn(u32) -> Option<PathBuf>,
-) -> Result<(), String> {
-    if dirs.is_empty() || peer_uid == Some(0) {
-        return Ok(());
+) -> Result<Vec<String>, String> {
+    if dirs.is_empty() {
+        return Ok(Vec::new());
+    }
+    confine_adds(dirs, &Confinement::of(peer_uid, home_for_uid)?)
+}
+
+/// See [`confine_added_dirs`]; resolves each removal here, where the handler
+/// resolves best-effort.
+#[cfg(test)]
+fn confine_removed_dirs(
+    dirs: &[String],
+    peer_uid: Option<u32>,
+    home_for_uid: impl Fn(u32) -> Option<PathBuf>,
+) -> Result<Vec<String>, String> {
+    if dirs.is_empty() {
+        return Ok(Vec::new());
+    }
+    confine_removals(dirs, &Confinement::of(peer_uid, home_for_uid)?, |d| {
+        Path::new(d).canonicalize().ok()
+    })
+}
+
+/// Resolve a path a client named: its real path. Filesystem access — run it off
+/// the async workers. A test can make it block for a chosen path.
+pub(crate) fn resolve_client_path(path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    test_hook::on_resolve(path);
+    path.canonicalize()
+}
+
+/// Test-only: block the resolution of a chosen path, standing in for a mount
+/// that stopped answering. Keyed by path, so parallel tests do not interfere.
+#[cfg(test)]
+pub(crate) mod test_hook {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+    static HOOKS: parking_lot::Mutex<Option<HashMap<PathBuf, Hook>>> =
+        parking_lot::Mutex::new(None);
+
+    /// Run `hook` in every resolution of `path` until the guard drops.
+    pub(crate) fn block_resolution_of(
+        path: &Path,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) -> Guard {
+        HOOKS
+            .lock()
+            .get_or_insert_with(HashMap::new)
+            .insert(path.to_path_buf(), Arc::new(hook));
+        Guard(path.to_path_buf())
     }
 
-    let Some(uid) = peer_uid else {
-        return Err(
-            "cannot identify the requesting user (SO_PEERCRED unavailable); \
-             refusing to remove profile search directories"
-                .to_string(),
-        );
-    };
-    let Some(home) = home_for_uid(uid).and_then(confining_root) else {
-        return Err(format!(
-            "cannot resolve the home directory for uid {uid}; \
-             refusing to remove profile search directories"
-        ));
-    };
-    let mut roots = vec![home.clone()];
-    if let Ok(canonical) = home.canonicalize() {
-        if canonical != home {
-            roots.push(canonical);
+    pub(crate) struct Guard(PathBuf);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Some(hooks) = HOOKS.lock().as_mut() {
+                hooks.remove(&self.0);
+            }
         }
     }
 
-    for dir in dirs {
-        // Raw OR canonical. The stored entry is the RAW string the adder sent,
-        // but `confine_added_dirs` validated its *canonical* form — so the set of
-        // storable paths is a strict superset of the lexically-containable ones,
-        // and the difference is exactly the entries a user most needs to prune.
-        // Two real shapes hit it: a dir added through a symlink
-        // (`/tmp/link -> ~/profiles`, stored as `/tmp/link`), and a
-        // `systemd-homed`-style layout where `pw_dir` is `/var/home/alice` while
-        // `$HOME` — and therefore the stored path — is `/home/alice`. Both were
-        // addable and permanently unremovable. `canonicalize` is *attempted*,
-        // never required: a vanished directory still passes on its raw form,
-        // which is the property this predicate exists for.
-        let raw_ok = path_is_within(Path::new(dir), &roots);
-        let canonical_ok = !raw_ok
-            && Path::new(dir)
-                .canonicalize()
-                .is_ok_and(|c| path_is_within(&c, &roots));
-        if !raw_ok && !canonical_ok {
-            return Err(format!(
-                "profile search directory must be within your home directory ({}): {dir}",
-                home.display()
-            ));
+    pub(super) fn on_resolve(path: &Path) {
+        let hook = HOOKS
+            .lock()
+            .as_ref()
+            .and_then(|hooks| hooks.get(path).cloned());
+        if let Some(hook) = hook {
+            hook();
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -659,6 +739,49 @@ mod tests {
         assert!(
             confine_added_dirs(&[], None, |_| None).is_ok(),
             "an empty add list must not be refused"
+        );
+    }
+
+    #[test]
+    fn a_refused_add_names_the_path_as_sent_never_its_real_path() {
+        // Security review S1: the daemon resolves as root, so the real path of a
+        // link inside a directory the caller cannot read (or of /proc/<pid>/cwd)
+        // must not come back in the refusal.
+        let home = tempfile::tempdir().unwrap();
+        let hidden = tempfile::tempdir().unwrap();
+        let target = hidden.path().join("only-root-may-know");
+        std::fs::create_dir(&target).unwrap();
+        let link = home.path().join("link");
+        symlink(&target, &link).unwrap();
+        let sent = link.to_string_lossy().into_owned();
+        let home_path = home.path().to_path_buf();
+
+        let msg = confine_added_dirs(std::slice::from_ref(&sent), Some(1000), |_| {
+            Some(home_path.clone())
+        })
+        .expect_err("a link out of the home must be refused");
+        assert!(msg.contains(&sent), "the caller's own spelling: {msg}");
+        assert!(
+            !msg.contains("only-root-may-know"),
+            "the resolved target must not leak: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_add_is_stored_as_the_real_path_it_was_confined_by() {
+        let home = tempfile::tempdir().unwrap();
+        let real = home.path().join("profiles");
+        std::fs::create_dir(&real).unwrap();
+        let link = home.path().join("via-link");
+        symlink(&real, &link).unwrap();
+        let home_path = home.path().to_path_buf();
+        let stored = confine_added_dirs(&[link.to_string_lossy().into_owned()], Some(1000), |_| {
+            Some(home_path.clone())
+        })
+        .unwrap();
+        assert_eq!(
+            stored,
+            vec![real.canonicalize().unwrap().display().to_string()]
         );
     }
 

@@ -872,11 +872,28 @@ fn apply_runtime_overlay(config: &mut DaemonConfig, runtime: &RuntimeConfig, adm
 /// by id and the store is the primary location — regardless of admin config or
 /// a SIGHUP reload. Dedup-safe; otherwise order-preserving.
 fn with_store_dir(mut dirs: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
-    let store = daemon_state::profiles_dir();
+    let store = real_path_of_store(daemon_state::profiles_dir());
     if !dirs.contains(&store) {
         dirs.insert(0, store);
     }
     dirs
+}
+
+/// The store's real path (FFA-a). The profile reader refuses a search directory
+/// that is not its own real path, so a state directory reached through a
+/// symlink would hide every stored profile. The store is root's, so resolving it
+/// is safe. Before the store exists its parent is resolved instead.
+fn real_path_of_store(store: std::path::PathBuf) -> std::path::PathBuf {
+    if let Ok(real) = store.canonicalize() {
+        return real;
+    }
+    match (
+        store.parent().and_then(|p| p.canonicalize().ok()),
+        store.file_name(),
+    ) {
+        (Some(parent), Some(name)) => parent.join(name),
+        _ => store,
+    }
 }
 
 fn apply_config_reload(
@@ -979,11 +996,23 @@ impl ProfileRequest {
         }
     }
 
-    /// The file this source names, or `None` when there is no such file.
-    fn locate(&self, search_dirs: &[PathBuf]) -> Option<PathBuf> {
+    /// Find and load the profile this source names: `Ok(None)` when there is
+    /// no such file. Filesystem access, in directories users can register:
+    /// call it through [`bounded_boot_read`] (FFA-b).
+    ///
+    /// A name is looked up as `GET /profiles/{id}` is, through the confined
+    /// reader: root chose the name, but the directory holding the file may be
+    /// a user's (FFA-a). A `--profile-file` path is root's choice outright.
+    fn load(&self, search_dirs: &[PathBuf]) -> Result<Option<DaemonProfile>, String> {
         match self {
-            Self::CliName(name) | Self::EnvName(name) => profile::find_profile(name, search_dirs),
-            Self::CliFile(path) => path.exists().then(|| path.clone()),
+            Self::CliName(name) | Self::EnvName(name) => {
+                match control_ofc_daemon::profile_store::read_by_id(search_dirs, name) {
+                    Some((path, content)) => profile::parse_profile(&content, &path).map(Some),
+                    None => Ok(None),
+                }
+            }
+            Self::CliFile(path) if !path.exists() => Ok(None),
+            Self::CliFile(path) => profile::load_profile(path).map(Some),
         }
     }
 }
@@ -1017,10 +1046,8 @@ fn resolve_persisted_profile(
 ) -> Option<DaemonProfile> {
     let path_str = state.active_profile_path.as_ref()?;
     let path = PathBuf::from(path_str);
-    if !path.exists() {
-        log::warn!("Persisted profile path no longer exists: {path_str}");
-        return None;
-    }
+    // No `exists()` first: the loader reports a missing file, and a stat of a
+    // path in a directory that stopped answering would hang start-up unbounded.
     match load(&path) {
         Ok(p) => Some(p),
         Err(e) => {
@@ -1042,24 +1069,23 @@ fn resolve_persisted_profile(
 /// saved profile now records only what `POST /profile/activate` last
 /// activated; an explicit source still wins on every start it is given.
 ///
-/// Pure over `requests`, `state` and `load`, so the order is testable without
-/// the real state file.
+/// Pure over `requests`, `state` and the loaders, so the order is testable
+/// without the real state file.
 fn resolve_startup_profile(
     requests: &[ProfileRequest],
-    search_dirs: &[PathBuf],
     state: &daemon_state::DaemonState,
-    load: impl Fn(&Path) -> Result<DaemonProfile, String>,
+    load: impl Fn(&ProfileRequest) -> Result<Option<DaemonProfile>, String>,
+    load_persisted: impl Fn(&Path) -> Result<DaemonProfile, String>,
 ) -> Option<DaemonProfile> {
     for request in requests {
         let source = request.describe();
-        let Some(path) = request.locate(search_dirs) else {
-            log::error!("Startup profile {source} not found — trying the next source");
-            continue;
-        };
-        match load(&path) {
-            Ok(p) => {
+        match load(request) {
+            Ok(Some(p)) => {
                 log::info!("Loaded profile '{}' from {source}", p.name);
                 return Some(p);
+            }
+            Ok(None) => {
+                log::error!("Startup profile {source} not found — trying the next source");
             }
             Err(e) => {
                 log::error!("Startup profile {source} failed to load: {e} — trying the next source")
@@ -1069,7 +1095,7 @@ fn resolve_startup_profile(
 
     // A corrupt/missing/hand-edited saved profile must fail SAFE to no-profile,
     // never crash startup — see `resolve_persisted_profile`.
-    if let Some(p) = resolve_persisted_profile(state, &load) {
+    if let Some(p) = resolve_persisted_profile(state, &load_persisted) {
         log::info!("Restored persisted profile: '{}'", p.name);
         return Some(p);
     }
@@ -1090,10 +1116,70 @@ fn resolve_initial_profile(
     let env = std::env::var("OPENFAN_PROFILE").ok();
     resolve_startup_profile(
         &profile_requests(cli, env.as_deref()),
-        search_dirs,
         &daemon_state::load_state(),
-        profile::load_profile,
+        |request| load_requested_profile(search_dirs, request),
+        |path| load_persisted_profile(search_dirs, path),
     )
+}
+
+/// [`ProfileRequest::load`], bounded: finding the file is filesystem access
+/// too, so it runs on the bounded thread with the read.
+fn load_requested_profile(
+    search_dirs: &[PathBuf],
+    request: &ProfileRequest,
+) -> Result<Option<DaemonProfile>, String> {
+    let dirs = search_dirs.to_vec();
+    let owned = request.clone();
+    bounded_boot_read(request.describe(), move || owned.load(&dirs))
+}
+
+/// Load the saved profile (FFA-a): read through the confined search-dir reader,
+/// as an activation by path is, because a client chose that path. A plain read
+/// would follow a link the client put there after activating, and have root
+/// open whatever it names.
+fn load_persisted_profile(search_dirs: &[PathBuf], path: &Path) -> Result<DaemonProfile, String> {
+    let dirs = search_dirs.to_vec();
+    let path = path.to_path_buf();
+    bounded_boot_read(path.display().to_string(), move || {
+        use control_ofc_daemon::profile_store::{read_by_path, PathReadError};
+        match read_by_path(&dirs, &path) {
+            Ok((real, content)) => profile::parse_profile(&content, &real),
+            Err(PathReadError::NotFound) => Err(format!("{} no longer exists", path.display())),
+            Err(PathReadError::OutsideSearchDirs) => Err(format!(
+                "{} is not directly inside a profile search directory",
+                path.display()
+            )),
+            Err(PathReadError::Unreadable(detail)) => Err(format!("refused: {detail}")),
+            Err(PathReadError::OutOfTime) => {
+                Err(format!("{} could not be read in time", path.display()))
+            }
+        }
+    })
+}
+
+/// Run a start-up profile load on a thread of its own, bounded by
+/// `PROFILE_IO_BUDGET` (FFA-b). It runs before `READY=1`: a profile in a
+/// directory that stopped answering used to hang start-up until systemd killed
+/// it, on every start. A load that does not finish counts as failed, and the
+/// next source is tried; the thread is left to finish on its own.
+fn bounded_boot_read<T: Send + 'static>(
+    what: String,
+    load: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let budget = control_ofc_daemon::constants::PROFILE_IO_BUDGET;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("profile-load".into())
+        .spawn(move || {
+            let _ = tx.send(load());
+        })
+        .map_err(|e| format!("could not start the profile load: {e}"))?;
+    rx.recv_timeout(budget).unwrap_or_else(|_| {
+        Err(format!(
+            "reading {what} did not finish within {} s",
+            budget.as_secs()
+        ))
+    })
 }
 
 /// Maximum time to wait for the IPC server or a poll/engine task to stop during
@@ -3250,6 +3336,33 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
+    // ── FFA-a: the store is listed by its real path ──────────────────────
+
+    #[test]
+    fn the_store_is_listed_by_its_real_path() {
+        // The profile reader refuses a search dir that is not its own real path,
+        // so a state dir reached through a symlink must not hide the store.
+        let tmp = tempfile::tempdir().unwrap();
+        let real_state = tmp.path().join("real-state");
+        std::fs::create_dir_all(real_state.join("profiles")).unwrap();
+        let linked_state = tmp.path().join("state");
+        std::os::unix::fs::symlink(&real_state, &linked_state).unwrap();
+        let real = real_state.canonicalize().unwrap();
+
+        assert_eq!(
+            real_path_of_store(linked_state.join("profiles")),
+            real.join("profiles")
+        );
+        // Before the store exists, its parent is resolved.
+        assert_eq!(
+            real_path_of_store(linked_state.join("not-yet")),
+            real.join("not-yet")
+        );
+        // With neither resolvable, the path is kept as given.
+        let gone = tmp.path().join("gone").join("profiles");
+        assert_eq!(real_path_of_store(gone.clone()), gone);
+    }
+
     // ── DEC-243 runtime overlay ──────────────────────────────────────────
     // `apply_runtime_overlay` is the half that makes "takes effect on restart"
     // TRUE: the setters persist to runtime.toml, and only this function moves
@@ -4351,13 +4464,63 @@ mod tests {
 
     #[test]
     fn persisted_profile_resolves_to_none_when_file_missing() {
-        // A pointer to a path that no longer exists → None; loader not run.
+        // A pointer to a path that no longer exists → None. The loader reports
+        // it: no `exists()` stat runs first (FFA-b).
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = [dir.path().to_path_buf()];
         let state = daemon_state::DaemonState {
             version: 1,
             active_profile_id: Some("x".into()),
-            active_profile_path: Some("/nonexistent/control-ofc/profile.json".into()),
+            active_profile_path: Some(dir.path().join("gone.json").display().to_string()),
         };
-        assert!(resolve_persisted_profile(&state, |_| panic!("loader must not run")).is_none());
+        assert!(resolve_persisted_profile(&state, |p| load_persisted_profile(&dirs, p)).is_none());
+    }
+
+    #[test]
+    fn a_persisted_profile_replaced_by_a_symlink_is_not_followed() {
+        // FFA-a (security review S5): the saved path was chosen by a client, so
+        // a link put there after activating must not have root read its target.
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("target.json");
+        std::fs::write(
+            &target,
+            r#"{"id":"x","name":"Target","version":7,"controls":[],"curves":[]}"#,
+        )
+        .unwrap();
+        let saved = dir.path().join("x.json");
+        let dirs = [dir.path().to_path_buf()];
+        let state = daemon_state::DaemonState {
+            version: 1,
+            active_profile_id: Some("x".into()),
+            active_profile_path: Some(saved.display().to_string()),
+        };
+        // Precondition: a regular file at the saved path is restored.
+        std::fs::copy(&target, &saved).unwrap();
+        assert!(resolve_persisted_profile(&state, |p| load_persisted_profile(&dirs, p)).is_some());
+
+        std::fs::remove_file(&saved).unwrap();
+        std::os::unix::fs::symlink(&target, &saved).unwrap();
+        assert!(resolve_persisted_profile(&state, |p| load_persisted_profile(&dirs, p)).is_none());
+    }
+
+    #[test]
+    fn a_boot_load_that_does_not_finish_counts_as_failed() {
+        // FFA-b: a load that hangs (a directory that stopped answering) must not
+        // hold start-up; it is abandoned at the budget. Self-releasing.
+        let (release, wedge) = std::sync::mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+        let out: Result<(), String> = bounded_boot_read("/hung/x.json".into(), move || {
+            let _ = wedge.recv_timeout(Duration::from_secs(30));
+            Err("released".into())
+        });
+        let waited = started.elapsed();
+        let _ = release.send(());
+        assert!(out.unwrap_err().contains("did not finish"));
+        assert!(
+            waited < control_ofc_daemon::constants::PROFILE_IO_BUDGET + Duration::from_secs(1),
+            "{waited:?}"
+        );
     }
 
     // ── DEC-435 (`DC-ab`): startup profile selection ─────────────────────
@@ -4627,8 +4790,37 @@ mod tests {
         dir: &Path,
         state: &daemon_state::DaemonState,
     ) -> Option<String> {
-        resolve_startup_profile(requests, &[dir.to_path_buf()], state, profile::load_profile)
-            .map(|p| p.id)
+        let dirs = [dir.to_path_buf()];
+        resolve_startup_profile(
+            requests,
+            state,
+            |request| load_requested_profile(&dirs, request),
+            |path| load_persisted_profile(&dirs, path),
+        )
+        .map(|p| p.id)
+    }
+
+    /// FFA-a (security review of FFA-b): a name given at start-up is looked up
+    /// through the confined reader, so a link a user put in a directory they
+    /// registered is not followed by root.
+    #[test]
+    fn a_named_startup_profile_that_is_a_symlink_is_not_loaded() {
+        let (dir, state) = startup_fixture();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("t.json");
+        std::fs::copy(dir.path().join("good.json"), &target).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("linked.json")).unwrap();
+        use ProfileRequest::CliName;
+        assert_eq!(
+            resolved(&[CliName("good".into())], dir.path(), &state).as_deref(),
+            Some("good"),
+            "precondition: the target is a loadable profile"
+        );
+        assert_eq!(
+            resolved(&[CliName("linked".into())], dir.path(), &state).as_deref(),
+            Some("saved"),
+            "a symlinked profile is skipped, not followed"
+        );
     }
 
     /// DEC-435 (Q22): a source that is not found, or that will not load, falls

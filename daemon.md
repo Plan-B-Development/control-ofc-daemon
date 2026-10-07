@@ -232,7 +232,8 @@ daemon/src/
   clock.rs             — injectable monotonic clock (lease/override/identify TTLs; deterministic in tests)
   atomic_io.rs         — crash-safe atomic file write (tmp+fsync+rename)
   profile.rs           — profile JSON loading + curve evaluation
-  profile_store.rs     — daemon-owned profile storage (store of record, DEC-160)
+  profile_store.rs     — daemon-owned profile storage (store of record, DEC-160); the confined search-dir reader (FFA-a)
+  io_gate.rs           — one outstanding filesystem operation per key; a hung holder is skipped unless strict (FFA-b)
   pwm_baselines.rs     — {state_dir}/pwm_baselines.json: learned per-duty RPM bands
                          (DEC-334 §6). Widened by each completed run, never replaced;
                          pruned at boot by the same stable-header-id rule. NOTHING in
@@ -1344,10 +1345,10 @@ that run. Thermal safety never depended on this — the forced-duty branch runs 
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST/PUT/DELETE | `/profiles`, `/profiles/{id}` | Profile CRUD + `?validate_only` — daemon is the store of record (DEC-160) |
-| POST | `/profile/activate` | Switch active profile by id or path (a path must lie inside a search dir); clears all active control-overrides, not identify holds (DEC-189) — except an identify stop on a header the new profile names a pump, which is released (DEC-394). A header the old profile drove and the new one does not name is given back on the next tick (DEC-382), and a PMFW GPU it does not name is reset to firmware auto (DEC-448) |
+| POST | `/profile/activate` | Switch active profile by id or path (a path must name a file directly inside a search dir, read like any profile — see `profile_store`, FFA-a); clears all active control-overrides, not identify holds (DEC-189) — except an identify stop on a header the new profile names a pump, which is released (DEC-394). A header the old profile drove and the new one does not name is given back on the next tick (DEC-382), and a PMFW GPU it does not name is reset to firmware auto (DEC-448) |
 | POST | `/profile/deactivate` | Clear active profile (DEC-097); also clears all active control-overrides, not identify holds (DEC-218, ≥ 2.12.0); idempotent. The next engine tick gives back every header the daemon holds to its recorded mode (DEC-382) and resets every PMFW GPU it drove to firmware auto (DEC-448) |
 | POST | `/control/{control_id}/override` (+`/override/renew`, `DELETE`) | Expiring manual override — floor-clamped, deadman, monotonic fencing (DEC-163); cleared on profile activation/deactivation (DEC-189/DEC-218) |
-| POST | `/config/profile-search-dirs` | Edit the profile search path: `{"add": [...]}` and/or `{"remove": [...]}`, at least one required. Removals apply before additions, so `add`+`remove` is one atomic "move" (DEC-285, `remove` is ≥ 2.23.0 and gated by `control.profile_search_dir_remove`). `/etc/control-ofc/profiles` and the last remaining entry cannot be removed. Applies live; persists to `runtime.toml`; 503 `persistence_failed` on write error |
+| POST | `/config/profile-search-dirs` | Edit the profile search path: `{"add": [...]}` and/or `{"remove": [...]}`, at least one required. Removals apply before additions, so `add`+`remove` is one atomic "move" (DEC-285, `remove` is ≥ 2.23.0 and gated by `control.profile_search_dir_remove`). `/etc/control-ofc/profiles` and the last remaining entry cannot be removed. Additions are stored by their real path; spellings of one directory are one entry; at most 32 entries of 4096 bytes, 4 per non-root user's home (FFA-c). Applies live; persists to `runtime.toml`; 503 `persistence_failed` on write error |
 | POST | `/config/poll-interval` | Set the sensor/fan poll interval, 250-2000 ms (DEC-243; persists to `runtime.toml`, restart to apply). **[SAFETY]** the ceiling bounds how stale a temperature the thermal-emergency rule can act on |
 | POST | `/config/serial-port` | Set the OpenFan serial device (`null` = auto-detect). Validated against the transport's own allowlist and capped at 256 chars; a configured port that fails to open **or fails to answer the `ReadAllRpm` handshake** falls back to auto-detection, so neither a bad value nor a wrong-but-openable device can remove OpenFan control. DEC-243 / DEC-250; restart to apply |
 | POST | `/config/serial-timeout` | Set the serial read timeout, 50-1000 ms (DEC-243; restart to apply). **[SAFETY]** bounds emergency `force_all_with_floor` latency |

@@ -9390,3 +9390,409 @@ async fn a_running_update_leaves_other_fans_alone() {
     .await;
     assert_eq!(st, 200, "{body}");
 }
+
+// ── FFA-a / FFA-b / FFA-j: profile reads and the profile store ──────────
+
+fn profile_doc(id: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({ "id": id, "name": name, "version": 7, "controls": [], "curves": [] })
+}
+
+/// POST a JSON body exactly as given, not re-serialised from a `Value`.
+async fn uds_post_json_bytes(
+    socket_path: &str,
+    path: &str,
+    body: Vec<u8>,
+) -> (u16, serde_json::Value) {
+    let stream = UnixStream::connect(socket_path).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let resp_body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&resp_body).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+fn mkfifo(path: &std::path::Path) {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: `c` is a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+}
+
+#[tokio::test]
+async fn get_profile_refuses_a_symlinked_file_in_a_search_dir() {
+    // FFA-a acceptance (audit F-1): any local user can register an in-home
+    // search dir and plant `x.json -> <any root-readable JSON>`. The target is a
+    // valid profile, so only the link refusal keeps it out.
+    let search = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let target = elsewhere.path().join("secret.json");
+    std::fs::write(&target, profile_doc("x", "Secret").to_string()).unwrap();
+    std::os::unix::fs::symlink(&target, search.path().join("x.json")).unwrap();
+    std::fs::write(
+        search.path().join("y.json"),
+        profile_doc("y", "Mine").to_string(),
+    )
+    .unwrap();
+
+    let state = test_app_state_with_profile_dirs(vec![search.path().to_path_buf()]);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/profiles/x").await;
+    assert_eq!(
+        status, 404,
+        "a symlinked profile must not be served: {json}"
+    );
+    assert!(!json.to_string().contains("Secret"));
+    // Positive control: the regular file beside it is served and listed.
+    let (status, json) = uds_get(&path, "/profiles/y").await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["name"], "Mine");
+    let (status, json) = uds_get(&path, "/profiles").await;
+    assert_eq!(status, 200);
+    let ids: Vec<&str> = json["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["y"]);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_fifo_in_a_search_dir_does_not_stall_the_runtime() {
+    // FFA-b acceptance (audit F-2). A FIFO named like a profile used to block
+    // each profile request's open on a tokio worker. With more such requests
+    // than workers, every worker blocked, and the engine (which ticks on those
+    // workers) stopped until the watchdog killed the daemon. A ticker task
+    // stands in for the engine; the requests must all answer and the ticker
+    // must keep running.
+    const WORKERS: usize = 2;
+    let search = tempfile::tempdir().unwrap();
+    let fifo = search.path().join("a.json");
+    mkfifo(&fifo);
+    std::fs::write(
+        search.path().join("good.json"),
+        profile_doc("good", "Good").to_string(),
+    )
+    .unwrap();
+
+    // Self-release (rust.md): without the fix the opens block for ever. After
+    // the assertion deadline, a writer keeps opening the FIFO so every blocked
+    // reader returns, the runtime can be dropped, and the test fails rather
+    // than hangs.
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let done = Arc::clone(&done);
+        let fifo = fifo.clone();
+        std::thread::spawn(move || {
+            let release_at = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let give_up = release_at + std::time::Duration::from_secs(30);
+            while !done.load(std::sync::atomic::Ordering::SeqCst)
+                && std::time::Instant::now() < give_up
+            {
+                if std::time::Instant::now() >= release_at {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let _ = std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&fifo);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(WORKERS)
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome = rt.block_on(async {
+        let state = test_app_state_with_profile_dirs(vec![search.path().to_path_buf()]);
+        let (path, shutdown, _dir) = start_test_server(state).await;
+
+        let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let ticks = Arc::clone(&ticks);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+        }
+
+        let requests = 3 * WORKERS;
+        let answers = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        for i in 0..requests {
+            let path = path.clone();
+            let fifo = fifo.display().to_string();
+            let answers = Arc::clone(&answers);
+            tokio::spawn(async move {
+                let answer = match i % 3 {
+                    0 => ("list", uds_get(&path, "/profiles").await),
+                    1 => ("get", uds_get(&path, "/profiles/a").await),
+                    _ => (
+                        "activate",
+                        uds_post(
+                            &path,
+                            "/profile/activate",
+                            &serde_json::json!({ "profile_path": fifo }),
+                        )
+                        .await,
+                    ),
+                };
+                answers.lock().push(answer);
+            });
+        }
+
+        // The body runs on the `block_on` thread, not a worker, so it can wait
+        // with a plain sleep even if every worker is blocked.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while answers.lock().len() < requests && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let answered = answers.lock().clone();
+        let ticks_after_answers = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        let tick_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ticks.load(std::sync::atomic::Ordering::SeqCst) < ticks_after_answers + 10
+            && std::time::Instant::now() < tick_deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ticks_later = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = shutdown.send(());
+        let _ = std::fs::remove_file(&path);
+        (answered, ticks_after_answers, ticks_later)
+    });
+    let (answered, ticks_after_answers, ticks_later) = outcome;
+    assert_eq!(
+        answered.len(),
+        3 * WORKERS,
+        "every profile request must answer; got {answered:?}"
+    );
+    assert!(
+        ticks_later >= ticks_after_answers + 10,
+        "the runtime stopped ticking: {ticks_after_answers} -> {ticks_later}"
+    );
+    for (kind, (status, json)) in &answered {
+        match *kind {
+            "list" => {
+                assert_eq!(*status, 200, "{json}");
+                assert_eq!(json["profiles"][0]["id"], "good", "{json}");
+                assert_eq!(json["profiles"].as_array().unwrap().len(), 1, "{json}");
+            }
+            "get" => assert_eq!(*status, 404, "{json}"),
+            _ => assert_eq!(*status, 400, "{json}"),
+        }
+    }
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[tokio::test]
+async fn profile_search_dirs_store_one_entry_per_directory() {
+    // FFA-c: `/./`, `//` and a trailing `/` used to each add a raw entry,
+    // growing `runtime.toml` without bound.
+    let (state, _tmp) = config_test_state("");
+    let (_keep_alive, dir) = addable_dir();
+    let (path, shutdown, _dir) = start_test_server(state.clone()).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/profile-search-dirs",
+        &serde_json::json!({ "add": [dir] }),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    let registered = json["search_dirs"].clone();
+    // Stored by its real path (precondition for the rest of the test).
+    let real = std::path::Path::new(&dir)
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
+    assert!(
+        registered
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d.as_str() == Some(real.as_str())),
+        "{registered}"
+    );
+
+    let (head, tail) = dir.split_at(dir.rfind('/').unwrap());
+    for variant in [
+        format!("{dir}/"),
+        format!("{dir}/."),
+        format!("{head}/.{tail}"),
+        format!("{head}/{tail}"),
+    ] {
+        let (status, json) = uds_post(
+            &path,
+            "/config/profile-search-dirs",
+            &serde_json::json!({ "add": [variant] }),
+        )
+        .await;
+        assert_eq!(status, 200, "{variant}: {json}");
+        assert_eq!(
+            json["search_dirs"], registered,
+            "{variant} must not add an entry"
+        );
+    }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn create_profile_stores_compact_bytes_within_the_read_cap() {
+    // FFA-j: stored with `to_vec_pretty`, a nested document grew several-fold
+    // on disk. Assert the realised file.
+    let store = tempfile::tempdir().unwrap();
+    let state = test_app_state_with_profile_dirs(vec![store.path().to_path_buf()]);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let mut doc = profile_doc("compact", "Compact");
+    doc["future"] = serde_json::json!({ "a": { "b": { "c": [1, 2, 3] } } });
+    let (status, json) = uds_post(&path, "/profiles", &doc).await;
+    assert_eq!(status, 201, "{json}");
+    let on_disk = std::fs::read(store.path().join("compact.json")).unwrap();
+    assert_eq!(on_disk, serde_json::to_vec(&doc).unwrap());
+    assert!(!on_disk.contains(&b'\n'));
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn create_profile_refuses_a_document_that_would_store_past_the_read_cap() {
+    // FFA-j: re-serialising expands numbers (`1e9` -> `1000000000.0`), so a body
+    // under the 4 MiB request limit could be stored as a file the daemon then
+    // refused to read, list, activate or recreate.
+    let store = tempfile::tempdir().unwrap();
+    let state = test_app_state_with_profile_dirs(vec![store.path().to_path_buf()]);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let head = serde_json::to_string(&profile_doc("big", "Big")).unwrap();
+    let pad = vec!["1e9"; 1_000_000].join(",");
+    let body = format!("{},\"pad\":[{pad}]}}", &head[..head.len() - 1]);
+    // Preconditions: the request fits the request limit, its stored form does not.
+    let limit = control_ofc_daemon::atomic_io::MAX_CONFIG_BYTES as usize;
+    assert!(body.len() < limit, "{} bytes", body.len());
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(serde_json::to_vec(&doc).unwrap().len() > limit);
+
+    let (status, json) = uds_post_json_bytes(&path, "/profiles", body.into_bytes()).await;
+    assert_eq!(status, 400, "{json}");
+    assert_eq!(json["error"]["code"], "validation_error");
+    assert!(!store.path().join("big.json").exists());
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn create_profile_refuses_a_new_id_when_the_store_is_full() {
+    let store = tempfile::tempdir().unwrap();
+    for i in 0..control_ofc_daemon::constants::MAX_STORED_PROFILES {
+        let id = format!("p{i}");
+        std::fs::write(
+            store.path().join(format!("{id}.json")),
+            profile_doc(&id, "P").to_string(),
+        )
+        .unwrap();
+    }
+    let state = test_app_state_with_profile_dirs(vec![store.path().to_path_buf()]);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(&path, "/profiles", &profile_doc("new", "New")).await;
+    assert_eq!(status, 400, "{json}");
+    assert!(!store.path().join("new.json").exists());
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_creates_of_one_id_create_it_once() {
+    // FFA-j (audit F-16): create checked for the id and then wrote, in two
+    // steps, so two concurrent POSTs of one id could both answer 201.
+    let store = tempfile::tempdir().unwrap();
+    let state = test_app_state_with_profile_dirs(vec![store.path().to_path_buf()]);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let mut tasks = Vec::new();
+    for i in 0..8 {
+        let path = path.clone();
+        tasks.push(tokio::spawn(async move {
+            uds_post(&path, "/profiles", &profile_doc("same", &format!("N{i}")))
+                .await
+                .0
+        }));
+    }
+    let mut statuses = Vec::new();
+    for task in tasks {
+        statuses.push(task.await.unwrap());
+    }
+    statuses.sort();
+    assert_eq!(statuses, [vec![201], vec![409; 7]].concat());
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn a_removal_through_a_symlink_cannot_prune_a_dir_outside_the_callers_home() {
+    // FFA-c self-review: a removal also matches an entry by its real path. That
+    // real path must pass the caller's confinement too, or `~/link -> <another
+    // user's registered dir>` would prune that user's entry.
+    // SAFETY: getuid() takes no arguments and always succeeds.
+    if unsafe { libc::getuid() } == 0 {
+        eprintln!("skipped: root is exempt from confinement");
+        return;
+    }
+    let (state, _tmp) = config_test_state("");
+    let victim = tempfile::tempdir().unwrap(); // under /tmp, outside the home
+    let victim_real = victim.path().canonicalize().unwrap().display().to_string();
+    let (_keep_alive, holder) = addable_dir();
+    let link = format!("{holder}/link");
+    std::os::unix::fs::symlink(&victim_real, &link).unwrap();
+    *state.profile_search_dirs.write() = vec![
+        std::path::PathBuf::from(control_ofc_daemon::config::SYSTEM_PROFILE_DIR),
+        std::path::PathBuf::from(&victim_real),
+    ];
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/profile-search-dirs",
+        &serde_json::json!({ "remove": [link] }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the in-home link itself may be removed: {json}"
+    );
+    assert_eq!(
+        json["search_dirs"],
+        serde_json::json!([control_ofc_daemon::config::SYSTEM_PROFILE_DIR, victim_real]),
+        "the entry outside the caller's home must survive"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}

@@ -192,13 +192,14 @@ fn tmp_path_for(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// fsync a directory so an entry created, renamed or removed in it is durable.
 #[cfg(unix)]
-fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
+pub(crate) fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -226,13 +227,58 @@ pub fn read_to_string_capped(path: &Path) -> std::io::Result<String> {
 /// unbounded read of a corrupt file is the thing this helper exists to prevent —
 /// it is simply the store's own, tied to the store's write budget.
 pub fn read_to_string_with_cap(path: &Path, cap: u64) -> std::io::Result<String> {
+    read_open_file_with_cap(File::open(path)?, cap, path)
+}
+
+/// [`read_to_string_capped`] for a file a client can place: the profile files a
+/// search directory holds (FFA-b).
+///
+/// The open is non-blocking and anything that is not a regular file is refused
+/// before a byte is read. A plain open of a FIFO blocks until a writer appears,
+/// so a FIFO named like a profile used to park the thread that opened it for
+/// good: a tokio worker on the request path, and the boot thread before
+/// `READY=1`. A symlink is still followed here; the search-directory reader in
+/// `profile_store` refuses one as well.
+pub fn read_regular_file_capped(path: &Path) -> std::io::Result<String> {
+    let file = open_regular_nonblocking(path, false)?;
+    read_open_file_with_cap(file, MAX_CONFIG_BYTES, path)
+}
+
+/// Open `path` without blocking, and refuse anything that is not a regular file.
+/// `no_follow` also refuses a symlink as the last component.
+pub(crate) fn open_regular_nonblocking(path: &Path, no_follow: bool) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut flags = libc::O_NONBLOCK;
+    if no_follow {
+        flags |= libc::O_NOFOLLOW;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)?;
+    // fstat on the descriptor, not a stat of the path: the check is about the
+    // file that was opened, whatever the path names by now.
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("not a regular file: {}", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+/// Read an already-open file to a `String`, refusing more than `cap` bytes.
+/// `path` only names the file in the error.
+pub(crate) fn read_open_file_with_cap(
+    file: File,
+    cap: u64,
+    path: &Path,
+) -> std::io::Result<String> {
     use std::io::Read;
     let mut buf = Vec::new();
     // `saturating_add`: a `u64::MAX` cap would wrap `take` to 0 and return an
     // empty string — a cap helper that fails OPEN. No caller passes that today.
-    File::open(path)?
-        .take(cap.saturating_add(1))
-        .read_to_end(&mut buf)?;
+    file.take(cap.saturating_add(1)).read_to_end(&mut buf)?;
     if buf.len() as u64 > cap {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -266,6 +312,39 @@ mod tests {
         let p = tmp.path().join("ok.json");
         std::fs::write(&p, b"{\"hello\": 1}").unwrap();
         assert_eq!(read_to_string_capped(&p).unwrap(), "{\"hello\": 1}");
+    }
+
+    #[test]
+    fn read_regular_refuses_a_fifo_without_blocking() {
+        // FFA-b: a plain open of a FIFO with no writer blocks forever. The
+        // non-blocking open returns at once and the type check refuses it.
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("a.json");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let err = read_regular_file_capped(&fifo).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        // Positive control: a regular file beside it reads.
+        let ok = tmp.path().join("b.json");
+        std::fs::write(&ok, b"{}").unwrap();
+        assert_eq!(read_regular_file_capped(&ok).unwrap(), "{}");
+    }
+
+    #[test]
+    fn read_regular_refuses_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = read_regular_file_capped(tmp.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn read_regular_applies_the_config_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("huge.json");
+        std::fs::write(&p, vec![b'a'; (MAX_CONFIG_BYTES + 1) as usize]).unwrap();
+        let err = read_regular_file_capped(&p).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

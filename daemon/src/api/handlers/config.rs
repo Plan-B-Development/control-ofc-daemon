@@ -52,7 +52,20 @@ fn dir_list_field(body: &serde_json::Value, field: &str) -> Result<Option<Vec<St
 /// Pure so the rules are unit-testable without a socket. The `..` rejection is
 /// what lets `confine_removed_dirs` compare lexically.
 pub(crate) fn validate_search_dir_edit(add: &[String], remove: &[String]) -> Result<(), String> {
+    let max_dirs = crate::constants::MAX_PROFILE_SEARCH_DIRS;
+    if add.len() > max_dirs || remove.len() > max_dirs {
+        return Err(format!(
+            "at most {max_dirs} profile search directories can be added or removed at once"
+        ));
+    }
+    let max_bytes = crate::constants::MAX_PROFILE_SEARCH_DIR_BYTES;
     for d in add.iter().chain(remove.iter()) {
+        if d.len() > max_bytes {
+            return Err(format!(
+                "search dir path is {} bytes; the limit is {max_bytes}",
+                d.len()
+            ));
+        }
         if !d.starts_with('/') {
             return Err(format!("search dir must be absolute: {d}"));
         }
@@ -62,16 +75,58 @@ pub(crate) fn validate_search_dir_edit(add: &[String], remove: &[String]) -> Res
             ));
         }
     }
-    if remove
-        .iter()
-        .any(|d| d == crate::config::SYSTEM_PROFILE_DIR)
-    {
-        return Err(format!(
-            "the system profile directory cannot be removed: {}",
-            crate::config::SYSTEM_PROFILE_DIR
-        ));
+    if remove.iter().any(|d| is_system_dir(d)) {
+        return Err(system_dir_protected());
     }
     Ok(())
+}
+
+/// The comparison key of a search-dir entry: its lexical normal form, so
+/// `/home/u/./p`, `/home/u//p` and `/home/u/p/` are one directory (FFA-c).
+fn dir_key(dir: &str) -> std::path::PathBuf {
+    crate::profile_store::normalize_lexically(std::path::Path::new(dir))
+}
+
+fn is_system_dir(dir: &str) -> bool {
+    dir_key(dir) == std::path::Path::new(crate::config::SYSTEM_PROFILE_DIR)
+}
+
+fn system_dir_protected() -> String {
+    format!(
+        "the system profile directory cannot be removed: {}",
+        crate::config::SYSTEM_PROFILE_DIR
+    )
+}
+
+/// Refuse an edit that leaves a non-root caller more than
+/// [`MAX_PROFILE_SEARCH_DIRS_PER_USER`](crate::constants::MAX_PROFILE_SEARCH_DIRS_PER_USER)
+/// entries inside its home and grows that number (FFA-c): without a share, one
+/// user could fill the global cap and lock every other user out of registering
+/// theirs, with no way to remove the entries. Root is unconfined and has no
+/// share. Lexical: the entries are compared as stored.
+pub(crate) fn within_user_share(
+    current: &[String],
+    merged: Vec<String>,
+    who: &super::path_confine::Confinement,
+) -> Result<Vec<String>, String> {
+    use super::path_confine::Confinement;
+    if matches!(who, Confinement::Unconfined) {
+        return Ok(merged);
+    }
+    let mine = |dirs: &[String]| {
+        dirs.iter()
+            .filter(|d| who.permits(std::path::Path::new(d)))
+            .count()
+    };
+    let max = crate::constants::MAX_PROFILE_SEARCH_DIRS_PER_USER;
+    let now = mine(&merged);
+    if now > max && now > mine(current) {
+        return Err(format!(
+            "at most {max} profile search directories inside your home can be registered; \
+             remove one first"
+        ));
+    }
+    Ok(merged)
 }
 
 /// Apply one edit to the search-dir list: removals first, then additions.
@@ -105,21 +160,45 @@ pub(crate) fn validate_search_dir_edit(add: &[String], remove: &[String]) -> Res
 /// with a test that blessed exactly that request (`is_ok()`, no order assertion)
 /// and a comment claiming "a future reordering cannot slip past" — it did, and a
 /// contract review found it. Assert what `store_dir()` actually reads.
+///
+/// **Compared by lexical normal form, capped (FFA-c).** Every spelling of one
+/// directory (`/./`, `//`, a trailing `/`) is one entry, so spelling variants no
+/// longer each add an entry; the handler also passes additions as their real
+/// path and removals with their real-path spelling. An edit that would leave
+/// more than [`MAX_PROFILE_SEARCH_DIRS`](crate::constants::MAX_PROFILE_SEARCH_DIRS)
+/// entries and grows the list is refused. Without the cap, repeated adds could
+/// grow `runtime.toml` past its read cap, and boot would fall back to defaults.
+/// A list already over the cap can still be shrunk.
 pub(crate) fn merge_search_dirs(
     current: &[String],
     add: &[String],
     remove: &[String],
     store_dir: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    let mut merged: Vec<String> = current
-        .iter()
-        .filter(|d| !remove.contains(d))
-        .cloned()
-        .collect();
-    for d in add {
-        if !merged.contains(d) {
-            merged.push(d.clone());
+    let removed: Vec<std::path::PathBuf> = remove.iter().map(|d| dir_key(d)).collect();
+    let mut merged: Vec<String> = Vec::with_capacity(current.len() + add.len());
+    for d in current {
+        if removed.contains(&dir_key(d)) {
+            // A removal can reach the system dir through a spelling of it the
+            // shape check could not see (a real-path spelling of a symlink).
+            if is_system_dir(d) {
+                return Err(system_dir_protected());
+            }
+            continue;
         }
+        merged.push(d.clone());
+    }
+    for d in add {
+        let key = dir_key(d);
+        if !merged.iter().any(|m| dir_key(m) == key) {
+            merged.push(key.display().to_string());
+        }
+    }
+    let max_dirs = crate::constants::MAX_PROFILE_SEARCH_DIRS;
+    if merged.len() > max_dirs && merged.len() > current.len() {
+        return Err(format!(
+            "at most {max_dirs} profile search directories can be registered; remove one first"
+        ));
     }
     if merged.is_empty() {
         return Err(
@@ -187,39 +266,89 @@ pub async fn update_profile_search_dirs_handler(
         return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg));
     }
 
-    // Multi-user confinement (DEC-205): a non-root client may only add search
-    // directories that exist within its own home directory. Root/CLI callers
-    // are exempt. The peer uid comes from SO_PEERCRED via the connect-info
-    // layer; an unresolvable uid/home fails closed.
-    if let Err(msg) = super::path_confine::confine_added_dirs(
-        &add,
-        peer.uid,
-        super::path_confine::home_dir_for_uid,
-    ) {
-        return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg));
-    }
-    // Removal is confined the same way — otherwise any local user could prune
-    // another user's search dir and quietly stop their profiles resolving — but
-    // by a predicate that does NOT require the directory to still exist. See
-    // `confine_removed_dirs`.
-    if let Err(msg) = super::path_confine::confine_removed_dirs(
-        &remove,
-        peer.uid,
-        super::path_confine::home_dir_for_uid,
-    ) {
-        return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg));
-    }
+    // Confinement and the real-path lookups touch directories the caller chose,
+    // which can sit on a mount that stops answering: off the async workers,
+    // bounded, in their own pool and one at a time per uid (FFA-b).
+    use super::path_confine::{confine_adds, confine_removals, Confinement};
+    let peer_uid = peer.uid;
+    const ROUTE: &str = "POST /config/profile-search-dirs";
 
-    // NOTE (DEC-205 residual, security review F1): confinement above validates the
-    // *canonical* dir at add-time, but we store the raw path (below) and
-    // `activate_profile_handler` re-canonicalizes stored search dirs at use-time.
-    // A caller who later swaps an approved in-home dir for a symlink out of their
-    // home can thus redirect it. Accepted as a bounded residual: activation
-    // validates the profile schema and never returns file contents, and any fan
-    // output is clamped by the safety floors — the caller gains nothing they
-    // cannot already do inside their own home. Fully closing it needs use-time
-    // peer-uid confinement of activation (a change to the pre-existing activation
-    // path), deferred as out of Wave-2 scope.
+    // Multi-user confinement (DEC-205): a non-root client may only add search
+    // directories that exist within its own home directory, and remove ones
+    // there. Root/CLI callers are exempt. The peer uid comes from SO_PEERCRED via
+    // the connect-info layer; an unresolvable uid/home fails closed.
+    //
+    // FFA-a/FFA-c: each addition is resolved ONCE, and that real path is both
+    // what is confined and what is stored. The profile reader requires an entry
+    // to still be its real path when read, which closes the DEC-205 residual this
+    // note used to accept: an approved in-home dir later swapped for a symlink out
+    // of the home is refused, not followed. That mattered because `GET
+    // /profiles/{id}` returns file contents. Root, with nothing to add, needs no
+    // filesystem access here at all, so it can always remove a directory that
+    // has stopped answering.
+    let (who, add) = if peer_uid == Some(0) && add.is_empty() {
+        (Confinement::Unconfined, Vec::new())
+    } else {
+        let resolved = super::resolve_io(peer_uid, move || {
+            let who = Confinement::of(peer_uid, super::path_confine::home_dir_for_uid)?;
+            let add = confine_adds(&add, &who)?;
+            Ok::<_, String>((who, add))
+        })
+        .await;
+        match resolved {
+            Ok(Ok(resolved)) => resolved,
+            Ok(Err(msg)) => {
+                return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg));
+            }
+            Err(e) => return super::profile_io_error_response(ROUTE, e),
+        }
+    };
+
+    // A removal also matches an entry stored by its real path, and may be
+    // confined by it (an entry an older daemon stored through a symlink). Looked
+    // up only for a removal whose spelling matches no current entry or is not
+    // the caller's as sent, and best-effort: if the lookup does not finish (the
+    // directory stopped answering — the case a user most needs to remove), the
+    // removal matches as sent.
+    let current_keys: Vec<std::path::PathBuf> = state
+        .profile_search_dirs
+        .read()
+        .iter()
+        .map(|d| crate::profile_store::normalize_lexically(d))
+        .collect();
+    let unmatched: Vec<String> = remove
+        .iter()
+        .filter(|r| !current_keys.contains(&dir_key(r)) || !who.permits(std::path::Path::new(r)))
+        .cloned()
+        .collect();
+    let real_paths: std::collections::HashMap<String, std::path::PathBuf> = if unmatched.is_empty()
+    {
+        std::collections::HashMap::new()
+    } else {
+        let looked_up = super::resolve_io(peer_uid, move || {
+            unmatched
+                .into_iter()
+                .filter_map(|d| {
+                    let real =
+                        super::path_confine::resolve_client_path(std::path::Path::new(&d)).ok()?;
+                    Some((d, real))
+                })
+                .collect()
+        })
+        .await;
+        looked_up.unwrap_or_else(|e| {
+            log::warn!(
+                "{ROUTE}: the real paths of removals were not found ({e:?}); matching them as sent"
+            );
+            std::collections::HashMap::new()
+        })
+    };
+    let remove = match confine_removals(&remove, &who, |d| real_paths.get(d).cloned()) {
+        Ok(spellings) => spellings,
+        Err(msg) => {
+            return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg));
+        }
+    };
 
     // Persist first. On failure, leave in-memory state alone and return 503
     // so the caller sees a durable, actionable error rather than a silent
@@ -245,7 +374,9 @@ pub async fn update_profile_search_dirs_handler(
     // `profile.rs::store_dir()` reads it, so the two cannot disagree about which
     // directory profile writes land in.
     let store = current.first().cloned();
-    let merged = match merge_search_dirs(&current, &add, &remove, store.as_deref()) {
+    let merged = match merge_search_dirs(&current, &add, &remove, store.as_deref())
+        .and_then(|merged| within_user_share(&current, merged, &who))
+    {
         Ok(m) => m,
         Err(msg) => {
             return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg));
@@ -1988,5 +2119,144 @@ mod tests {
         let current = v(&["/a", "/b", "/c", "/d"]);
         let out = merge_search_dirs(&current, &[], &v(&["/c"]), None).unwrap();
         assert_eq!(out, v(&["/a", "/b", "/d"]));
+    }
+
+    // ── FFA-c: spelling variants and bounds ───────────────────────────
+
+    #[test]
+    fn spelling_variants_of_one_dir_are_one_entry() {
+        // Each of these passed the `..` check and confinement and used to be
+        // stored as a new raw entry, so repeated adds grew `runtime.toml`.
+        let current = v(&["/etc/control-ofc/profiles", "/home/u/p"]);
+        for variant in ["/home/u/./p", "/home/u//p", "/home/u/p/", "//home/u/p"] {
+            let out = merge_search_dirs(&current, &v(&[variant]), &[], None).unwrap();
+            assert_eq!(out, current, "{variant} must be a duplicate");
+            let out = merge_search_dirs(&current, &[], &v(&[variant]), None).unwrap();
+            assert_eq!(
+                out,
+                v(&["/etc/control-ofc/profiles"]),
+                "{variant} must remove it"
+            );
+        }
+        // A new directory is stored in its normal form.
+        let out = merge_search_dirs(&current, &v(&["/home/u/./q/"]), &[], None).unwrap();
+        assert_eq!(out.last().map(String::as_str), Some("/home/u/q"));
+    }
+
+    #[test]
+    fn an_add_past_the_cap_is_refused() {
+        let max = crate::constants::MAX_PROFILE_SEARCH_DIRS;
+        let full: Vec<String> = (0..max).map(|i| format!("/d{i}")).collect();
+        let msg = merge_search_dirs(&full, &v(&["/one-more"]), &[], None)
+            .expect_err("an add past the cap must be refused");
+        assert!(
+            msg.contains(&max.to_string()),
+            "the message names the cap: {msg}"
+        );
+        // One below the cap still takes an add, so the bound is exactly the cap.
+        assert!(merge_search_dirs(&full[1..], &v(&["/one-more"]), &[], None).is_ok());
+        // A move at the cap does not grow the list and is accepted.
+        let moved = merge_search_dirs(&full, &v(&["/one-more"]), &v(&["/d3"]), None).unwrap();
+        assert_eq!(moved.len(), max);
+    }
+
+    #[test]
+    fn a_list_already_over_the_cap_can_still_shrink() {
+        // A runtime.toml written before the cap may hold more; it must stay
+        // editable downwards.
+        let max = crate::constants::MAX_PROFILE_SEARCH_DIRS;
+        let over: Vec<String> = (0..max + 5).map(|i| format!("/d{i}")).collect();
+        let out = merge_search_dirs(&over, &[], &v(&["/d0"]), None).unwrap();
+        assert_eq!(out.len(), max + 4);
+        assert!(merge_search_dirs(&over, &v(&["/new"]), &[], None).is_err());
+    }
+
+    #[test]
+    fn an_overlong_path_or_request_is_refused() {
+        let max_bytes = crate::constants::MAX_PROFILE_SEARCH_DIR_BYTES;
+        let at_cap = format!("/{}", "a".repeat(max_bytes - 1));
+        let over_cap = format!("/{}", "a".repeat(max_bytes));
+        assert!(validate_search_dir_edit(&[at_cap], &[]).is_ok());
+        assert!(validate_search_dir_edit(std::slice::from_ref(&over_cap), &[]).is_err());
+        assert!(validate_search_dir_edit(&[], &[over_cap]).is_err());
+
+        let max = crate::constants::MAX_PROFILE_SEARCH_DIRS;
+        let many: Vec<String> = (0..=max).map(|i| format!("/d{i}")).collect();
+        assert!(validate_search_dir_edit(&many, &[]).is_err());
+        assert!(validate_search_dir_edit(&many[1..], &[]).is_ok());
+    }
+
+    #[test]
+    fn the_system_dir_cannot_be_removed_by_another_spelling() {
+        let respelled = format!("{SYSTEM_PROFILE_DIR}/");
+        assert!(validate_search_dir_edit(&[], &v(&[&respelled])).is_err());
+        // The merge refuses too: the handler adds a removal's real-path
+        // spelling, which the shape check never sees.
+        let current = v(&["/store", SYSTEM_PROFILE_DIR, "/home/u/p"]);
+        let msg = merge_search_dirs(&current, &[], &v(&[SYSTEM_PROFILE_DIR]), Some("/store"))
+            .expect_err("the system dir must stay");
+        assert!(msg.contains(SYSTEM_PROFILE_DIR), "{msg}");
+    }
+
+    #[test]
+    fn one_user_cannot_take_more_than_its_share_of_the_search_path() {
+        // Security review S3: without a share one user could fill the global cap
+        // and lock every other user out, with no way to remove the entries.
+        use super::super::path_confine::Confinement;
+        let max = crate::constants::MAX_PROFILE_SEARCH_DIRS_PER_USER;
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().to_path_buf();
+        let who = Confinement::of(Some(1000), |_| Some(home_path.clone())).unwrap();
+        let mine = |n: usize| -> Vec<String> {
+            (0..n)
+                .map(|i| home.path().join(format!("d{i}")).display().to_string())
+                .collect()
+        };
+        let current = [v(&["/store", SYSTEM_PROFILE_DIR]), mine(max)].concat();
+
+        let grown = [current.clone(), mine(max + 1)[max..].to_vec()].concat();
+        let msg = within_user_share(&current, grown.clone(), &who)
+            .expect_err("a share past the cap must be refused");
+        assert!(msg.contains(&max.to_string()), "{msg}");
+        // Exactly the share is accepted.
+        let at_share = [v(&["/store"]), mine(max)].concat();
+        assert!(within_user_share(&current, at_share, &who).is_ok());
+        // Entries outside the caller's home are not its share.
+        let others = [current.clone(), v(&["/home/someone-else/p"])].concat();
+        assert!(within_user_share(&current, others, &who).is_ok());
+        // A list already over the share can shrink.
+        let over = [v(&["/store"]), mine(max + 2)].concat();
+        let shrunk = [v(&["/store"]), mine(max + 1)].concat();
+        assert!(within_user_share(&over, shrunk, &who).is_ok());
+        // Root has no share.
+        assert!(within_user_share(&current, grown, &Confinement::Unconfined).is_ok());
+    }
+
+    #[test]
+    fn a_full_search_dir_list_fits_well_inside_the_runtime_config_read_cap() {
+        // The realised artefact: the cap exists so `runtime.toml` stays
+        // readable, so measure the file the daemon writes at the cap, with
+        // every path at the length cap.
+        let max = crate::constants::MAX_PROFILE_SEARCH_DIRS;
+        let max_bytes = crate::constants::MAX_PROFILE_SEARCH_DIR_BYTES;
+        let dirs: Vec<String> = (0..max)
+            .map(|i| format!("/{i:02}{}", "a".repeat(max_bytes - 3)))
+            .collect();
+        assert!(dirs.iter().all(|d| d.len() == max_bytes));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("runtime.toml");
+        let mut runtime = RuntimeConfig::default();
+        runtime.set_profile_search_dirs(dirs.clone());
+        runtime.save_to(&path).unwrap();
+
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            on_disk <= crate::atomic_io::MAX_CONFIG_BYTES / 8,
+            "{on_disk} bytes on disk"
+        );
+        let (loaded, degraded) =
+            RuntimeConfig::load_from_reporting(&path, crate::runtime_config::LoadPhase::Startup);
+        assert!(degraded.is_none());
+        assert_eq!(loaded.profile_search_dirs(), Some(&dirs[..]));
     }
 }

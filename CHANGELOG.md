@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### Security
+
+- **A profile search directory can no longer be used to read other files.** Any local user can register a
+  directory in their own home, and `GET /profiles/{id}` returns the file it finds there. A symlink named
+  `x.json` made it return any JSON file root could read; so did replacing the registered directory with
+  a symlink after adding it. Profile reads now refuse a file that is a symlink, a FIFO or anything else but
+  a regular file, or whose owner is not its directory's owner, and skip a directory whose real path is not
+  the path registered. Activation by `profile_path` takes only a file directly inside a search directory,
+  and the saved profile, and a `--profile`/`OPENFAN_PROFILE` name, are read the same way at start-up
+  (FFA-a, audit F-1).
+
+### Fixed
+
+- **A FIFO in a profile directory no longer stalls the daemon.** Profile reads blocked on a FIFO named like
+  a profile, on the threads the fan engine runs on; a few `GET /profiles` calls (the GUI and the tray both
+  make them) stopped the engine until the watchdog killed the daemon, and a FIFO at the saved profile's path
+  hung every start. Opens no longer block on one, and every profile read runs off those threads and answers
+  within 2 s — a retryable `500 internal_error` past that. A user's directory that stops answering (a hung
+  FUSE or network mount) costs one request and is then skipped until its read returns, so it parks one
+  thread, not one per request; root's directories are never skipped, so a busy store cannot let a user's
+  same-id file stand in for a stored profile. A listing stops in time however slow the directories are. Paths
+  a client names are resolved in a pool of their own, one at a time per user. At start-up every profile
+  source is found and read on a bounded thread, so a profile in a hung directory no longer holds start-up
+  until systemd kills it (FFA-b, audit F-2).
+- **The profile search-dir list is bounded.** Additions are stored by their real path, spellings of one
+  directory (`/./`, `//`, a trailing `/`) are one entry, and the list holds at most 32 paths of at most
+  4096 bytes, at most 4 of them inside one user's home. Before, spelling variants each added an entry, and
+  enough of them could grow `runtime.toml` past its read cap, after which boot fell back to defaults and lost header roles, cooling devices, the
+  coolant limit and the exit floor (FFA-c, audit F-3). An entry an older daemon stored through a symlink is
+  skipped until it is added again; the GUI re-adds its own folder on every connect.
+- **The profile store is bounded and its edits are serialised.** Profiles are stored compact; one whose
+  stored form would exceed 4 MiB is refused, as is a new id once 256 are stored and a write that would leave
+  the store over 64 MiB in all. Concurrent creates of one
+  id no longer both succeed, a delete can no longer land between an activation's read and its swap, and a
+  delete is now fsynced (FFA-j, audit F-16, F-20).
+
 ## [4.0.0] — 2026-10-04
 
 Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor. GUI 4.0.0 adds **Update OpenFAN

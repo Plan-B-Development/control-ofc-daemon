@@ -9,6 +9,7 @@ pub mod daemon_state;
 pub mod error;
 pub mod health;
 pub mod hwmon;
+pub mod io_gate;
 pub mod openfan_maintenance;
 pub mod polling;
 pub mod profile;

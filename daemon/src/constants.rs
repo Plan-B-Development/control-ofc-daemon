@@ -1511,3 +1511,91 @@ const _: () = assert!(DIAGNOSTIC_WRITE_BUDGET.as_secs() < STABILITY_RENEW_INTERV
 // `STABILITY_RENEW_INTERVAL_S * 2 <= VERIFY_PAUSE_DEADMAN` is asserted above.
 // The 20 % baseline hold is one settle window, bounded like every other.
 const _: () = assert!(CHARACTERIZATION_SETTLE_MAX_S * 2 <= VERIFY_PAUSE_DEADMAN.as_secs());
+
+// ─────────────────────── Profile store and search dirs ───────────────────────
+
+/// [SAFETY] The longest a profile read on the request path may take before the
+/// request is answered with a retryable `500 internal_error` (FFA-b). Listing,
+/// fetching and activating read files from user-registered search directories,
+/// and a directory on a FUSE or network mount can stop answering. Those reads
+/// run on the blocking pool, never on the tokio workers the engine ticks on, and
+/// this bounds how long a request waits for one. A healthy read of a local
+/// profile takes microseconds.
+pub const PROFILE_IO_BUDGET: Duration = Duration::from_secs(2);
+
+/// [SAFETY] How many reads of registered profile directories may be outstanding
+/// at once (FFA-b). `spawn_blocking` cannot be cancelled, so a read that
+/// outlives [`PROFILE_IO_BUDGET`] keeps its pool thread until the filesystem
+/// answers, and the engine's bounded writes share that pool. One read per
+/// directory at most is ever left hung ([`PROFILE_DIR_HUNG_AFTER`]), so sized to
+/// the directory cap plus room for healthy requests: hung directories alone
+/// cannot hold every slot. Past the bound a request waits for a slot within the
+/// budget, parking no thread, and is then refused.
+pub const PROFILE_IO_MAX_OUTSTANDING: usize = MAX_PROFILE_SEARCH_DIRS + 4;
+
+/// [SAFETY] How many resolutions of client-supplied paths may be outstanding at
+/// once (FFA-b): confining a search-dir edit, and an activation path whose
+/// directory is not a registered entry as written. A separate pool from the
+/// reads, so a hung path a client names cannot take the slots registered
+/// directories are read with. Each uid has at most one outstanding, and a uid's
+/// second request is refused before it takes a slot, so only distinct users can
+/// fill it.
+pub const PATH_RESOLVE_MAX_OUTSTANDING: usize = 4;
+
+/// [SAFETY] How long one operation may hold a profile directory before a later
+/// reader treats it as hung and skips it rather than parking another thread
+/// behind it (FFA-b, `io_gate`). Under the walk's deadline, so a request that
+/// meets a hung directory still answers in time.
+pub const PROFILE_DIR_HUNG_AFTER: Duration = Duration::from_secs(1);
+
+/// [SAFETY] How long before [`PROFILE_IO_BUDGET`] runs out a walk of the search
+/// directories stops starting new reads (FFA-b), so what it found is answered
+/// in time and an abandoned walk does not go on reading. A single read slower
+/// than this still runs the request past its budget, and it answers a retryable
+/// `500`.
+pub const PROFILE_IO_REPLY_MARGIN: Duration = Duration::from_millis(500);
+
+/// The most `*.json` names read from one search directory per listing (FFA-c),
+/// so a directory one user fills with files cannot make every caller's
+/// `GET /profiles` read without end. The store holds no more than this.
+pub const MAX_PROFILES_LISTED_PER_DIR: usize = MAX_STORED_PROFILES;
+
+/// The most profile search directories the daemon keeps (FFA-c). The default
+/// list has three entries and each GUI user adds one. Without a bound, repeated
+/// adds could grow `runtime.toml` past the read cap, and boot would then fall
+/// back to defaults and lose the header roles, cooling devices, coolant limit
+/// and exit floor stored beside the list.
+pub const MAX_PROFILE_SEARCH_DIRS: usize = 32;
+
+/// The most profile search directories one non-root user may have registered
+/// inside their home (FFA-c). The GUI registers one. Without a share, one user
+/// could fill [`MAX_PROFILE_SEARCH_DIRS`] and lock every other user out of
+/// registering theirs, with no way to remove the entries (removal is confined to
+/// the caller's home).
+pub const MAX_PROFILE_SEARCH_DIRS_PER_USER: usize = 4;
+
+/// The longest profile search directory path accepted, in bytes (FFA-c):
+/// Linux's `PATH_MAX`.
+pub const MAX_PROFILE_SEARCH_DIR_BYTES: usize = 4096;
+
+/// The most profiles the daemon's own store holds (FFA-j). Creating a new id
+/// past this is refused; replacing an existing one is not.
+pub const MAX_STORED_PROFILES: usize = 256;
+
+/// The most bytes the daemon's own store holds in all (FFA-j). Any local user
+/// can write the store, and every listing reads it: without this, 256 profiles
+/// at the read cap made each `GET /profiles` read a gigabyte, holding the store
+/// past the budget for every caller. A profile is a few kilobytes.
+pub const MAX_STORE_BYTES: u64 = 64 * 1024 * 1024;
+
+const _: () = assert!(
+    PROFILE_DIR_HUNG_AFTER.as_millis()
+        < PROFILE_IO_BUDGET.as_millis() - PROFILE_IO_REPLY_MARGIN.as_millis()
+);
+const _: () = assert!(MAX_PROFILE_SEARCH_DIRS_PER_USER < MAX_PROFILE_SEARCH_DIRS);
+// A full search-dir list must stay far inside the runtime config's read cap,
+// or the bound above would not protect the keys stored beside it.
+const _: () = assert!(
+    (MAX_PROFILE_SEARCH_DIRS * MAX_PROFILE_SEARCH_DIR_BYTES) as u64
+        <= crate::atomic_io::MAX_CONFIG_BYTES / 8
+);

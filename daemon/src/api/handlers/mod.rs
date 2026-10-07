@@ -1226,6 +1226,184 @@ where
     }
 }
 
+/// Run `fut` holding the profile store lock (FFA-j), in a task of its own.
+///
+/// The task is what makes the critical section whole: axum drops a handler's
+/// future when its client disconnects, and a lock held by that future would be
+/// released mid-step — after a swap but before its persist, or while a
+/// `spawn_blocking` write still runs — letting the next holder interleave. A
+/// spawned task runs to the end whatever happens to the request. `Err` only if
+/// the task panicked.
+pub(crate) async fn under_store_lock<T, F>(fut: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(async move {
+        let _store = crate::profile_store::STORE_LOCK.lock().await;
+        fut.await
+    })
+    .await
+    .map_err(|e| format!("store task failed: {e}"))
+}
+
+/// Why a [`bounded_profile_io`] call produced no answer.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProfileIoError {
+    /// [`PROFILE_IO_MAX_OUTSTANDING`](crate::constants::PROFILE_IO_MAX_OUTSTANDING)
+    /// reads stayed outstanding for the whole budget; nothing was started.
+    Busy,
+    /// The read did not finish within the budget. It may still be running.
+    TimedOut,
+    /// The read panicked.
+    Failed(String),
+}
+
+/// [SAFETY] Run a profile-directory read off the async workers, bounded in time
+/// and in how many may be outstanding (FFA-b).
+///
+/// A profile read touches directories any local user can register, and those
+/// can sit on a FUSE or network mount that stops answering. Run on a tokio
+/// worker, such a read parked the worker, and a few concurrent requests parked
+/// every worker the 1 Hz engine (and so the thermal decision) ticks on, until
+/// the watchdog killed the daemon. Here the read runs on the blocking pool, and
+/// the request waits at most `budget` in all: for a free slot, then for the
+/// read. Because `spawn_blocking` cannot be cancelled, the slot stays with the
+/// read until it really ends, so at most `slots` threads can ever be parked by
+/// hung reads. A request that finds every slot held by such reads for its whole
+/// budget is refused without starting one. Waiting for a slot parks no thread;
+/// a burst of healthy reads just queues for microseconds.
+///
+/// The slots are a parameter so a test can use its own.
+pub(crate) async fn bounded_profile_io<T, F>(
+    slots: &'static tokio::sync::Semaphore,
+    budget: std::time::Duration,
+    f: F,
+) -> Result<T, ProfileIoError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    let permit = match tokio::time::timeout_at(deadline, slots.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        // Elapsed, or closed (these semaphores never are).
+        _ => return Err(ProfileIoError::Busy),
+    };
+    let join = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    });
+    match tokio::time::timeout_at(deadline, join).await {
+        Err(_elapsed) => Err(ProfileIoError::TimedOut),
+        Ok(Err(join_error)) => Err(ProfileIoError::Failed(join_error.to_string())),
+        Ok(Ok(value)) => Ok(value),
+    }
+}
+
+/// The slots reads of registered profile directories share. `profile_store`
+/// leaves at most one read per directory hung, so hung directories alone cannot
+/// hold them all.
+pub(crate) static PROFILE_IO_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(crate::constants::PROFILE_IO_MAX_OUTSTANDING);
+
+/// The slots resolutions of client-supplied paths share: a pool of their own,
+/// so paths a client names cannot take the slots registered directories are
+/// read with.
+static PATH_RESOLVE_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(crate::constants::PATH_RESOLVE_MAX_OUTSTANDING);
+
+/// One outstanding path resolution per uid, so one user's hung or slow mount
+/// parks one thread and refuses only that user's later edits, not everyone's.
+static RESOLVING_USERS: crate::io_gate::Gate<u32> = crate::io_gate::Gate::new();
+
+/// Read registered profile directories: [`bounded_profile_io`] over
+/// [`PROFILE_IO_SLOTS`] and
+/// [`PROFILE_IO_BUDGET`](crate::constants::PROFILE_IO_BUDGET). `f` gets the
+/// instant its walk must stop starting reads, a
+/// [`PROFILE_IO_REPLY_MARGIN`](crate::constants::PROFILE_IO_REPLY_MARGIN)
+/// before the budget runs out.
+pub(crate) async fn profile_io<T, F>(f: F) -> Result<T, ProfileIoError>
+where
+    F: FnOnce(std::time::Instant) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    use crate::constants::{PROFILE_IO_BUDGET, PROFILE_IO_REPLY_MARGIN};
+    let stop_at = std::time::Instant::now() + PROFILE_IO_BUDGET - PROFILE_IO_REPLY_MARGIN;
+    bounded_profile_io(&PROFILE_IO_SLOTS, PROFILE_IO_BUDGET, move || f(stop_at)).await
+}
+
+/// Resolve paths a client named, for the client `peer_uid`: bounded as
+/// [`profile_io`], in its own pool, and one at a time per uid.
+///
+/// The uid is claimed before a slot is taken, and a request waits for its
+/// uid's earlier resolution here, on the async side, holding neither a slot nor
+/// a thread: so one user, however many requests it sends and however slow its
+/// mount, holds at most one slot (concurrency review of FFA-b). A uid whose
+/// resolution has been outstanding for
+/// [`PROFILE_DIR_HUNG_AFTER`](crate::constants::PROFILE_DIR_HUNG_AFTER) is
+/// refused as [`ProfileIoError::Busy`] at once.
+pub(crate) async fn resolve_io<T, F>(peer_uid: Option<u32>, f: F) -> Result<T, ProfileIoError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    use crate::constants::{PROFILE_DIR_HUNG_AFTER, PROFILE_IO_BUDGET};
+    /// How often a request looks again for its uid's turn.
+    const RECHECK: std::time::Duration = std::time::Duration::from_millis(10);
+    let key = peer_uid.unwrap_or(u32::MAX);
+    let deadline = std::time::Instant::now() + PROFILE_IO_BUDGET;
+    let claim = loop {
+        if let Some(claim) = RESOLVING_USERS.try_claim(key) {
+            break claim;
+        }
+        let hung = RESOLVING_USERS
+            .held_for(&key)
+            .is_some_and(|age| age >= PROFILE_DIR_HUNG_AFTER);
+        if hung || std::time::Instant::now() + RECHECK >= deadline {
+            return Err(ProfileIoError::Busy);
+        }
+        tokio::time::sleep(RECHECK).await;
+    };
+    // The claim goes with the work, so it is held until the resolution really
+    // ends, not just until this request gives up on it.
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    bounded_profile_io(&PATH_RESOLVE_SLOTS, left, move || {
+        let _claim = claim;
+        f()
+    })
+    .await
+}
+
+/// The answer to a [`ProfileIoError`]: a retryable `500 internal_error`. The
+/// detail goes to the log, never the envelope (DEC-173).
+pub(crate) fn profile_io_error_response(
+    what: &str,
+    error: ProfileIoError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let message = match error {
+        ProfileIoError::Busy => {
+            log::warn!("{what}: refused, earlier profile reads have still not finished");
+            "profile storage is busy with reads that have not finished; try again"
+        }
+        ProfileIoError::TimedOut => {
+            log::warn!(
+                "{what}: a profile read did not finish within {} s",
+                crate::constants::PROFILE_IO_BUDGET.as_secs()
+            );
+            "profile storage did not respond in time; try again"
+        }
+        ProfileIoError::Failed(detail) => {
+            log::error!("{what}: the profile read failed: {detail}");
+            "profile storage failed; try again"
+        }
+    };
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &ErrorEnvelope::internal(message),
+    )
+}
+
 /// `status.openfan_link`, `status.openfan_maintenance` (DEC-481) and
 /// `status.openfan_silent_board` (DEC-484), read under the same guard as the
 /// health entry they explain.
@@ -2239,5 +2417,68 @@ mod persist_tests {
     async fn a_successful_persistence_task_passes_its_value_through() {
         let result = persist_off_runtime(|| Ok::<u8, String>(7)).await;
         assert_eq!(result, Ok(7));
+    }
+}
+
+#[cfg(test)]
+mod profile_io_tests {
+    use super::{bounded_profile_io, ProfileIoError};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn a_hung_read_is_abandoned_and_keeps_its_slot_until_it_ends() {
+        // FFA-b. A read that never returns (a hung FUSE mount) must answer the
+        // request at the budget, and must keep its slot while its thread is
+        // still parked, so repeated requests cannot park more threads than the
+        // slots allow.
+        static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let budget = Duration::from_millis(100);
+        let (release, wedge) = std::sync::mpsc::channel::<()>();
+
+        let started = Instant::now();
+        let first = bounded_profile_io(&SLOTS, budget, move || {
+            // Self-releasing, so a failed assertion cannot leave the runtime
+            // waiting on this thread for ever.
+            let _ = wedge.recv_timeout(Duration::from_secs(10));
+        })
+        .await;
+        assert_eq!(first, Err(ProfileIoError::TimedOut));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the request waited {:?}, not the budget",
+            started.elapsed()
+        );
+
+        // The hung read still holds the only slot: refused at the budget, and
+        // never started.
+        let ran = Arc::new(AtomicBool::new(false));
+        let second = bounded_profile_io(&SLOTS, budget, {
+            let ran = Arc::clone(&ran);
+            move || ran.store(true, Ordering::SeqCst)
+        })
+        .await;
+        assert_eq!(second, Err(ProfileIoError::Busy));
+        assert!(!ran.load(Ordering::SeqCst), "a refused read must not start");
+
+        // Once the read really ends, its slot comes back.
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while SLOTS.available_permits() == 0 {
+            assert!(Instant::now() < deadline, "the slot was never returned");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(bounded_profile_io(&SLOTS, budget, || 7).await, Ok(7));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_read_is_an_error_and_returns_its_slot() {
+        static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let budget = Duration::from_secs(2);
+        let out: Result<(), _> =
+            bounded_profile_io(&SLOTS, budget, || panic!("simulated read panic")).await;
+        assert!(matches!(out, Err(ProfileIoError::Failed(_))), "{out:?}");
+        assert_eq!(SLOTS.available_permits(), 1);
     }
 }

@@ -359,14 +359,26 @@ pub fn canonicalize_profile_document(doc: &mut serde_json::Value) {
     }
 }
 
-/// Load a profile from a JSON file.
+/// Load a profile from a JSON file: the boot paths' loader.
+///
+/// The read refuses a FIFO or any other non-regular file without blocking
+/// (FFA-b): this runs before `READY=1`, so a FIFO planted at the saved profile's
+/// path used to hang every start. The API reads profiles through
+/// `profile_store`, which also confines them to their search directory, and
+/// parses them with [`parse_profile`].
 ///
 /// Hwmon ids are canonicalised on the way in (DEC-442,
 /// [`canonicalize_profile_document`]); the file itself is never rewritten.
 pub fn load_profile(path: &Path) -> Result<DaemonProfile, String> {
-    let content = crate::atomic_io::read_to_string_capped(path)
+    let content = crate::atomic_io::read_regular_file_capped(path)
         .map_err(|e| format!("failed to read profile '{}': {e}", path.display()))?;
-    let mut doc: serde_json::Value = serde_json::from_str(&content)
+    parse_profile(&content, path)
+}
+
+/// Parse and load-check a profile document read from `path`, which only names
+/// it in errors and the log. Applies the same nets as [`load_profile`].
+pub fn parse_profile(content: &str, path: &Path) -> Result<DaemonProfile, String> {
+    let mut doc: serde_json::Value = serde_json::from_str(content)
         .map_err(|e| format!("failed to parse profile '{}': {e}", path.display()))?;
     canonicalize_profile_document(&mut doc);
     let profile: DaemonProfile = serde_json::from_value(doc)

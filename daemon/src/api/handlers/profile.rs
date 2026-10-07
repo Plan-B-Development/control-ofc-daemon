@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 
@@ -46,57 +46,20 @@ pub async fn active_profile_handler(
 /// POST /profile/activate — switch the active profile at runtime.
 pub async fn activate_profile_handler(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<crate::api::server::UdsConnectInfo>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Accept either profile_id (search by name) or profile_path (direct file).
-    // profile_path is restricted to known search directories to prevent
-    // arbitrary filesystem reads (P1-R4 security hardening).
-    let profile_path = if let Some(path) = body.get("profile_path").and_then(|v| v.as_str()) {
-        let p = std::path::PathBuf::from(path);
-        let canonical = match p.canonicalize() {
-            Ok(c) => c,
-            Err(_) => {
-                return error_response(
-                    StatusCode::NOT_FOUND,
-                    &ErrorEnvelope::validation(format!("profile path not found: {path}")),
-                );
-            }
-        };
-        // Canonicalize both sides to prevent symlink-based path traversal (CWE-22).
-        // Skip search dirs that don't exist on disk (can't canonicalize).
-        // Snapshot the configured dirs so the read lock is released before the
-        // canonicalize() syscalls below — never hold it across filesystem I/O.
-        let search_dirs: Vec<std::path::PathBuf> = state.profile_search_dirs.read().clone();
-        let allowed: Vec<std::path::PathBuf> = search_dirs
-            .iter()
-            .filter_map(|d| d.canonicalize().ok())
-            .collect();
-        if allowed.is_empty() {
-            log::warn!(
-                "No profile search directories exist on disk: {:?}",
-                search_dirs
-            );
-        }
-        if !super::path_confine::path_is_within(&canonical, &allowed) {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                &ErrorEnvelope::validation(
-                    "profile_path must be within a profile search directory",
-                ),
-            );
-        }
-        canonical
+    // profile_path is restricted to the search directories, and every read goes
+    // through `profile_store`'s confined reader (P1-R4, FFA-a).
+    enum Request {
+        Path(std::path::PathBuf),
+        Id(String),
+    }
+    let request = if let Some(path) = body.get("profile_path").and_then(|v| v.as_str()) {
+        Request::Path(std::path::PathBuf::from(path))
     } else if let Some(id) = body.get("profile_id").and_then(|v| v.as_str()) {
-        let search_dirs = state.profile_search_dirs.read();
-        match crate::profile::find_profile(id, &search_dirs) {
-            Some(p) => p,
-            None => {
-                return error_response(
-                    StatusCode::NOT_FOUND,
-                    &ErrorEnvelope::validation(format!("profile '{id}' not found in search paths")),
-                );
-            }
-        }
+        Request::Id(id.to_string())
     } else {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -104,8 +67,94 @@ pub async fn activate_profile_handler(
         );
     };
 
+    // Snapshot the configured dirs so the read lock is released before any
+    // filesystem I/O — never hold it across that.
+    let search_dirs: Vec<std::path::PathBuf> = state.profile_search_dirs.read().clone();
+    use crate::profile_store::{locate_by_path, read_in_dir, PathReadError};
+    // FFA-b: every read runs off the async workers, bounded. A path names its
+    // directory as a registered entry, normally as written (the GUI's does); only
+    // when it does not is the directory resolved — a client-supplied path, so in
+    // the resolution pool, one at a time per uid.
+    let read = match request {
+        Request::Id(id) => {
+            let dirs = search_dirs;
+            let lookup = id.clone();
+            super::profile_io(move |stop_at| {
+                match crate::profile_store::read_by_id_until(&dirs, &lookup, stop_at) {
+                    Ok(Some(found)) => Ok(found),
+                    Ok(None) => Err(PathReadError::NotFound),
+                    Err(_) => Err(PathReadError::OutOfTime),
+                }
+            })
+            .await
+            .map(|found| found.map_err(|e| (id, e)))
+        }
+        Request::Path(path) => {
+            let named = path.display().to_string();
+            let located = match locate_by_path(&search_dirs, &path, None) {
+                Ok((dir, name)) => Ok((dir.to_path_buf(), name)),
+                Err(PathReadError::OutsideSearchDirs)
+                    if path.is_absolute() && path.parent().is_some() =>
+                {
+                    let parent = path.parent().map(std::path::Path::to_path_buf);
+                    let resolved = super::resolve_io(peer.uid, move || {
+                        parent.map(|p| super::path_confine::resolve_client_path(&p))
+                    })
+                    .await;
+                    match resolved {
+                        Ok(Some(Ok(real))) => locate_by_path(&search_dirs, &path, Some(&real))
+                            .map(|(dir, name)| (dir.to_path_buf(), name)),
+                        Ok(_) => Err(PathReadError::NotFound),
+                        Err(e) => return super::profile_io_error_response("profile activation", e),
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            match located {
+                Ok((dir, name)) => {
+                    super::profile_io(move |stop_at| read_in_dir(&dir, &name, stop_at))
+                        .await
+                        .map(|found| found.map_err(|e| (named, e)))
+                }
+                Err(e) => Ok(Err((named, e))),
+            }
+        }
+    };
+    let (profile_path, content) = match read {
+        Ok(Ok(found)) => found,
+        Ok(Err((named, error))) => {
+            return match error {
+                PathReadError::NotFound => error_response(
+                    StatusCode::NOT_FOUND,
+                    &ErrorEnvelope::validation(format!(
+                        "profile '{named}' not found in the profile search directories"
+                    )),
+                ),
+                PathReadError::OutsideSearchDirs => error_response(
+                    StatusCode::BAD_REQUEST,
+                    &ErrorEnvelope::validation(
+                        "profile_path must name a file directly inside a profile search directory",
+                    ),
+                ),
+                PathReadError::Unreadable(detail) => {
+                    // Path-bearing detail to the log only (DEC-173).
+                    log::error!("Profile for activation refused: {detail}");
+                    error_response(
+                        StatusCode::BAD_REQUEST,
+                        &ErrorEnvelope::validation("profile could not be read or parsed"),
+                    )
+                }
+                PathReadError::OutOfTime => super::profile_io_error_response(
+                    "profile activation",
+                    super::ProfileIoError::TimedOut,
+                ),
+            };
+        }
+        Err(e) => return super::profile_io_error_response("profile activation", e),
+    };
+
     // Load and validate
-    let profile = match crate::profile::load_profile(&profile_path) {
+    let profile = match crate::profile::parse_profile(&content, &profile_path) {
         Ok(p) => p,
         Err(e) => {
             // Path-bearing read/parse detail to the log only (DEC-173 —
@@ -137,6 +186,72 @@ pub async fn activate_profile_handler(
     // TS-af / DEC-394: the headers this profile names as pumps, computed from the
     // owned profile before the swap moves it — a pure read, no lock needed.
     let pump_ids = super::pump_header_ids(&profile);
+
+    // FFA-j: the swap and the persist run under the store lock, which a delete
+    // holds across its active check and unlink and a deactivation across its own
+    // swap and persist. The read above ran without it, so a hung search directory
+    // cannot hold the lock; instead a profile read from the store is checked to
+    // still exist under the lock, so a delete that won the race is not activated
+    // and left saved as the active profile with no file behind it.
+    let store = store_dir(&state).map(|d| crate::profile_store::normalize_lexically(&d));
+    let from_store = store.is_some() && profile_path.parent() == store.as_deref();
+    let state = Arc::clone(&state);
+    let id_for_log = profile_id.clone();
+    let committed = super::under_store_lock(async move {
+        if from_store {
+            let path = profile_path.clone();
+            let still_there = super::persist_off_runtime(move || Ok(path.exists()))
+                .await
+                .unwrap_or(false);
+            if !still_there {
+                return None;
+            }
+        }
+        commit_activation(&state, profile, pump_ids, profile_path).await;
+        Some(())
+    })
+    .await;
+    match committed {
+        Ok(Some(())) => {}
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                &ErrorEnvelope::validation(format!(
+                    "profile '{id_for_log}' was deleted while it was being activated"
+                )),
+            );
+        }
+        Err(e) => {
+            log::error!("Profile activation of '{id_for_log}' did not complete: {e}");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorEnvelope::internal("profile activation did not complete"),
+            );
+        }
+    }
+
+    log::info!("Profile activated: '{profile_name}' (id={profile_id})");
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "activated": true,
+            "profile_id": profile_id,
+            "profile_name": profile_name,
+        })),
+    )
+}
+
+/// Install `profile` as the active profile and persist the choice. Called under
+/// the store lock (FFA-j).
+async fn commit_activation(
+    state: &AppState,
+    profile: crate::profile::DaemonProfile,
+    pump_ids: HashSet<String>,
+    profile_path: std::path::PathBuf,
+) {
+    let profile_id = profile.id.clone();
 
     // Apply. Everything in this block runs under the `active_profile` lock so
     // the swap and the dependent state resets are observed atomically by the
@@ -200,7 +315,7 @@ pub async fn activate_profile_handler(
     // Persist
     let new_state = crate::daemon_state::DaemonState {
         version: 1,
-        active_profile_id: Some(profile_id.clone()),
+        active_profile_id: Some(profile_id),
         active_profile_path: Some(profile_path.display().to_string()),
     };
     // DEC-252: fsync off the async worker threads the engine shares.
@@ -209,18 +324,6 @@ pub async fn activate_profile_handler(
     {
         log::warn!("Failed to persist profile state: {e}");
     }
-
-    log::info!("Profile activated: '{profile_name}' (id={profile_id})");
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "api_version": API_VERSION,
-            "activated": true,
-            "profile_id": profile_id,
-            "profile_name": profile_name,
-        })),
-    )
 }
 
 /// POST /profile/deactivate — clear the active profile so the daemon stops
@@ -234,6 +337,25 @@ pub async fn activate_profile_handler(
 pub async fn deactivate_profile_handler(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // FFA-j: the swap and the persist run under the store lock, as activation's
+    // do, so the saved state is the last swap's: an activation persisting after
+    // this deactivation could otherwise bring its profile back at restart.
+    let locked_state = Arc::clone(&state);
+    let previous = match super::under_store_lock(deactivate_and_persist(locked_state)).await {
+        Ok(previous) => previous,
+        Err(e) => {
+            log::error!("Profile deactivation did not complete: {e}");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorEnvelope::internal("profile deactivation did not complete"),
+            );
+        }
+    };
+    release_engine_lease_and_report(&state, previous)
+}
+
+/// Clear the active profile and persist that. Called under the store lock.
+async fn deactivate_and_persist(state: Arc<AppState>) -> Option<(String, String)> {
     let previous = {
         let mut guard = state.active_profile.lock();
         let previous = guard.take().map(|p| (p.id, p.name));
@@ -264,7 +386,14 @@ pub async fn deactivate_profile_handler(
     {
         log::warn!("Failed to persist deactivation: {e}");
     }
+    previous
+}
 
+/// The rest of deactivation: release the engine's lease and answer.
+fn release_engine_lease_and_report(
+    state: &AppState,
+    previous: Option<(String, String)>,
+) -> (StatusCode, Json<serde_json::Value>) {
     // Release the profile engine's own self-lease so the next activation
     // re-acquires cleanly. The engine is the sole hwmon writer post-2.0.0
     // (DEC-165); only the "profile-engine" owner is released.
@@ -349,7 +478,18 @@ pub async fn list_profiles_handler(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let dirs = state.profile_search_dirs.read().clone();
-    let profiles = crate::profile_store::list(&dirs);
+    // FFA-b: off the async workers, bounded.
+    let listed = super::profile_io(move |stop_at| crate::profile_store::list_until(&dirs, stop_at));
+    let profiles = match listed.await {
+        Ok(Ok(profiles)) => profiles,
+        Ok(Err(_)) => {
+            return super::profile_io_error_response(
+                "GET /profiles",
+                super::ProfileIoError::TimedOut,
+            )
+        }
+        Err(e) => return super::profile_io_error_response("GET /profiles", e),
+    };
     json_ok(
         StatusCode::OK,
         ProfileListResponse {
@@ -369,7 +509,22 @@ pub async fn get_profile_handler(
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let dirs = state.profile_search_dirs.read().clone();
-    match crate::profile_store::get_raw(&dirs, &id) {
+    // FFA-b: off the async workers, bounded.
+    let lookup = id.clone();
+    let read = super::profile_io(move |stop_at| {
+        crate::profile_store::get_raw_until(&dirs, &lookup, stop_at)
+    });
+    let found = match read.await {
+        Ok(Ok(found)) => found,
+        Ok(Err(_)) => {
+            return super::profile_io_error_response(
+                "GET /profiles/{id}",
+                super::ProfileIoError::TimedOut,
+            )
+        }
+        Err(e) => return super::profile_io_error_response("GET /profiles/{id}", e),
+    };
+    match found {
         Some(mut value) => {
             crate::profile::canonicalize_profile_document(&mut value);
             (StatusCode::OK, Json(value))
@@ -468,16 +623,13 @@ async fn validate_and_store(
         );
     };
 
-    if !allow_overwrite && crate::profile_store::exists_in_store(&dir, expected_id) {
-        return error_response(
-            StatusCode::CONFLICT,
-            &ErrorEnvelope::already_exists(format!("profile '{expected_id}' already exists")),
-        );
-    }
-
     // Persist the document as supplied (round-tripped through Value), so fields
-    // the daemon model doesn't know are preserved.
-    let bytes = match serde_json::to_vec_pretty(body) {
+    // the daemon model doesn't know are preserved. Compact, and refused past the
+    // read cap (FFA-j): pretty-printing a deeply nested document multiplied its
+    // size, and re-serialising expands numbers (`1e9` is stored as
+    // `1000000000.0`), so a body the 4 MiB request limit accepted could be
+    // stored as a file the daemon then refused to read, list or activate.
+    let bytes = match serde_json::to_vec(body) {
         Ok(b) => b,
         Err(e) => {
             return error_response(
@@ -486,22 +638,66 @@ async fn validate_and_store(
             )
         }
     };
-    // DEC-252: fsync off the async worker threads the engine shares.
+    let limit = crate::atomic_io::MAX_CONFIG_BYTES;
+    if bytes.len() as u64 > limit {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::validation(format!(
+                "profile document is too large to store: {} bytes, the limit is {limit}",
+                bytes.len()
+            )),
+        );
+    }
+    // FFA-j: the existence and count checks and the write are one step under
+    // the store lock. DEC-252: the fsync runs off the async worker threads the
+    // engine shares.
     let save_dir = dir.clone();
     let save_id = expected_id.to_string();
-    let save_bytes = bytes.clone();
-    if let Err(e) = super::persist_off_runtime(move || {
-        crate::profile_store::save_raw(&save_dir, &save_id, &save_bytes)
-    })
+    let stored = super::under_store_lock(super::persist_off_runtime(move || {
+        Ok(crate::profile_store::store(
+            &save_dir,
+            &save_id,
+            &bytes,
+            allow_overwrite,
+        ))
+    }))
     .await
-    {
-        // Keep the path-bearing detail server-side; the client gets a generic
-        // message (DEC-173 — internal fs paths must not leak in the envelope).
-        log::error!("Failed to save profile '{expected_id}': {e}");
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &ErrorEnvelope::internal("failed to save profile"),
-        );
+    .and_then(|stored| stored);
+    match stored {
+        Ok(Ok(())) => {}
+        Ok(Err(crate::profile_store::StoreError::AlreadyExists)) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                &ErrorEnvelope::already_exists(format!("profile '{expected_id}' already exists")),
+            );
+        }
+        Ok(Err(crate::profile_store::StoreError::Full)) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!(
+                    "the profile store is full ({} profiles); delete one first",
+                    crate::constants::MAX_STORED_PROFILES
+                )),
+            );
+        }
+        Ok(Err(crate::profile_store::StoreError::TooLarge)) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!(
+                    "the profile store is full ({} MiB in all); delete a profile first",
+                    crate::constants::MAX_STORE_BYTES / (1024 * 1024)
+                )),
+            );
+        }
+        Ok(Err(crate::profile_store::StoreError::Io(e))) | Err(e) => {
+            // Keep the path-bearing detail server-side; the client gets a generic
+            // message (DEC-173 — internal fs paths must not leak in the envelope).
+            log::error!("Failed to save profile '{expected_id}': {e}");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorEnvelope::internal("failed to save profile"),
+            );
+        }
     }
 
     log::info!("Profile '{expected_id}' {success_verb} via API");
@@ -580,25 +776,34 @@ pub async fn delete_profile_handler(
             &ErrorEnvelope::validation(format!("unsafe profile id: {id:?}")),
         );
     }
-    if is_active(&state, &id) {
-        return error_response(
-            StatusCode::CONFLICT,
-            &ErrorEnvelope::profile_in_use(format!(
-                "profile '{id}' is active; deactivate or activate another profile first"
-            )),
-        );
-    }
     let Some(dir) = store_dir(&state) else {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &ErrorEnvelope::internal("no profile store directory configured"),
         );
     };
-    // DEC-252: unlink + directory fsync off the async worker threads.
-    let del_dir = dir.clone();
+    // FFA-j: the active check and the unlink are one step under the store lock,
+    // which activation holds across its existence check and swap.
+    let locked_state = Arc::clone(&state);
     let del_id = id.clone();
-    match super::persist_off_runtime(move || crate::profile_store::delete(&del_dir, &del_id)).await
-    {
+    let deleted = super::under_store_lock(async move {
+        if is_active(&locked_state, &del_id) {
+            return None;
+        }
+        // DEC-252: unlink + directory fsync off the async worker threads.
+        Some(super::persist_off_runtime(move || crate::profile_store::delete(&dir, &del_id)).await)
+    })
+    .await
+    .unwrap_or_else(|e| Some(Err(e)));
+    let Some(deleted) = deleted else {
+        return error_response(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope::profile_in_use(format!(
+                "profile '{id}' is active; deactivate or activate another profile first"
+            )),
+        );
+    };
+    match deleted {
         Ok(true) => json_ok(
             StatusCode::OK,
             serde_json::json!({
@@ -618,6 +823,453 @@ pub async fn delete_profile_handler(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &ErrorEnvelope::internal("failed to delete profile"),
             )
+        }
+    }
+}
+
+/// FFA-b / FFA-j: the routes' wiring, with a directory or a path that stops
+/// answering. The test hooks block an open or a resolution as a hung FUSE
+/// mount does. Plain `#[tokio::test]` (current_thread): a read run on the
+/// executor would block the only thread, so a route that lost its bound hangs
+/// until the hook releases itself and fails its time assertion (rust.md).
+#[cfg(test)]
+mod wiring_tests {
+    use super::*;
+    use crate::api::server::UdsConnectInfo;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    const SAMPLE: &str = r#"{"id":"%ID%","name":"%ID%","version":7,"controls":[],"curves":[]}"#;
+
+    fn write_profile(dir: &std::path::Path, id: &str) {
+        std::fs::write(dir.join(format!("{id}.json")), SAMPLE.replace("%ID%", id)).unwrap();
+    }
+
+    /// A hook that blocks until `release` sends (or a self-release deadline), and
+    /// reports each entry on `entered`.
+    fn wedge() -> (
+        impl Fn() + Send + Sync + 'static,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = parking_lot::Mutex::new(release_rx);
+        let entered_tx = parking_lot::Mutex::new(entered_tx);
+        let hook = move || {
+            let _ = entered_tx.lock().send(());
+            let _ = release_rx.lock().recv_timeout(Duration::from_secs(10));
+        };
+        (hook, release_tx, entered_rx)
+    }
+
+    fn test_state(dirs: Vec<PathBuf>, runtime_config_path: PathBuf) -> Arc<AppState> {
+        let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
+        Arc::new(AppState {
+            cache: Arc::new(crate::health::cache::StateCache::new()),
+            staleness_config: crate::health::staleness::StalenessConfig::default(),
+            daemon_version: "0.0.0-test".into(),
+            fan_controller: Arc::new(parking_lot::RwLock::new(None)),
+            openfan_runtime: crate::api::handlers::OpenFanRuntime {
+                timeout: Duration::from_millis(50),
+                interval: Duration::from_millis(1000),
+                shutdown: tokio::sync::watch::channel(false).1,
+            },
+            hwmon_controller: None,
+            start_time: Instant::now(),
+            history: Arc::new(crate::health::history::HistoryRing::new(10)),
+            active_profile: Arc::new(parking_lot::Mutex::new(None)),
+            openfan_calibration: Default::default(),
+            characterization: Arc::new(parking_lot::Mutex::new(None)),
+            validation: Arc::new(Default::default()),
+            characterization_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            control_path: Arc::new(parking_lot::Mutex::new(None)),
+            control_path_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stall_probe: Arc::new(parking_lot::Mutex::new(None)),
+            stall_probe_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            control_paths: Arc::new(parking_lot::RwLock::new(Default::default())),
+            pwm_baselines: Default::default(),
+            pwm_verification: Default::default(),
+            openfan_rescanning: Default::default(),
+            last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
+            adopted_poll_tasks: Arc::new(parking_lot::Mutex::new(Default::default())),
+            openfan_maintenance: Default::default(),
+            amd_gpus: Vec::new(),
+            intel_gpus: Vec::new(),
+            nvidia_gpus: Vec::new(),
+            profile_search_dirs: parking_lot::RwLock::new(dirs),
+            config_path: String::new(),
+            runtime_config_path,
+            sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
+                std::collections::HashMap::new(),
+            ))),
+            cooling_devices: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
+            override_table: Arc::new(parking_lot::Mutex::new(
+                crate::control_override::OverrideTable::new(),
+            )),
+            allow_port_probe: false,
+            running_config: Default::default(),
+            readiness_rollup: readiness_rollup.clone(),
+            config_write: Default::default(),
+            runtime_config_degraded: Default::default(),
+            assessment: Arc::new(crate::api::handlers::AssessmentCache::new(readiness_rollup)),
+        })
+    }
+
+    fn peer(uid: u32) -> ConnectInfo<UdsConnectInfo> {
+        ConnectInfo(UdsConnectInfo { uid: Some(uid) })
+    }
+
+    /// The bound the routes promise: the budget, plus slack for a loaded host.
+    fn within_budget(started: Instant) {
+        let waited = started.elapsed();
+        assert!(
+            waited < crate::constants::PROFILE_IO_BUDGET + Duration::from_millis(1500),
+            "the route waited {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_read_route_answers_while_a_registered_directory_hangs() {
+        let store = tempfile::tempdir().unwrap();
+        let hung = tempfile::tempdir().unwrap();
+        write_profile(store.path(), "mine");
+        write_profile(hung.path(), "theirs");
+        let rc = tempfile::tempdir().unwrap();
+        let state = test_state(
+            vec![store.path().to_path_buf(), hung.path().to_path_buf()],
+            rc.path().join("runtime.toml"),
+        );
+        let (hook, release, entered) = wedge();
+        let _guard = crate::profile_store::test_hook::block_opens_of(hung.path(), hook);
+
+        // The first list meets the hang and is answered at the budget.
+        let started = Instant::now();
+        let (status, Json(body)) = list_profiles_handler(State(Arc::clone(&state))).await;
+        within_budget(started);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["error"]["retryable"], true);
+        entered
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the hang was hit");
+
+        // Activation by a path in the hung directory is retryable, not refused.
+        let (status, Json(body)) = activate_profile_handler(
+            State(Arc::clone(&state)),
+            peer(1000),
+            Json(serde_json::json!({
+                "profile_path": hung.path().join("theirs.json").display().to_string()
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["error"]["retryable"], true);
+
+        // Later requests skip the hung directory at once: one parked thread, not
+        // one per request, and every route still answers from the others.
+        let started = Instant::now();
+        let (status, Json(body)) = list_profiles_handler(State(Arc::clone(&state))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["profiles"][0]["id"], "mine");
+        assert_eq!(body["profiles"].as_array().unwrap().len(), 1, "{body}");
+        let (status, _) = get_profile_handler(State(Arc::clone(&state)), Path("mine".into())).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, Json(body)) = activate_profile_handler(
+            State(Arc::clone(&state)),
+            peer(1000),
+            Json(serde_json::json!({ "profile_id": "mine" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a hung directory must be skipped, not waited on: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            entered.try_recv().is_err(),
+            "no later request may enter the hung directory"
+        );
+        let _ = release.send(());
+    }
+
+    #[tokio::test]
+    async fn activation_by_path_resolution_is_bounded_and_per_user() {
+        // A path whose directory is not registered as written is resolved — a
+        // client-supplied path, in its own pool, one at a time per uid.
+        let store = tempfile::tempdir().unwrap();
+        write_profile(store.path(), "mine");
+        let elsewhere = tempfile::tempdir().unwrap();
+        let unregistered = elsewhere.path().join("x.json");
+        let rc = tempfile::tempdir().unwrap();
+        let state = test_state(vec![store.path().to_path_buf()], rc.path().join("rt.toml"));
+        let (hook, release, entered) = wedge();
+        let _guard = crate::api::handlers::path_confine::test_hook::block_resolution_of(
+            elsewhere.path(),
+            hook,
+        );
+        let body = serde_json::json!({ "profile_path": unregistered.display().to_string() });
+
+        let started = Instant::now();
+        let (status, _) =
+            activate_profile_handler(State(Arc::clone(&state)), peer(4242), Json(body.clone()))
+                .await;
+        within_budget(started);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        entered
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the hang was hit");
+
+        // The same user is refused at once: its resolution is still hung.
+        let started = Instant::now();
+        let (status, _) =
+            activate_profile_handler(State(Arc::clone(&state)), peer(4242), Json(body)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(entered.try_recv().is_err(), "no second thread may enter");
+
+        // Another user still resolves: the gate is per uid. Its directory is
+        // not registered, so a resolution that ran answers 400, not 500.
+        let other = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let (status, Json(body)) = activate_profile_handler(
+            State(Arc::clone(&state)),
+            peer(4343),
+            Json(serde_json::json!({
+                "profile_path": other.path().join("x.json").display().to_string()
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // Anyone naming a registered directory as written needs no resolution.
+        let path = store.path().join("mine.json").display().to_string();
+        let (status, Json(body)) = activate_profile_handler(
+            State(Arc::clone(&state)),
+            peer(4242),
+            Json(serde_json::json!({ "profile_path": path })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let _ = release.send(());
+    }
+
+    #[tokio::test]
+    async fn root_can_remove_a_directory_that_stopped_answering() {
+        // Concurrency review finding 1: removing a hung directory is the API's
+        // only remedy for one, so it must not touch that directory.
+        let store = tempfile::tempdir().unwrap();
+        let hung = tempfile::tempdir().unwrap();
+        let rc = tempfile::tempdir().unwrap();
+        let state = test_state(
+            vec![store.path().to_path_buf(), hung.path().to_path_buf()],
+            rc.path().join("runtime.toml"),
+        );
+        let (hook, release, entered) = wedge();
+        let _resolve =
+            crate::api::handlers::path_confine::test_hook::block_resolution_of(hung.path(), hook);
+
+        let started = Instant::now();
+        let (status, Json(body)) = crate::api::handlers::update_profile_search_dirs_handler(
+            State(Arc::clone(&state)),
+            peer(0),
+            Json(serde_json::json!({ "remove": [hung.path().display().to_string()] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            entered.try_recv().is_err(),
+            "the removal must not resolve the directory"
+        );
+        assert_eq!(
+            body["search_dirs"],
+            serde_json::json!([store.path().display().to_string()])
+        );
+        let _ = release.send(());
+    }
+
+    #[tokio::test]
+    async fn a_hung_add_refuses_only_that_users_later_edits() {
+        let store = tempfile::tempdir().unwrap();
+        let hung = tempfile::tempdir().unwrap();
+        let rc = tempfile::tempdir().unwrap();
+        let state = test_state(
+            vec![store.path().to_path_buf()],
+            rc.path().join("runtime.toml"),
+        );
+        let (hook, release, entered) = wedge();
+        let _guard =
+            crate::api::handlers::path_confine::test_hook::block_resolution_of(hung.path(), hook);
+        let add = serde_json::json!({ "add": [hung.path().display().to_string()] });
+
+        // The test's own uid: it has a home to look up, and the per-uid gate is
+        // process-wide, so a uid other tests use (root) must not be the hung one.
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let me = unsafe { libc::getuid() };
+        let started = Instant::now();
+        let (status, _) = crate::api::handlers::update_profile_search_dirs_handler(
+            State(Arc::clone(&state)),
+            peer(me),
+            Json(add.clone()),
+        )
+        .await;
+        within_budget(started);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        entered
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the hang was hit");
+
+        let started = Instant::now();
+        let (status, _) = crate::api::handlers::update_profile_search_dirs_handler(
+            State(Arc::clone(&state)),
+            peer(me),
+            Json(add),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(entered.try_recv().is_err(), "no second thread may enter");
+        let _ = release.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_store_profile_deleted_after_the_read_is_not_activated() {
+        // FFA-j: the read runs outside the store lock, so a delete can win the
+        // race to it; the existence check under the lock must see that, or the
+        // deleted profile is activated and saved as active with no file.
+        let store = tempfile::tempdir().unwrap();
+        write_profile(store.path(), "p");
+        let rc = tempfile::tempdir().unwrap();
+        let state = test_state(vec![store.path().to_path_buf()], rc.path().join("rt.toml"));
+        let (signal, opened) = std::sync::mpsc::channel::<()>();
+        let signal = parking_lot::Mutex::new(signal);
+        let _guard = crate::profile_store::test_hook::block_opens_of(store.path(), move || {
+            let _ = signal.lock().send(());
+        });
+
+        let held = crate::profile_store::STORE_LOCK.lock().await;
+        let activation = tokio::spawn(activate_profile_handler(
+            State(Arc::clone(&state)),
+            peer(0),
+            Json(serde_json::json!({ "profile_id": "p" })),
+        ));
+        opened
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the read started");
+        // The read is over once it releases the directory; only then is the
+        // file removed, so the read found it and the check under the lock this
+        // test holds is what must refuse it.
+        let give_up = Instant::now() + Duration::from_secs(5);
+        while crate::profile_store::dir_in_use(store.path()) {
+            assert!(Instant::now() < give_up, "the read never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::remove_file(store.path().join("p.json")).unwrap();
+        drop(held);
+
+        let (status, Json(body)) = activation.await.unwrap();
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(state.active_profile.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_user_with_a_slow_mount_holds_one_resolution_slot_at_most() {
+        // Concurrency review of FFA-b: a mount that answers each lookup just
+        // under the hung threshold, flooded by its owner, must not fill the
+        // resolution pool and refuse everyone else.
+        let store = tempfile::tempdir().unwrap();
+        let slow = tempfile::tempdir().unwrap();
+        let rc = tempfile::tempdir().unwrap();
+        let state = test_state(vec![store.path().to_path_buf()], rc.path().join("rt.toml"));
+        let _guard =
+            crate::api::handlers::path_confine::test_hook::block_resolution_of(slow.path(), || {
+                std::thread::sleep(Duration::from_millis(900));
+            });
+        let flood: Vec<_> = (0..crate::constants::PATH_RESOLVE_MAX_OUTSTANDING + 2)
+            .map(|_| {
+                tokio::spawn(activate_profile_handler(
+                    State(Arc::clone(&state)),
+                    peer(5151),
+                    Json(serde_json::json!({
+                        "profile_path": slow.path().join("x.json").display().to_string()
+                    })),
+                ))
+            })
+            .collect();
+        // Let every flood request reach its slot (or its refusal).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let other = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let (status, Json(body)) = activate_profile_handler(
+            State(Arc::clone(&state)),
+            peer(5252),
+            Json(serde_json::json!({
+                "profile_path": other.path().join("x.json").display().to_string()
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "another user must not wait behind the flood: {:?}",
+            started.elapsed()
+        );
+        for request in flood {
+            let _ = request.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_directories_do_not_run_a_listing_past_its_budget() {
+        // Concurrency review of FFA-b: directories that are slow but never hung
+        // are not skipped, so the walk itself must stop in time — and with what
+        // it found, not a 500 for every caller.
+        let store = tempfile::tempdir().unwrap();
+        write_profile(store.path(), "mine");
+        let slow: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let mut dirs = vec![store.path().to_path_buf()];
+        let mut guards = Vec::new();
+        for (i, dir) in slow.iter().enumerate() {
+            write_profile(dir.path(), &format!("slow{i}"));
+            dirs.push(dir.path().to_path_buf());
+            guards.push(crate::profile_store::test_hook::block_opens_of(
+                dir.path(),
+                || std::thread::sleep(Duration::from_millis(800)),
+            ));
+        }
+        let rc = tempfile::tempdir().unwrap();
+        let state = test_state(dirs, rc.path().join("rt.toml"));
+
+        for _ in 0..2 {
+            let started = Instant::now();
+            let (status, Json(body)) = list_profiles_handler(State(Arc::clone(&state))).await;
+            assert!(
+                started.elapsed() < crate::constants::PROFILE_IO_BUDGET,
+                "{:?}",
+                started.elapsed()
+            );
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["profiles"][0]["id"], "mine");
         }
     }
 }

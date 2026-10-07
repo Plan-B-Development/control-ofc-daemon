@@ -237,7 +237,7 @@ As of 2.0.0 the profile engine is the **sole writer** (DEC-159 / DEC-165) — th
 | `POST /profiles` | Create a stored profile (`?validate_only=true` validates only; `409 already_exists` on a duplicate id) |
 | `PUT /profiles/{id}` | Replace a stored profile's desired-state (re-activate to apply — no hot reload) |
 | `DELETE /profiles/{id}` | Remove a stored profile (`409 profile_in_use` if it is the active profile) |
-| `POST /profile/activate` | Activate a profile by id (`{"profile_id": "..."}`) or path (`{"profile_path": "..."}` — the file must lie inside a profile search directory). Clears every control override; on the next engine tick a motherboard header or AMD GPU the old profile drove and the new one does not name is given back (DEC-382, DEC-448), and an OpenFan channel or a header with no automatic mode (an ARCTIC hub channel) it does not name is left at its last duty or `[shutdown] exit_floor_pct`, whichever is higher — 100 % if its last duty is unknown (DEC-451) |
+| `POST /profile/activate` | Activate a profile by id (`{"profile_id": "..."}`) or path (`{"profile_path": "..."}` — the file must be directly inside a profile search directory, and be a regular file, not a symlink). Clears every control override; on the next engine tick a motherboard header or AMD GPU the old profile drove and the new one does not name is given back (DEC-382, DEC-448), and an OpenFan channel or a header with no automatic mode (an ARCTIC hub channel) it does not name is left at its last duty or `[shutdown] exit_floor_pct`, whichever is higher — 100 % if its last duty is unknown (DEC-451) |
 | `POST /profile/deactivate` | Clear the active profile; idempotent. Clears every control override, and on the next engine tick each motherboard header the daemon took goes back to what it was doing before (DEC-382), and each AMD GPU whose fan curve it wrote goes back to PMFW's own curve (DEC-448); each OpenFan channel and each header with no automatic mode it drove is left at its last duty or `[shutdown] exit_floor_pct`, whichever is higher — 100 % if its last duty is unknown (DEC-451); no fan curve runs until a profile is activated again |
 
 **Live control intent (DEC-163 / DEC-166):**
@@ -683,6 +683,27 @@ would leave the daemon unable to find any profile at all. Both are
 `400 validation_error`. A non-root caller may only touch directories under its
 own home (DEC-205); removal does **not** require the directory to still exist,
 which is the point — a stale entry usually no longer does.
+
+A directory is stored by its **real path** (symlinks resolved), and different
+spellings of one directory (`/./`, `//`, a trailing `/`) count as one entry. The
+list holds at most 32 directories, at most 4 of them inside one user's home, each
+path at most 4096 bytes. When reading
+profiles the daemon skips, with a warning in the journal:
+
+- a directory whose real path is no longer the path registered — one replaced by a
+  symlink after it was added, or one an older daemon stored through a symlink
+  (add it again to store its real path; the GUI does this for its own folder every
+  time it connects);
+- a profile file that is a symlink, a FIFO or anything else but a regular file, or
+  whose owner is not the directory's owner;
+- a user's directory that has stopped answering (a hung network or FUSE mount),
+  until a read of it returns. The request that first meets it gets a retryable error
+  after 2 s; root can always remove the entry. Root's directories (the store, the
+  presets) are never skipped: a request that cannot read them in time gets the
+  retryable error instead.
+
+This stops a profile directory from being used to read files the caller could not
+read themselves (FFA-a).
 
 ### Profile engine ownership
 
