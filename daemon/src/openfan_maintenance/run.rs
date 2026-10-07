@@ -2365,6 +2365,13 @@ mod tests {
         let bench = Bench::new(Board::new()).await;
         let run = bench.start();
         bench.reached(stage::WAITING_FOR_FILE).await;
+        // The stage is recorded before the sysfs watch names the drive, so a
+        // look taken as the wait begins can still find none.
+        let slot = bench.slot.clone();
+        wait_until("the drive to be named", || {
+            slot.record().and_then(|r| r.bootloader_drive).as_deref() == Some("sdx")
+        })
+        .await;
 
         // Parked, then the bootloader asked for — once, and with `>07` alone.
         for ch in 0..NUM_CHANNELS {
