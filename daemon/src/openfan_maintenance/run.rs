@@ -2535,6 +2535,19 @@ mod tests {
         assert_eq!(*bench.board.opened.lock(), vec![TTY.to_string()]);
         assert!(bench.cache.openfan_maintenance().is_none());
         assert_eq!(bench.cache.openfan_link(), Some(OpenFanLink::Connected));
+        // [SAFETY] FFA-i: the restart dropped the parked 100 %, so the
+        // engine's 100 % must reach the wire, not coalesce against the park.
+        assert_eq!(bench.board.sent(&park_frame(0)), 1, "parked once");
+        bench
+            .ctrl
+            .lock()
+            .set_pwm(0, 100)
+            .expect("a write lands again");
+        assert_eq!(
+            bench.board.sent(&park_frame(0)),
+            2,
+            "the engine's 100 % after the restart is sent, not coalesced"
+        );
     }
 
     #[tokio::test]

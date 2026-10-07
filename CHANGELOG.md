@@ -37,6 +37,11 @@
   the store over 64 MiB in all. Concurrent creates of one
   id no longer both succeed, a delete can no longer land between an activation's read and its swap, and a
   delete is now fsynced (FFA-j, audit F-16, F-20).
+- **An OpenFan board that restarted during a firmware update now gets its fan duties again.** An update
+  parks every channel at 100 %; a board that then restarted into its firmware instead of its bootloader
+  was handed back with the daemon still believing it held 100 %, so a profile's 100 % was never sent and
+  the fans stayed at the board's boot duty while the daemon reported 100 %. Every port an update hands
+  back now has its write record cleared first, so the next duty reaches the board (FFA-i, audit F-11).
 
 ## [4.0.0] — 2026-10-04
 

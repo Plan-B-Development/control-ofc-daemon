@@ -1098,6 +1098,14 @@ pub(crate) async fn openfan_poll_loop_with<F, G>(
                 }
                 LoanEnd::Refused | LoanEnd::Abandoned => {}
                 LoanEnd::Returned { path, settled } => {
+                    // [SAFETY] DEC-256: the board may have restarted while the
+                    // port was out — into its firmware rather than its
+                    // bootloader, too, which no stage of the update marks —
+                    // so its channels may not hold what the controller last
+                    // sent. Invalidated before `settled` lifts the write
+                    // suspension, or the next identical duty (the engine's
+                    // 100 % after the park) is coalesced away.
+                    cache.invalidate_openfan_writes();
                     let reseed = reseed.clone();
                     let node = path.clone();
                     if let Err(e) = tokio::task::spawn_blocking(move || reseed(&node)).await {
