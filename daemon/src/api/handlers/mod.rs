@@ -43,7 +43,6 @@ use axum::response::Json;
 use crate::constants;
 use crate::health::cache::StateCache;
 use crate::health::staleness::StalenessConfig;
-use crate::hwmon::pwm_control::HwmonPwmController;
 use crate::serial::controller::FanController;
 
 use super::responses::*;
@@ -451,8 +450,9 @@ pub struct AppState {
     /// these are configuration, not discovery.
     pub openfan_runtime: OpenFanRuntime,
     /// Hwmon PWM controller for motherboard fan header writes. `None` if no headers found.
-    /// Arc-wrapped to share between API handlers and the profile engine task.
-    pub hwmon_controller: Option<Arc<Mutex<HwmonPwmController>>>,
+    /// Shared with the profile engine; a handler reads its headers from the
+    /// handle's snapshot and never locks it on a tokio worker (FFA-h).
+    pub hwmon_controller: Option<crate::api::hwmon_handle::HwmonHandle>,
     /// Daemon process start time for uptime calculation.
     pub start_time: Instant,
     /// Per-entity time-series history ring buffer.
@@ -633,11 +633,10 @@ pub struct AppState {
     /// `AppState::header_role_parts` already documents that pair as ABBA-sensitive.
     /// Setters that validate against live headers do so *before* acquiring this.
     /// `update_header_role_handler` additionally **drops the guard before building
-    /// its response**, because `resolved_header_role` reaches `hwmon_controller`
-    /// and, on the `role: null` clear path, is the handler's only acquisition of
-    /// it — so the pre-lock validation does not cover it. An earlier revision of
-    /// this comment claimed the invariant held by construction; it did not, and
-    /// the drop is what makes it true.
+    /// its response** (`AIO1-d`). Since FFA-h `resolved_header_role` reads the
+    /// headers from `HwmonHandle`'s snapshot and takes no controller lock, so
+    /// the drop is no longer what keeps the pair apart; it stays, as the cheaper
+    /// critical section.
     pub config_write: tokio::sync::Mutex<()>,
     /// Set when a `runtime.toml` load fell back to defaults, mirrored onto
     /// `/status` + `/poll` so a client can see it (`AUD3-m`).
@@ -879,11 +878,10 @@ impl AppState {
     /// inferred for it. Split out so the display and safety questions read the
     /// same two facts and cannot drift apart.
     ///
-    /// Takes the `header_roles` read lock and releases it *before* acquiring the
-    /// controller lock — deliberately, and load-bearing: `hwmon_headers_handler`
-    /// and the inventory handler take those two in the opposite order, so
-    /// holding both here would complete an ABBA cycle with the 1 Hz engine in
-    /// the middle of it.
+    /// Takes the `header_roles` read lock and releases it; the inferred role
+    /// comes from `HwmonHandle`'s header snapshot, so no controller lock is
+    /// taken (FFA-h) — this runs on tokio workers, from `/poll`'s neighbours
+    /// and identify, and the engine holds that lock across blocking writes.
     pub(crate) fn header_role_parts(
         &self,
         header_id: &str,
@@ -905,16 +903,12 @@ impl AppState {
         if crate::serial::openfan_channel_of(header_id).is_ok() {
             return (assigned, Default::default());
         }
+        // FFA-h: from the frozen header snapshot, so no lock is taken here.
         let inferred = self
             .hwmon_controller
             .as_ref()
-            .and_then(|c| {
-                c.lock()
-                    .headers()
-                    .into_iter()
-                    .find(|h| h.id == header_id)
-                    .map(|h| (h.role, h.role_source))
-            })
+            .and_then(|c| c.header(header_id))
+            .map(|h| (h.role, h.role_source))
             .unwrap_or_default();
         (assigned, inferred)
     }
@@ -924,18 +918,16 @@ impl AppState {
     ///
     /// [SAFETY] Says nothing about WHETHER the header is a pump — that is
     /// [`Self::header_is_pump_protected`]. Every site that floors a pump asks
-    /// both and applies this value only when the answer is yes. Takes the
-    /// controller lock alone and releases it, like `header_role_parts`, so a
-    /// caller must hold neither that lock nor `active_profile`. An unknown
-    /// header gets the 30 % floor — the value it had before the mode was read.
+    /// both and applies this value only when the answer is yes. Reads the
+    /// header from `HwmonHandle`'s snapshot and takes no lock (FFA-h). An
+    /// unknown header gets the 30 % floor — the value it had before the mode
+    /// was read.
     pub fn header_pump_floor_pct(&self, header_id: &str) -> u8 {
-        let mode = self.hwmon_controller.as_ref().and_then(|c| {
-            c.lock()
-                .headers()
-                .into_iter()
-                .find(|h| h.id == header_id)
-                .and_then(|h| h.pwm_mode)
-        });
+        let mode = self
+            .hwmon_controller
+            .as_ref()
+            .and_then(|c| c.header(header_id))
+            .and_then(|h| h.pwm_mode);
         pump_floor_duty(mode)
     }
 
@@ -987,8 +979,7 @@ impl AppState {
     /// The profile term makes the answer — and the published `stop_permitted` /
     /// `effective_min_pwm_pct` — change when the active profile does.
     pub fn header_is_pump_protected(&self, header_id: &str) -> bool {
-        // The profile term first, its lock already released: `header_role_parts`
-        // takes the controller, and the two are never held together.
+        // The profile term first, its lock already released.
         let profile_names_pump = self.profile_pump_header_ids().contains(header_id);
         let (assigned, inferred) = self.header_role_parts(header_id);
         // One definition of the union, in `roles`. This wrapper only adds the
@@ -1081,6 +1072,22 @@ pub(crate) fn verify_slot_refusal(
         StatusCode::CONFLICT,
         &ErrorEnvelope::validation("a hardware verify or calibration is already in progress"),
     )
+}
+
+/// The `details.reason` of a request refused because the hwmon controller's
+/// lock did not come free in time (FFA-h).
+pub const HWMON_CONTROLLER_BUSY_REASON: &str = "hwmon_controller_busy";
+
+/// The answer of a request that needs the hwmon controller's live state when
+/// its lock did not come free within `HWMON_CONTROLLER_WAIT` (FFA-h) — a
+/// motherboard fan write that has not returned is holding it: 503
+/// `hardware_unavailable`, retryable, `details.reason: "hwmon_controller_busy"`.
+pub(crate) fn hwmon_controller_busy() -> (StatusCode, Json<serde_json::Value>) {
+    let mut e = ErrorEnvelope::hardware_unavailable(
+        "the motherboard fan controller is busy with a write that has not returned — try again",
+    );
+    e.error.details = Some(serde_json::json!({ "reason": HWMON_CONTROLLER_BUSY_REASON }));
+    error_response(StatusCode::SERVICE_UNAVAILABLE, &e)
 }
 
 /// The `details.reason` of every refusal caused by a running firmware update.

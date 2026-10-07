@@ -2571,7 +2571,9 @@ fn preflight_state_with_members(
             interval: Duration::from_millis(1000),
             shutdown: tokio::sync::watch::channel(false).1,
         },
-        hwmon_controller: Some(Arc::new(parking_lot::Mutex::new(ctrl))),
+        hwmon_controller: Some(control_ofc_daemon::api::hwmon_handle::HwmonHandle::new(
+            ctrl,
+        )),
         start_time: Instant::now(),
         history: Arc::new(control_ofc_daemon::health::history::HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),

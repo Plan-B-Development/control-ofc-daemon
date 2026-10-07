@@ -1280,7 +1280,8 @@ where
 /// more at the end: its pump answer at any point raises the restore floor, so a
 /// pump role assigned while the probe ran is never restored below the pump
 /// floor (`AUD3-l`'s rule) — except after a write that did not return, when
-/// nothing that takes the controller lock is called again (DEC-455).
+/// it is not called again (DEC-455: nothing more is written, so its answer has
+/// no use).
 ///
 /// [SAFETY] `write_fn` is BOUNDED in production (DEC-455, `PTR-ab`,
 /// [`crate::api::diagnostic_gates::bounded_hwmon_write`]), the kick's and the
@@ -1432,10 +1433,10 @@ where
 
     // [SAFETY] The final re-check. A pump role assigned after the last sample —
     // during the kick, say — must still raise the restore floor; the restore
-    // just below reads the field. Skipped while shutting down: the restore is
-    // skipped then, and the lookup takes the controller lock the exit path may
-    // be holding. Skipped after a write that did not return, for the same lock
-    // (DEC-455): that write still holds it, and the restore is skipped anyway.
+    // just below reads the field. Skipped while shutting down, and after a
+    // write that did not return (DEC-455): the restore is skipped in both, so
+    // the answer has no use. (The lookup reads `HwmonHandle`'s header snapshot
+    // since FFA-h, not the controller lock it once queued on.)
     let pump_now = probe.pump_seen
         || (!shutting_down()
             && !write_stuck.load(Ordering::SeqCst)
@@ -2349,7 +2350,7 @@ mod tests {
     /// no 100 % kick, unlike an errored write (the test above), because the
     /// kick would queue behind the parked write on the controller lock and
     /// land whenever it did; no restore (`skipped_unresponsive`); and no
-    /// eligibility re-check, which takes that lock too.
+    /// eligibility re-check.
     #[tokio::test(start_paused = true)]
     async fn a_step_write_that_does_not_return_writes_nothing_more_not_even_the_kick() {
         let (res, report, events) = run_with_stuck_write(None, 12, true).await;

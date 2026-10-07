@@ -1492,6 +1492,15 @@ pub const DIAGNOSTIC_READ_BUDGET: Duration = Duration::from_secs(2);
 /// budget, and for the same reason: a healthy write takes microseconds.
 pub const DIAGNOSTIC_WRITE_BUDGET: Duration = Duration::from_secs(2);
 
+/// How long a request waits for the hwmon controller's lock before it is
+/// refused as busy (FFA-h). The wait runs on the blocking pool, never on a
+/// tokio worker: a write that does not return keeps the lock (DEC-455), and
+/// requests parked on it there would starve the engine until the watchdog
+/// killed the daemon. A healthy holder keeps it for microseconds; the figure
+/// matches the diagnostic budgets, so a stuck diagnostic write is reported
+/// as stuck before a request behind it gives up.
+pub const HWMON_CONTROLLER_WAIT: Duration = Duration::from_secs(2);
+
 // The descent must land exactly on 0 %, so the start must be a whole number of
 // steps; and the probe must never start above the characterisation clamp.
 const _: () = assert!(STALL_PROBE_STEP_PCT > 0);

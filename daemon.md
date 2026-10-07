@@ -98,7 +98,9 @@ daemon/src/
                           the active profile's pump-labelled members joined it in DEC-384).
                           `AppState::header_is_pump_protected` is the lookup wrapper
                           around it; callers holding the controller lock must use the
-                          function directly or they deadlock
+                          function directly (the wrapper takes `active_profile`, never
+                          held with that lock; it reads headers from `HwmonHandle`'s
+                          snapshot, FFA-h)
     cooling_device.rs  — cooling-device topology: a pump + radiator fans + an advisory
                           sensor as one named assembly (DEC-316). Metadata only — the
                           profile engine never reads one, and a `pump_member` confers
@@ -183,6 +185,12 @@ daemon/src/
       discovery.rs     — /diagnostics/preflight + the control-path routes (DEC-333)
       stall_probe.rs   — the stall-probe routes (DEC-407); the probe itself is api/stall_probe.rs
     responses.rs       — response structs (Serialize)
+    hwmon_handle.rs    — HwmonHandle: AppState's hwmon controller plus a lock-free
+                         snapshot of its headers (frozen at discovery). Handlers read
+                         header facts from the snapshot and reach live controller state
+                         only through with_controller — the blocking pool, try_lock_for
+                         HWMON_CONTROLLER_WAIT (2 s), else a retryable 503
+                         `hwmon_controller_busy` — never a lock on a tokio worker (FFA-h)
     calibration.rs     — OpenFan calibration: descent + ascent walk, gates, kick, restore (DEC-452)
     diagnostics.rs     — hardware-diagnostics scanning logic behind /diagnostics/hardware
     stats.rs           — pure statistics over retained tach samples (DEC-334): mean,

@@ -80,10 +80,8 @@ fn build_hwmon_inventory(state: &AppState) -> (StatusCode, Json<serde_json::Valu
     // `/hwmon/headers`. Empty when no controller was constructed at startup.
     let pwm_controls: Vec<PwmHeaderEntry> = match &state.hwmon_controller {
         Some(controller) => {
-            // DEC-384: before the controller lock — `active_profile` is never held with it.
             let profile_pumps = state.profile_pump_header_ids();
-            let ctrl = controller.lock();
-            super::hwmon_ctl::published_header_entries(state, ctrl.headers(), &profile_pumps)
+            super::hwmon_ctl::published_header_entries(state, controller.headers(), &profile_pumps)
         }
         None => Vec::new(),
     };
@@ -298,18 +296,13 @@ fn compute_hardware_assessment(state: &AppState) -> crate::hwmon::readiness::Har
     // one, and the readiness note is about headers the daemon could drive.
     let (pwm_total, pwm_writable, pwm_verified, pwm_failed) = match &state.hwmon_controller {
         Some(controller) => {
-            let writable_ids: Vec<String>;
-            let total;
-            {
-                let ctrl = controller.lock();
-                let headers = ctrl.headers();
-                total = headers.len();
-                writable_ids = headers
-                    .iter()
-                    .filter(|h| h.is_writable)
-                    .map(|h| h.id.clone())
-                    .collect();
-            }
+            let headers = controller.headers();
+            let total = headers.len();
+            let writable_ids: Vec<String> = headers
+                .iter()
+                .filter(|h| h.is_writable)
+                .map(|h| h.id.clone())
+                .collect();
             let (verified, failed) = state
                 .pwm_verification
                 .read()
@@ -432,7 +425,6 @@ fn gather_bound_chips(
 ) -> Vec<superio::BoundChip> {
     let header_chips: Vec<(String, String)> = match &state.hwmon_controller {
         Some(controller) => controller
-            .lock()
             .headers()
             .iter()
             .map(|h| (h.chip_name.clone(), h.device_id.clone()))

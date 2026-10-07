@@ -28,11 +28,9 @@ pub async fn hwmon_headers_handler(
         );
     };
 
-    // DEC-384: the profile's pump members, collected (and that lock released)
-    // BEFORE the controller lock — the two are never held together.
+    // FFA-h: the handle's header snapshot, so no controller lock is taken.
     let profile_pumps = state.profile_pump_header_ids();
-    let ctrl = controller.lock();
-    let headers = published_header_entries(&state, ctrl.headers(), &profile_pumps);
+    let headers = published_header_entries(&state, controller.headers(), &profile_pumps);
 
     json_ok(
         StatusCode::OK,
@@ -53,12 +51,12 @@ pub async fn hwmon_headers_handler(
 /// DEC-379 records, where the call sites that can quietly take a default are
 /// the ones that get missed.
 ///
-/// `profile_pumps` is [`AppState::profile_pump_header_ids`], collected by the
-/// caller BEFORE it takes the controller lock, because `active_profile` is never
-/// held together with it. The user's role assignments and the cooling-device
-/// topology are read here instead: each clones an `Arc` under a momentary read
-/// guard and takes no other lock, so both are safe under the controller lock —
-/// which `header_is_pump_protected` is not, since it takes that lock itself.
+/// `profile_pumps` is [`AppState::profile_pump_header_ids`], collected once by
+/// the caller so every entry is judged against the same profile. The user's
+/// role assignments and the cooling-device topology are read here: each clones
+/// an `Arc` under a momentary read guard and takes no other lock. No caller
+/// holds the controller lock: the headers come from `HwmonHandle`'s snapshot
+/// (FFA-h) or, for `/hwmon/rescan`, a fresh discovery.
 pub(crate) fn published_header_entries<'a>(
     state: &AppState,
     headers: impl IntoIterator<Item = &'a crate::hwmon::pwm_discovery::PwmHeaderDescriptor>,
@@ -214,6 +212,37 @@ pub(crate) struct VerifyLeaseGuard {
         std::sync::Arc<parking_lot::Mutex<crate::hwmon::pwm_control::HwmonPwmController>>,
     pub(crate) lease_id: String,
 }
+/// Force-take a diagnostic's `Verify` lease and wrap it in its guard, off the
+/// tokio workers and bounded (FFA-h): a write that has not returned holds the
+/// controller lock, and waiting for it on a worker is what starved the engine.
+/// Returns the lease guard and the caller's engine-pause guard, in that order.
+///
+/// The pause travels with the take, so it is released only after the lease
+/// on every path: a handler dropped while it waits leaves both in the
+/// blocking task, whose unread output drops the lease and then the pause
+/// (tuple fields drop in order); a wait that runs out drops the pause with
+/// the closure, having taken nothing. Held by the handler instead, the pause
+/// went at once and the late take evicted whatever lease was live then —
+/// the engine's, or a newer diagnostic's that had claimed the freed slot.
+pub(crate) async fn take_verify_lease(
+    handle: &crate::api::hwmon_handle::HwmonHandle,
+    pause: super::VerifyPauseGuard,
+) -> Result<(VerifyLeaseGuard, super::VerifyPauseGuard), crate::api::hwmon_handle::ControllerBusy> {
+    let controller = handle.controller().clone();
+    handle
+        .with_controller(move |c| {
+            let lease = VerifyLeaseGuard {
+                lease_id: c
+                    .lease_manager_mut()
+                    .force_take_lease(HwmonWriter::Verify)
+                    .lease_id,
+                controller,
+            };
+            (lease, pause)
+        })
+        .await
+}
+
 impl Drop for VerifyLeaseGuard {
     /// [SAFETY] DEC-455 (`PTR-ab`): never waits for the controller lock on a
     /// tokio worker. After a diagnostic write that did not return, that write
@@ -435,8 +464,7 @@ pub async fn hwmon_verify_handler(
 
     // Extract header paths (404 if unknown) before pausing the engine.
     let (pwm_path, enable_path, rpm_path) = {
-        let ctrl = controller.lock();
-        match ctrl.header(&header_id) {
+        match controller.header(&header_id) {
             Some(h) => (
                 h.pwm_path.clone(),
                 h.enable_path.clone(),
@@ -463,16 +491,10 @@ pub async fn hwmon_verify_handler(
     // Force-take a daemon-owned "verify" lease for our own controlled writes,
     // released by `VerifyLeaseGuard` (defined above the handler) on EVERY exit
     // path — including a cancelled or panicked future.
-    let verify_lease_id = {
-        let mut ctrl = controller.lock();
-        ctrl.lease_manager_mut()
-            .force_take_lease(HwmonWriter::Verify)
-            .lease_id
+    let Ok((verify_lease, verify_guard)) = take_verify_lease(controller, verify_guard).await else {
+        return super::hwmon_controller_busy();
     };
-    let verify_lease = VerifyLeaseGuard {
-        controller: controller.clone(),
-        lease_id: verify_lease_id.clone(),
-    };
+    let verify_lease_id = verify_lease.lease_id.clone();
 
     // DEC-290: the ENTIRE test-write -> settle -> restore sequence runs inside a
     // single `spawn_blocking`, and BOTH guards are moved into it.
@@ -493,7 +515,7 @@ pub async fn hwmon_verify_handler(
     // the handler would release the lease and the engine pause *while the
     // blocking write was still in flight*, and the restore would then fail
     // `InvalidLease` — trading a stranded duty for a failed one.
-    let bg_controller = controller.clone();
+    let bg_controller = controller.controller().clone();
     // DEC-290 review: the shared shutdown watch, read by the task before its
     // restore. Making the sequence uncancellable also made it survive the
     // shutdown that used to cancel it, and `main.rs` guarantees "the restore is
@@ -1032,8 +1054,7 @@ pub async fn hwmon_characterize_handler(
     // DEC-455: `has_mode_switch` is exactly when `set_pwm` records its take for
     // the engine to hand back (`supports_enable` with an enable path).
     let (pwm_path, enable_path, rpm_path, has_mode_switch) = {
-        let ctrl = controller.lock();
-        match ctrl.header(&header_id) {
+        match controller.header(&header_id) {
             Some(h) => (
                 h.pwm_path.clone(),
                 h.enable_path.clone(),
@@ -1119,16 +1140,10 @@ pub async fn hwmon_characterize_handler(
         })
         .unwrap_or_default();
 
-    let verify_lease_id = {
-        let mut ctrl = controller.lock();
-        ctrl.lease_manager_mut()
-            .force_take_lease(HwmonWriter::Verify)
-            .lease_id
+    let Ok((verify_lease, verify_guard)) = take_verify_lease(controller, verify_guard).await else {
+        return super::hwmon_controller_busy();
     };
-    let verify_lease = VerifyLeaseGuard {
-        controller: controller.clone(),
-        lease_id: verify_lease_id.clone(),
-    };
+    let verify_lease_id = verify_lease.lease_id.clone();
     let lease_for_renew = verify_lease_id.clone();
 
     let run = ch::CharacterizationRun {
@@ -1175,7 +1190,7 @@ pub async fn hwmon_characterize_handler(
     let my_run_id = run.run_id.clone();
     let cancel = state.characterization_cancel.clone();
     let cache = state.cache.clone();
-    let ctrl_arc = controller.clone();
+    let ctrl_arc = controller.controller().clone();
     let shutdown_rx = state.openfan_runtime.shutdown.clone();
     let hid = header_id.clone();
 
@@ -2380,6 +2395,7 @@ pub(crate) mod tests {
                 .hwmon_controller
                 .as_ref()
                 .expect("a controller")
+                .controller()
                 .try_lock()
                 .is_some(),
             "the controller lock must be free once the run has ended"
@@ -2406,13 +2422,14 @@ pub(crate) mod tests {
     ) {
         let ctrl = state.hwmon_controller.clone().expect("a controller");
         assert!(
-            ctrl.try_lock().is_none(),
+            ctrl.controller().try_lock().is_none(),
             "precondition: the write is still parked, holding the controller lock"
         );
         assert_eq!(pwm_duties(writes), before, "nothing landed after the wedge");
         wedge.release();
         poll_until("the deferred lease release", || {
-            ctrl.try_lock()
+            ctrl.controller()
+                .try_lock()
                 .and_then(|c| c.lease_manager().active_lease().is_none().then_some(()))
         })
         .await;
@@ -3804,7 +3821,7 @@ pub(crate) mod tests {
                 interval: std::time::Duration::from_millis(1000),
                 shutdown: shutdown_rx,
             },
-            hwmon_controller: Some(Arc::new(parking_lot::Mutex::new(ctrl))),
+            hwmon_controller: Some(crate::api::hwmon_handle::HwmonHandle::new(ctrl)),
             start_time: std::time::Instant::now(),
             history: Arc::new(crate::health::history::HistoryRing::new(250)),
             active_profile: Arc::new(parking_lot::Mutex::new(None)),
@@ -3993,6 +4010,7 @@ pub(crate) mod tests {
             .hwmon_controller
             .as_ref()
             .expect("a controller")
+            .controller()
             .lock()
             .handback()
             .begin_shutdown_hand_back();
@@ -4512,6 +4530,292 @@ pub(crate) mod tests {
         assert!(
             ctrl.lock().lease_manager().active_lease().is_none(),
             "the verify lease must be released when the guard drops"
+        );
+    }
+
+    // ── FFA-h: no request parks a tokio worker on the controller lock ─────
+
+    /// Hold the controller's lock on another thread, as a motherboard write
+    /// that has not returned does (DEC-455), until the returned sender is
+    /// dropped or `deadline` passes — the self-release, so a failed assertion
+    /// cannot leave the runtime waiting on it. Returns once the lock is held.
+    fn hold_controller(
+        state: &Arc<AppState>,
+        deadline: std::time::Duration,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let controller = state
+            .hwmon_controller
+            .as_ref()
+            .expect("a controller")
+            .controller()
+            .clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _guard = controller.lock();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(deadline);
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the holder took the lock");
+        (release_tx, holder)
+    }
+
+    /// Counts ticks of a task on the test's own executor. It advances only
+    /// while nothing blocks that executor's one thread.
+    fn executor_ticks() -> Arc<std::sync::atomic::AtomicUsize> {
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t = ticks.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        ticks
+    }
+
+    /// FFA-h acceptance: with the controller lock held by a stuck write,
+    /// `/capabilities`, `/hwmon/headers` and an identify of an OpenFan channel
+    /// and of a motherboard header all answer at once. Each used to take that
+    /// lock on the tokio worker, so each waited out the whole hold — and
+    /// enough of them starved the engine until the watchdog fired.
+    ///
+    /// Plain `#[tokio::test]` (current_thread): the handlers run on the one
+    /// thread the test body does, so a handler that blocks shows as elapsed
+    /// time rather than going unnoticed on a second worker.
+    #[tokio::test]
+    async fn a_held_controller_lock_does_not_hold_up_capabilities_headers_or_identify() {
+        const BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+        let (state, _writes, _tx) = unlabelled_header_state();
+        state
+            .cache
+            .update_openfan_fans(vec![crate::health::state::OpenFanState {
+                channel: 0,
+                rpm: 900,
+                last_commanded_pwm: Some(40),
+                updated_at: std::time::Instant::now(),
+                rpm_polled: true,
+                poll_seq: 1,
+            }]);
+        let (release, holder) = hold_controller(&state, std::time::Duration::from_secs(5));
+
+        let started = std::time::Instant::now();
+        let Json(caps) =
+            super::super::capabilities_handler(axum::extract::State(state.clone())).await;
+        assert!(
+            started.elapsed() < BUDGET,
+            "/capabilities waited for the lock"
+        );
+        // The snapshot answers what the lock did: one writable header.
+        assert!(caps.devices.hwmon.write_support);
+        assert!(caps.features.hwmon_write_supported);
+
+        let started = std::time::Instant::now();
+        let (status, Json(body)) = hwmon_headers_handler(axum::extract::State(state.clone())).await;
+        assert!(
+            started.elapsed() < BUDGET,
+            "/hwmon/headers waited for the lock"
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["headers"][0]["id"], PROFILED, "{body}");
+
+        for fan in ["openfan:ch00", PROFILED] {
+            let started = std::time::Instant::now();
+            let (status, Json(body)) = crate::api::handlers::fan_identify_handler(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(fan.to_string()),
+                Json(IdentifyRequest {
+                    action: "stop".into(),
+                    ttl_secs: None,
+                }),
+            )
+            .await;
+            assert!(
+                started.elapsed() < BUDGET,
+                "an identify of {fan} waited for the lock"
+            );
+            assert_eq!(status, StatusCode::OK, "{fan}: {body}");
+        }
+
+        drop(release);
+        holder.join().unwrap();
+    }
+
+    /// FFA-h: a diagnostic that needs the controller's live state while a stuck
+    /// write holds it waits on the blocking pool, not the worker, and is
+    /// refused as busy — retryable — once `HWMON_CONTROLLER_WAIT` runs out,
+    /// with its engine pause released and no lease taken late.
+    #[tokio::test]
+    async fn a_verify_behind_a_held_lock_is_refused_as_busy_without_parking_the_worker() {
+        let wait = crate::constants::HWMON_CONTROLLER_WAIT;
+        let (state, _writes, _tx) = verify_test_state();
+        let (release, holder) = hold_controller(&state, wait + std::time::Duration::from_secs(5));
+        let ticks = executor_ticks();
+
+        let started = std::time::Instant::now();
+        let (status, Json(body)) = hwmon_verify_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(PROFILED.to_string()),
+        )
+        .await;
+        let waited = started.elapsed();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "hardware_unavailable");
+        assert_eq!(body["error"]["retryable"], true);
+        assert_eq!(
+            body["error"]["details"]["reason"],
+            super::super::HWMON_CONTROLLER_BUSY_REASON
+        );
+        assert!(
+            waited >= wait,
+            "refused before the wait ran out: {waited:?}"
+        );
+        // [SAFETY] The worker stayed free throughout: at 10 ms a tick, a 2 s
+        // wait leaves room for well over 50 — and a worker parked on the lock
+        // for all of it leaves none.
+        let ran = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            ran >= 50,
+            "the executor ran {ran} ticks while the verify waited"
+        );
+        assert!(
+            !state.cache.verify_active(),
+            "a refused verify must release its engine pause"
+        );
+
+        drop(release);
+        holder.join().unwrap();
+        let ctrl = state.hwmon_controller.as_ref().unwrap().controller();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            ctrl.lock().lease_manager().active_lease().is_none(),
+            "a wait that ran out takes no lease once the lock comes free"
+        );
+    }
+
+    /// FFA-h review: a verify dropped while its lease take waits on the lock
+    /// keeps the engine pause until that take has run and its lease is gone.
+    /// With the pause on the handler, the drop released it at once, and the
+    /// take landing later evicted whatever lease was live by then — the
+    /// engine's, or that of a diagnostic that had claimed the freed slot.
+    #[tokio::test]
+    async fn a_verify_dropped_while_its_lease_take_waits_keeps_the_pause_until_the_take_is_undone()
+    {
+        let (state, _writes, _tx) = verify_test_state();
+        let (release, holder) = hold_controller(&state, std::time::Duration::from_secs(5));
+        let s = state.clone();
+        let verify = tokio::spawn(async move {
+            hwmon_verify_handler(
+                axum::extract::State(s),
+                axum::extract::Path(PROFILED.to_string()),
+            )
+            .await
+        });
+        // Paused and waiting for the lock: the take is queued.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !state.cache.verify_active() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the verify never paused"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        verify.abort();
+        let _ = verify.await;
+
+        assert!(
+            state.cache.verify_active(),
+            "the pause went with the handler while its lease take was still queued"
+        );
+        // [SAFETY] No other diagnostic can claim the slot meanwhile.
+        assert!(super::super::begin_verify_pause(
+            &state.cache,
+            crate::constants::VERIFY_PAUSE_DEADMAN
+        )
+        .is_none());
+
+        drop(release);
+        holder.join().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.cache.verify_active() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pause outlived the take"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let ctrl = state.hwmon_controller.as_ref().unwrap().controller();
+        assert!(
+            ctrl.lock().lease_manager().active_lease().is_none(),
+            "the late take's lease is released before the pause"
+        );
+    }
+
+    /// FFA-h: deactivation releases the engine's lease off the worker and
+    /// bounded. Behind a held lock it still answers, and the release is
+    /// skipped rather than queued — one landing later could release a lease
+    /// taken since. With the lock free, the lease is released.
+    #[tokio::test]
+    async fn deactivation_releases_the_engine_lease_or_skips_it_without_parking_the_worker() {
+        use crate::hwmon::lease::HwmonWriter;
+        let wait = crate::constants::HWMON_CONTROLLER_WAIT;
+        let engine_lease = |state: &Arc<AppState>| {
+            state
+                .hwmon_controller
+                .as_ref()
+                .unwrap()
+                .controller()
+                .lock()
+                .lease_manager()
+                .active_lease()
+                .filter(|l| l.owner == HwmonWriter::Engine)
+                .map(|l| l.lease_id.clone())
+        };
+        let take_engine_lease = |state: &Arc<AppState>| {
+            state
+                .hwmon_controller
+                .as_ref()
+                .unwrap()
+                .controller()
+                .lock()
+                .lease_manager_mut()
+                .take_lease(HwmonWriter::Engine)
+                .expect("the engine's lease");
+        };
+
+        // The lock is free: released.
+        let (state, _writes, _tx) = verify_test_state();
+        take_engine_lease(&state);
+        let (status, _) =
+            super::super::profile::release_engine_lease_and_report(&state, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(engine_lease(&state), None, "the engine's lease is released");
+
+        // Behind a held lock: answered, the worker free, the release skipped.
+        let (state, _writes, _tx) = verify_test_state();
+        take_engine_lease(&state);
+        let before = engine_lease(&state).expect("held");
+        let (release, holder) = hold_controller(&state, wait + std::time::Duration::from_secs(5));
+        let ticks = executor_ticks();
+        let (status, _) =
+            super::super::profile::release_engine_lease_and_report(&state, None).await;
+        assert_eq!(status, StatusCode::OK, "deactivation still answers");
+        let ran = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            ran >= 50,
+            "the executor ran {ran} ticks while deactivation waited"
+        );
+        drop(release);
+        holder.join().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            engine_lease(&state),
+            Some(before),
+            "a release that ran out of time is skipped, never landed late"
         );
     }
 }

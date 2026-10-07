@@ -570,7 +570,7 @@ pub async fn update_header_role_handler(
             Err(crate::serial::OpenFanMemberIdError::NotOpenFan) => state
                 .hwmon_controller
                 .as_ref()
-                .is_some_and(|c| c.lock().headers().into_iter().any(|h| h.id == header_id)),
+                .is_some_and(|c| c.header(&header_id).is_some()),
         };
         if !known {
             return error_response(
@@ -635,15 +635,11 @@ pub async fn update_header_role_handler(
     // [AIO1-d] Release the config lock BEFORE building the response. Everything
     // it guards — the load, the persist and both in-memory commits — is done.
     //
-    // This is not tidiness. `resolved_header_role` below reaches
-    // `AppState::header_role_parts`, which takes `hwmon_controller` — the one
-    // lock the profile engine holds across a blocking sysfs write (DEC-278/289).
-    // Reading it while still holding `config_write` would park EVERY `/config/*`
-    // write route behind a wedged header instead of just this request, and would
-    // stack a third lock onto a pair that `header_role_parts` already documents
-    // as ABBA-sensitive. On the `role: null` clear path this is the only
-    // `hwmon_controller` acquisition in the handler, so the pre-lock validation
-    // above does not cover it.
+    // `resolved_header_role` below reaches `AppState::header_role_parts`, which
+    // took `hwmon_controller` — the lock the profile engine holds across a
+    // blocking sysfs write (DEC-278/289) — until FFA-h moved it onto
+    // `HwmonHandle`'s header snapshot. The early release keeps `config_write`'s
+    // critical section to what it guards.
     //
     // The cost of dropping early is that a concurrent setter could change the
     // resolution between here and the read, so `effective_role` reports the live
@@ -1796,13 +1792,7 @@ pub async fn set_cooling_device_handler(
     let hwmon_ids: std::collections::HashSet<String> = state
         .hwmon_controller
         .as_ref()
-        .map(|c| {
-            c.lock()
-                .headers()
-                .into_iter()
-                .map(|h| h.id.clone())
-                .collect()
-        })
+        .map(|c| c.headers().iter().map(|h| h.id.clone()).collect())
         .unwrap_or_default();
     let openfan_ids: std::collections::HashSet<String> = state
         .cache

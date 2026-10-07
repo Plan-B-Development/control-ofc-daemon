@@ -37,7 +37,6 @@ use crate::api::discovery as disc;
 use crate::api::preflight as pf;
 use crate::api::responses::ErrorEnvelope;
 use crate::control_paths::{ControlPathRecord, ControlPathStore};
-use crate::hwmon::lease::HwmonWriter;
 
 // ── GET /diagnostics/preflight ───────────────────────────────────────
 
@@ -76,7 +75,29 @@ pub async fn preflight_handler(
         );
     };
 
-    let inputs = gather_preflight(&state, &header_id, diagnostic);
+    // FFA-h: the one live fact the report needs from the controller, read off
+    // the tokio workers and bounded — a write that has not returned holds its
+    // lock. Every header fact comes from the handle's snapshot instead.
+    let enable_revert_count = match state
+        .hwmon_controller
+        .as_ref()
+        .filter(|c| c.header(&header_id).is_some())
+    {
+        Some(c) => {
+            let id = header_id.clone();
+            let read = c
+                .with_controller(move |ctrl| {
+                    ctrl.enable_revert_counts().get(&id).copied().unwrap_or(0)
+                })
+                .await;
+            match read {
+                Ok(count) => count,
+                Err(_) => return super::hwmon_controller_busy(),
+            }
+        }
+        None => 0,
+    };
+    let inputs = gather_preflight(&state, &header_id, diagnostic, enable_revert_count);
     json_ok(StatusCode::OK, pf::build_report(&inputs))
 }
 
@@ -88,38 +109,23 @@ fn gather_preflight(
     state: &Arc<AppState>,
     header_id: &str,
     diagnostic: pf::Diagnostic,
+    enable_revert_count: u64,
 ) -> pf::PreflightInputs {
     let pump_protected = state.header_is_pump_protected(header_id);
     let resolved_role = state.resolved_header_role(header_id);
     let role = resolved_role.as_str().to_string();
 
-    // One controller lock, released before anything else is done with the result
-    // — the same discipline `header_role_parts` documents for the ABBA hazard.
-    let header_bits = state.hwmon_controller.as_ref().and_then(|c| {
-        let ctrl = c.lock();
-        let reverts = ctrl
-            .enable_revert_counts()
-            .get(header_id)
-            .copied()
-            .unwrap_or(0);
-        ctrl.header(header_id).map(|h| {
-            (
-                h.is_writable,
-                h.pwm_path.clone(),
-                h.enable_path.clone(),
-                h.rpm_path.clone(),
-                reverts,
-            )
-        })
-    });
-
-    let (header_known, is_writable, has_tach, live, enable_revert_count) = match header_bits {
-        Some((writable, pwm, en, rpm, reverts)) => {
-            let has_tach = rpm.is_some();
-            let live = super::hwmon_ctl::read_header_state(&pwm, &en, &rpm);
-            (true, writable, has_tach, Some(live), reverts)
+    let header = state
+        .hwmon_controller
+        .as_ref()
+        .and_then(|c| c.header(header_id));
+    let (header_known, is_writable, has_tach, live) = match header {
+        Some(h) => {
+            let live =
+                super::hwmon_ctl::read_header_state(&h.pwm_path, &h.enable_path, &h.rpm_path);
+            (true, h.is_writable, h.rpm_path.is_some(), Some(live))
         }
-        None => (false, false, false, None, 0),
+        None => (false, false, false, None),
     };
 
     // DEC-443: the header's own pump floor — the DC pump floor on a DC header.
@@ -424,8 +430,7 @@ pub(crate) async fn start_control_path_discovery(
         mut channels,
         mut tach_paths,
     ) = {
-        let ctrl = controller.lock();
-        let Some(target) = ctrl.header(&header_id) else {
+        let Some(target) = controller.header(&header_id) else {
             return error_response(
                 StatusCode::NOT_FOUND,
                 &ErrorEnvelope::validation(format!("unknown header: {header_id}")),
@@ -440,7 +445,7 @@ pub(crate) async fn start_control_path_discovery(
         );
         let mut channels: Vec<disc::TachChannel> = Vec::new();
         let mut paths: Vec<String> = Vec::new();
-        for h in ctrl.headers() {
+        for h in controller.headers() {
             let Some(path) = h.rpm_path.as_ref() else {
                 continue;
             };
@@ -513,16 +518,12 @@ pub(crate) async fn start_control_path_discovery(
     let baseline = disc::resolve_baseline(live.pwm_percent, floor);
     let (perturbed, direction) = disc::perturbation_target(baseline, delta, floor);
 
-    let verify_lease_id = {
-        let mut ctrl = controller.lock();
-        ctrl.lease_manager_mut()
-            .force_take_lease(HwmonWriter::Verify)
-            .lease_id
+    let Ok((verify_lease, verify_guard)) =
+        super::hwmon_ctl::take_verify_lease(controller, verify_guard).await
+    else {
+        return super::hwmon_controller_busy();
     };
-    let verify_lease = super::hwmon_ctl::VerifyLeaseGuard {
-        controller: controller.clone(),
-        lease_id: verify_lease_id.clone(),
-    };
+    let verify_lease_id = verify_lease.lease_id.clone();
     let lease_for_renew = verify_lease_id.clone();
 
     let run = disc::ControlPathRun {
@@ -561,7 +562,7 @@ pub(crate) async fn start_control_path_discovery(
     let my_run_id = run.run_id.clone();
     let cancel = state.control_path_cancel.clone();
     let cache = state.cache.clone();
-    let ctrl_arc = controller.clone();
+    let ctrl_arc = controller.controller().clone();
     let shutdown_rx = state.openfan_runtime.shutdown.clone();
     let hid = header_id.clone();
     let state_for_persist = state.clone();

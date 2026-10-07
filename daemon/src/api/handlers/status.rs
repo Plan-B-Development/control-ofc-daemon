@@ -254,20 +254,11 @@ pub async fn capabilities_handler(
     // (`forced_target_ids`, DEC-295/DEC-372) — one definition, four readers
     // since the engine's per-member deliverability joined them (`OFN-al`).
     //
-    // These two values come from ONE lock acquisition rather than two. The
-    // controller lock is held for the whole of an uncancellable blocking
-    // `std::fs::write`, so an avoidable second acquisition is avoidable
-    // exposure. Note this is NOT a claim about the handler as a whole — it takes
-    // the lock again below for the AIO header fold, which is safe (the
-    // descriptors are frozen at discovery, so the two acquisitions cannot tear)
-    // but means the honest statement is "one acquisition for these two reads",
-    // not "one for the handler". Raised by `ofc:concurrency-reviewer` against an
-    // earlier wording of this comment that claimed the latter.
+    // FFA-h: from the handle's frozen header snapshot, with no controller lock —
+    // that lock is held for the whole of an uncancellable blocking sysfs write,
+    // and `/capabilities` must answer while one is stuck.
     let (hwmon_header_count, hwmon_writable) = match state.hwmon_controller.as_ref() {
-        Some(c) => {
-            let guard = c.lock();
-            (guard.headers().len(), !guard.forced_target_ids().is_empty())
-        }
+        Some(c) => (c.headers().len(), !c.forced_target_ids().is_empty()),
         None => (0, false),
     };
 
@@ -343,8 +334,7 @@ pub async fn capabilities_handler(
         .hwmon_controller
         .as_ref()
         .map(|c| {
-            c.lock()
-                .headers()
+            c.headers()
                 .iter()
                 .filter(|h| h.is_aio)
                 .fold((0usize, 0usize), |(total, writable), h| {

@@ -227,11 +227,10 @@ pub async fn fan_identify_handler(
             // profile term sees it) or strictly after (its release removes the
             // stop) — the DEC-189 order `override_take_handler` uses.
             //
-            // The inferred role is gathered FIRST, with no profile lock held:
-            // `header_role_parts` takes `hwmon_controller`, which the engine holds
-            // across blocking sysfs writes, and the two are never held together
-            // (DEC-384) — waiting on it with `active_profile` held would stall the
-            // engine tick and `/poll` behind one wedged header.
+            // The inferred role is gathered FIRST, with no profile lock held. It
+            // comes from `HwmonHandle`'s header snapshot (FFA-h), never the
+            // controller lock the engine holds across blocking sysfs writes —
+            // waiting on that on a tokio worker starved the engine.
             //
             // [SAFETY] TS-ax / DEC-419: only `inferred` is taken from this read
             // (`header_role_parts` also returns the assignment; it is ignored).
@@ -248,8 +247,7 @@ pub async fn fan_identify_handler(
             // drops the guard, taking nothing else meanwhile — so reading it
             // under `override_table` cannot close a cycle.
             let (_, inferred) = state.header_role_parts(&fan_id);
-            // DEC-443: the header's pump floor (DC-aware), gathered with the
-            // inferred role for the same reason — it takes the controller lock.
+            // DEC-443: the header's pump floor (DC-aware), from the same snapshot.
             let pump_floor = state.header_pump_floor_pct(&fan_id);
             let ttl = resolve_ttl(body.ttl_secs);
             let (role, target_pct, mode) = {

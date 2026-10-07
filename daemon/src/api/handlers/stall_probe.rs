@@ -17,7 +17,6 @@ use super::{error_response, json_ok, AppState};
 use crate::api::characterization::RestoreOutcome;
 use crate::api::responses::{ErrorEnvelope, HwmonVerifyState};
 use crate::api::stall_probe as sp;
-use crate::hwmon::lease::HwmonWriter;
 
 /// Start a stall/restart probe. Returns **202** with the run snapshot; the probe
 /// runs detached and the client polls `GET /diagnostics/stall-probe`.
@@ -76,8 +75,7 @@ pub async fn stall_probe_handler(
     // DEC-455: `has_mode_switch` is exactly when `set_pwm` records its take for
     // the engine to hand back (`supports_enable` with an enable path).
     let (pwm_path, enable_path, rpm_path, is_writable, has_mode_switch) = {
-        let ctrl = controller.lock();
-        match ctrl.header(&header_id) {
+        match controller.header(&header_id) {
             Some(h) => (
                 h.pwm_path.clone(),
                 h.enable_path.clone(),
@@ -137,16 +135,12 @@ pub async fn stall_probe_handler(
         return super::verify_slot_refusal(&state.cache);
     };
 
-    let verify_lease_id = {
-        let mut ctrl = controller.lock();
-        ctrl.lease_manager_mut()
-            .force_take_lease(HwmonWriter::Verify)
-            .lease_id
+    let Ok((verify_lease, verify_guard)) =
+        super::hwmon_ctl::take_verify_lease(controller, verify_guard).await
+    else {
+        return super::hwmon_controller_busy();
     };
-    let verify_lease = super::hwmon_ctl::VerifyLeaseGuard {
-        controller: controller.clone(),
-        lease_id: verify_lease_id.clone(),
-    };
+    let verify_lease_id = verify_lease.lease_id.clone();
     let lease_for_renew = verify_lease_id.clone();
 
     let run = sp::StallProbeRun {
@@ -174,7 +168,7 @@ pub async fn stall_probe_handler(
     let my_run_id = run.run_id.clone();
     let cancel = state.stall_probe_cancel.clone();
     let cache = state.cache.clone();
-    let ctrl_arc = controller.clone();
+    let ctrl_arc = controller.controller().clone();
     let shutdown_rx = state.openfan_runtime.shutdown.clone();
     let hid = header_id.clone();
     let state_for_eligibility = state.clone();

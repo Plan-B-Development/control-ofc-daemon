@@ -435,6 +435,25 @@ pub struct HwmonExitFloorWrite {
     pub result: Option<Result<(), HwmonError>>,
 }
 
+/// The order `HwmonPwmController::headers` lists headers in: by chip, then
+/// by `pwmN` index.
+pub fn header_order(h: &PwmHeaderDescriptor) -> (&str, u8) {
+    (&h.chip_name, h.pwm_index)
+}
+
+/// [`HwmonPwmController::forced_target_ids`] over a header list in
+/// [`header_order`] — the one definition, shared with `HwmonHandle`'s
+/// snapshot so `/capabilities` reads it without the controller lock (FFA-h).
+pub fn forced_target_ids_of<'a>(
+    headers: impl IntoIterator<Item = &'a PwmHeaderDescriptor>,
+) -> Vec<String> {
+    let mut targets: Vec<&PwmHeaderDescriptor> =
+        headers.into_iter().filter(|h| h.is_writable).collect();
+    // Stable: each group keeps `headers()` order.
+    targets.sort_by_key(|h| is_shared_report_chip(&h.chip_name));
+    targets.into_iter().map(|h| h.id.clone()).collect()
+}
+
 impl HwmonPwmController {
     pub fn new(
         headers: Vec<PwmHeaderDescriptor>,
@@ -763,20 +782,17 @@ impl HwmonPwmController {
     /// (`pwm_discovery.rs`) and never recomputed — `hwmon_rescan_handler` does
     /// not replace a running controller.
     pub fn forced_target_ids(&self) -> Vec<String> {
-        let mut targets: Vec<&PwmHeaderDescriptor> = self
-            .headers()
-            .into_iter()
-            .filter(|h| h.is_writable)
-            .collect();
-        // Stable: each group keeps `headers()` order.
-        targets.sort_by_key(|h| is_shared_report_chip(&h.chip_name));
-        targets.into_iter().map(|h| h.id.clone()).collect()
+        forced_target_ids_of(self.headers())
     }
 
-    /// Get the list of discovered PWM headers.
+    /// Get the list of discovered PWM headers, in [`header_order`].
+    ///
+    /// Frozen at construction: nothing changes the set or a descriptor after
+    /// [`Self::new`], which is what lets the API serve them from
+    /// `HwmonHandle`'s snapshot without this controller's lock (FFA-h).
     pub fn headers(&self) -> Vec<&PwmHeaderDescriptor> {
         let mut headers: Vec<_> = self.headers.values().collect();
-        headers.sort_by_key(|h| (&h.chip_name, h.pwm_index));
+        headers.sort_by_key(|&h| header_order(h));
         headers
     }
 

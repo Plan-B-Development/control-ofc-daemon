@@ -351,7 +351,7 @@ pub async fn deactivate_profile_handler(
             );
         }
     };
-    release_engine_lease_and_report(&state, previous)
+    release_engine_lease_and_report(&state, previous).await
 }
 
 /// Clear the active profile and persist that. Called under the store lock.
@@ -390,15 +390,23 @@ async fn deactivate_and_persist(state: Arc<AppState>) -> Option<(String, String)
 }
 
 /// The rest of deactivation: release the engine's lease and answer.
-fn release_engine_lease_and_report(
+pub(super) async fn release_engine_lease_and_report(
     state: &AppState,
     previous: Option<(String, String)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Release the profile engine's own self-lease so the next activation
     // re-acquires cleanly. The engine is the sole hwmon writer post-2.0.0
     // (DEC-165); only the "profile-engine" owner is released.
-    if let Some(ref ctrl) = state.hwmon_controller {
-        let mut guard = ctrl.lock();
+    //
+    // FFA-h: off the tokio workers, and bounded — a write that has not returned
+    // holds the controller lock. A release that cannot run in time is skipped,
+    // never queued: one landing later could release the lease of an activation
+    // made since. The profile is already gone, so nothing drives the headers
+    // meanwhile; the next activation takes the engine's lease as it finds it.
+    let Some(ctrl) = state.hwmon_controller.as_ref() else {
+        return deactivation_report(previous);
+    };
+    let released = ctrl.with_controller(|guard| {
         let release_id = guard
             .lease_manager()
             .active_lease()
@@ -419,8 +427,20 @@ fn release_engine_lease_and_report(
             // re-assert on the next acquisition).
             guard.on_lease_released();
         }
+    });
+    if released.await.is_err() {
+        log::warn!(
+            "Profile deactivated, but the hwmon controller stayed busy — the engine's lease \
+             was not released"
+        );
     }
+    deactivation_report(previous)
+}
 
+/// Deactivation's answer, and its log line.
+fn deactivation_report(
+    previous: Option<(String, String)>,
+) -> (StatusCode, Json<serde_json::Value>) {
     let (deactivated_id, deactivated_name) = previous
         .map(|(id, name)| (Some(id), Some(name)))
         .unwrap_or((None, None));

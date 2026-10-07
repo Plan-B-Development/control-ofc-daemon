@@ -2507,7 +2507,9 @@ async fn async_main(cli: CliOptions) {
             );
             keep_handback_record(ctrl.handback());
             hwmon_handback = Some(ctrl.handback().clone());
-            Some(Arc::new(Mutex::new(ctrl)))
+            Some(control_ofc_daemon::api::hwmon_handle::HwmonHandle::new(
+                ctrl,
+            ))
         }
         Ok(_) => {
             log::info!("No hwmon PWM headers found");
@@ -2915,7 +2917,10 @@ async fn async_main(cli: CliOptions) {
         let engine_profile = active_profile.clone();
         let engine_safety = safety_rule.clone();
         let engine_fc = app_state.fan_controller.clone();
-        let engine_hwmon = app_state.hwmon_controller.clone();
+        let engine_hwmon = app_state
+            .hwmon_controller
+            .as_ref()
+            .map(|h| h.controller().clone());
         let engine_gpus = app_state.amd_gpus.clone();
         let engine_overrides = app_state.override_table.clone();
         let engine_roles = app_state.header_roles.clone();
@@ -2961,7 +2966,10 @@ async fn async_main(cli: CliOptions) {
             control_ofc_daemon::validation::recorder::RecorderContext::sysfs_roots();
         let ctx = control_ofc_daemon::validation::recorder::RecorderContext {
             cache: cache.clone(),
-            hwmon_controller: app_state.hwmon_controller.clone(),
+            hwmon_controller: app_state
+                .hwmon_controller
+                .as_ref()
+                .map(|h| h.controller().clone()),
             override_table: app_state.override_table.clone(),
             characterization: app_state.characterization.clone(),
             hwmon_root,
@@ -3301,7 +3309,10 @@ async fn async_main(cli: CliOptions) {
             // drains can lower an OpenFan channel or a no-mode header below it.
             let _ = apply_exit_floor(
                 app_state.fan_controller.read().clone(),
-                app_state.hwmon_controller.clone(),
+                app_state
+                    .hwmon_controller
+                    .as_ref()
+                    .map(|h| h.controller().clone()),
                 app_state.cache.exit_floor_pct(),
                 SHUTDOWN_TASK_TIMEOUT,
             );

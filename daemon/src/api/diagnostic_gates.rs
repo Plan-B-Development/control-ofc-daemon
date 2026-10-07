@@ -180,14 +180,13 @@ where
 /// choice, DEC-418 review, `K1`). Never lower than before this change.
 ///
 /// `check` must take no lock the caller holds. Production passes
-/// `AppState::header_is_pump_protected`, which takes `active_profile`,
-/// `header_roles` and `hwmon_controller` one at a time and releases each, so
-/// every call site calls it with nothing held — never from inside a `set_pwm`
-/// critical section. Nor is it called once shutdown has been seen: each run
-/// checks shutdown first, and `RestoreGuard` skips before it reaches the watch.
-/// Nothing a stopping run could do with the answer is left by then — it writes
-/// nothing more — and the exit floor is contending for the controller lock the
-/// lookup takes (bounded, `apply_exit_floor`'s `try_lock_for`).
+/// `AppState::header_is_pump_protected`, which takes `active_profile` and
+/// `header_roles` one at a time and releases each, and reads the header from
+/// `HwmonHandle`'s snapshot — no controller lock since FFA-h — so every call
+/// site calls it with nothing held. Nor is it called once shutdown has been
+/// seen: each run checks shutdown first, and `RestoreGuard` skips before it
+/// reaches the watch. Nothing a stopping run could do with the answer is left
+/// by then — it writes nothing more.
 pub struct PumpWatch<'a> {
     header_id: String,
     subject: &'static str,
@@ -244,7 +243,7 @@ impl<'a> PumpWatch<'a> {
 
     /// [`Self::floored_fallback`] from what the watch has already seen, with
     /// no lookup — for a restore queued behind a write that did not return,
-    /// which must not take the controller lock that write holds (DEC-455).
+    /// which writes from what the run saw before it (DEC-455).
     pub fn floored_fallback_as_seen(&self) -> Option<u8> {
         self.floored_fallback_if(self.seen_as_pump())
     }

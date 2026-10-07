@@ -117,7 +117,10 @@ fn recorder_context(state: &Arc<AppState>) -> RecorderContext {
     let (hwmon_root, powercap_root) = RecorderContext::sysfs_roots();
     RecorderContext {
         cache: state.cache.clone(),
-        hwmon_controller: state.hwmon_controller.clone(),
+        hwmon_controller: state
+            .hwmon_controller
+            .as_ref()
+            .map(|c| c.controller().clone()),
         override_table: state.override_table.clone(),
         characterization: state.characterization.clone(),
         hwmon_root,
@@ -281,16 +284,14 @@ fn build_metadata(
     let headers: Vec<crate::hwmon::pwm_discovery::PwmHeaderDescriptor> = state
         .hwmon_controller
         .as_ref()
-        .map(|c| c.lock().headers().into_iter().cloned().collect())
+        .map(|c| c.headers().to_vec())
         .unwrap_or_default();
 
     // `TS-ag`: the profile is read ONCE, and its id, name and pump members all
     // come from that read. Each member's union used to read the active profile
     // on its own, and the id was read again after them, so an activation in
     // between recorded one profile's id beside pump fields derived from another
-    // — or two members derived from different profiles. The lock is released
-    // before `header_role_parts` takes the controller: the two are never held
-    // together (`AppState::header_is_pump_protected`).
+    // — or two members derived from different profiles.
     let (active_profile_id, active_profile_name, profile_pump_ids) = {
         let guard = state.active_profile.lock();
         match guard.as_ref() {

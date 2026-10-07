@@ -157,7 +157,9 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
         crate::hwmon::HWMON_SYSFS_ROOT,
     ));
     let chips_detected: Vec<HwmonChipInfo> = match state.hwmon_controller {
-        Some(ref controller) => chips_detected(&controller.lock().headers(), &observed),
+        Some(ref controller) => {
+            chips_detected(&controller.headers().iter().collect::<Vec<_>>(), &observed)
+        }
         None => Vec::new(),
     };
 
@@ -165,7 +167,7 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
     let writable_headers = state
         .hwmon_controller
         .as_ref()
-        .map(|c| c.lock().headers().iter().filter(|h| h.is_writable).count())
+        .map(|c| c.headers().iter().filter(|h| h.is_writable).count())
         .unwrap_or(0);
 
     // DEC-119: PCI-space scan for AMD VGA devices + driver binding. Done
@@ -293,8 +295,9 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
         .as_ref()
         .map(|c| {
             // One lock, both maps: taken separately they could straddle a
-            // reclaim and publish a count without the age that dates it.
-            let ctrl = c.lock();
+            // reclaim and publish a count without the age that dates it. On
+            // the blocking pool (the handler's `spawn_blocking`), not a worker.
+            let ctrl = c.controller().lock();
             let now = std::time::Instant::now();
             (
                 ctrl.enable_revert_counts().clone(),

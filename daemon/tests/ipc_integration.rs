@@ -1562,7 +1562,9 @@ fn test_app_state_with_headers(headers: Vec<PwmHeaderDescriptor>) -> Arc<AppStat
             interval: std::time::Duration::from_millis(1000),
             shutdown: tokio::sync::watch::channel(false).1,
         },
-        hwmon_controller: Some(Arc::new(Mutex::new(ctrl))),
+        hwmon_controller: Some(control_ofc_daemon::api::hwmon_handle::HwmonHandle::new(
+            ctrl,
+        )),
         start_time: std::time::Instant::now(),
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
@@ -2686,7 +2688,7 @@ async fn a_wedged_hwmon_header_does_not_stall_unrelated_config_writes() {
     assert!(state_ref.header_roles().contains_key("h1"));
 
     // Wedge the header the way a stuck sysfs write does: hold the controller lock.
-    let wedge = ctrl.lock();
+    let wedge = ctrl.controller().lock();
 
     let p1 = path.clone();
     let blocked = tokio::spawn(async move {
@@ -3319,7 +3321,7 @@ async fn deactivate_profile_releases_profile_engine_lease() {
     }
     {
         let ctrl = state.hwmon_controller.as_ref().unwrap();
-        let mut guard = ctrl.lock();
+        let mut guard = ctrl.controller().lock();
         guard
             .lease_manager_mut()
             .take_lease(HwmonWriter::Engine)
@@ -3338,7 +3340,7 @@ async fn deactivate_profile_releases_profile_engine_lease() {
     // Profile-engine lease should now be released — leaving the controller
     // free for the engine to re-acquire on its next tick.
     let ctrl = state.hwmon_controller.as_ref().unwrap();
-    let guard = ctrl.lock();
+    let guard = ctrl.controller().lock();
     assert!(
         guard.lease_manager().active_lease().is_none(),
         "profile-engine lease must be released after deactivation"
@@ -3356,7 +3358,7 @@ async fn deactivate_profile_preserves_foreign_lease() {
     let state = test_app_state_with_hwmon();
     let foreign_lease_id = {
         let ctrl = state.hwmon_controller.as_ref().unwrap();
-        let mut guard = ctrl.lock();
+        let mut guard = ctrl.controller().lock();
         guard
             .lease_manager_mut()
             .take_lease(HwmonWriter::Verify)
@@ -3370,7 +3372,7 @@ async fn deactivate_profile_preserves_foreign_lease() {
 
     // Foreign (verify) lease unchanged.
     let ctrl = state.hwmon_controller.as_ref().unwrap();
-    let guard = ctrl.lock();
+    let guard = ctrl.controller().lock();
     let active = guard
         .lease_manager()
         .active_lease()
@@ -3391,7 +3393,7 @@ async fn deactivate_profile_preserves_thermal_lease() {
     let state = test_app_state_with_hwmon();
     let thermal_lease_id = {
         let ctrl = state.hwmon_controller.as_ref().unwrap();
-        let mut guard = ctrl.lock();
+        let mut guard = ctrl.controller().lock();
         guard
             .lease_manager_mut()
             .force_take_lease(HwmonWriter::ThermalSafety)
@@ -3403,7 +3405,7 @@ async fn deactivate_profile_preserves_thermal_lease() {
     assert_eq!(status, 200);
 
     let ctrl = state.hwmon_controller.as_ref().unwrap();
-    let guard = ctrl.lock();
+    let guard = ctrl.controller().lock();
     let active = guard
         .lease_manager()
         .active_lease()
@@ -3469,7 +3471,9 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
             interval: std::time::Duration::from_millis(1000),
             shutdown: tokio::sync::watch::channel(false).1,
         },
-        hwmon_controller: Some(Arc::new(Mutex::new(ctrl))),
+        hwmon_controller: Some(control_ofc_daemon::api::hwmon_handle::HwmonHandle::new(
+            ctrl,
+        )),
         start_time: std::time::Instant::now(),
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(Mutex::new(Some(DaemonProfile {
@@ -3523,7 +3527,7 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
     // The engine holds a profile-engine lease and has written a value, seeding
     // coalescing state (manual_mode_set=true, last=50): enable(1) + pwm(50).
     {
-        let mut g = hwmon.lock();
+        let mut g = hwmon.controller().lock();
         let lease = g
             .lease_manager_mut()
             .take_lease(HwmonWriter::Engine)
@@ -3541,7 +3545,7 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
     // deactivate reset coalescing, this re-writes pwm_enable=1 rather than
     // coalescing to a no-op.
     {
-        let mut g = hwmon.lock();
+        let mut g = hwmon.controller().lock();
         let lease = g
             .lease_manager_mut()
             .take_lease(HwmonWriter::Engine)
@@ -3818,7 +3822,9 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
             interval: std::time::Duration::from_millis(1000),
             shutdown: tokio::sync::watch::channel(false).1,
         },
-        hwmon_controller: Some(Arc::new(Mutex::new(ctrl))),
+        hwmon_controller: Some(control_ofc_daemon::api::hwmon_handle::HwmonHandle::new(
+            ctrl,
+        )),
         start_time: std::time::Instant::now(),
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
@@ -6871,7 +6877,7 @@ async fn a_running_characterisation_publishes_its_current_step_and_clears_it() {
 fn test_app_state_with_short_lease(ttl: std::time::Duration) -> Arc<AppState> {
     let state = test_app_state_with_hwmon();
     if let Some(ctrl) = state.hwmon_controller.as_ref() {
-        *ctrl.lock().lease_manager_mut() = LeaseManager::with_ttl(ttl);
+        *ctrl.controller().lock().lease_manager_mut() = LeaseManager::with_ttl(ttl);
     }
     state
 }
@@ -7322,7 +7328,7 @@ async fn a_superseded_run_cannot_publish_over_the_run_that_replaced_it() {
     // Precondition 1: A is inside its settle, past keepalive and past its write.
     let mut a_wrote = false;
     for _ in 0..100 {
-        if controller.lock().last_commanded_pct("h1") == Some(40) {
+        if controller.controller().lock().last_commanded_pct("h1") == Some(40) {
             a_wrote = true;
             break;
         }

@@ -301,10 +301,11 @@ pub fn resolve_role(
 /// [`crate::api::handlers::AppState::header_is_pump_protected`] is the lookup
 /// wrapper around it, for callers holding only a header id. Callers already
 /// inside a loop over descriptors must use **this** function rather than the
-/// wrapper: the wrapper takes the header-roles lock and then the controller
-/// lock, so calling it while holding the controller lock would deadlock on a
-/// non-reentrant `parking_lot::Mutex`. Two copies of the rule would be worse
-/// still — a floor that disagreed with itself between two endpoints.
+/// wrapper: the wrapper takes `active_profile`, which is never held together
+/// with the controller lock. (It no longer takes the controller lock itself —
+/// it reads `HwmonHandle`'s header snapshot since FFA-h.) Two copies of the
+/// rule would be worse still — a floor that disagreed with itself between two
+/// endpoints.
 pub fn is_pump_protected(
     assigned: Option<HeaderRole>,
     inferred: (HeaderRole, RoleSource),

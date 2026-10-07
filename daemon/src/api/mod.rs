@@ -9,6 +9,7 @@ pub mod diagnostic_gates;
 pub mod diagnostics;
 pub mod discovery;
 pub mod handlers;
+pub mod hwmon_handle;
 pub mod preflight;
 pub mod responses;
 pub mod server;

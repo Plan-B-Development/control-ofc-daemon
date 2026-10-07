@@ -1438,8 +1438,8 @@ where
     /// [SAFETY] DEC-455 (`PTR-ab`). Set when one of the run's WRITES did not
     /// return within [`constants::DIAGNOSTIC_WRITE_BUDGET`] — by the run, or by
     /// this guard's own restore write. The stuck write still holds the
-    /// controller lock, so the restore re-reads nothing that takes that lock —
-    /// not even the pump union — and writes only what `after_stuck_write` says.
+    /// controller lock, so the restore re-reads nothing — not even the pump
+    /// union — and writes only what `after_stuck_write` says.
     pub(crate) write_stuck: &'a AtomicBool,
     /// [SAFETY] DEC-455: what the restore does after a write that did not
     /// return. Decided by whether anything else will ever put the header back.
@@ -1613,9 +1613,8 @@ where
 
     /// [SAFETY] DEC-455: the restore after one of the run's writes did not
     /// return — [`AfterStuckWrite`] says what, by whether anything else will
-    /// ever put the header back. Calls nothing that takes the controller lock:
-    /// the queued write's floor comes from what the pump watch has already
-    /// seen. A queued write that is still waiting when its bound runs out stays
+    /// ever put the header back. Looks nothing up: the queued write's floor
+    /// comes from what the pump watch has already seen. A queued write that is still waiting when its bound runs out stays
     /// queued and lands after the stuck one; it is reported
     /// `skipped_unresponsive`, like any write that may yet land.
     async fn after_a_stuck_write(&mut self, moved: bool) {
@@ -3871,8 +3870,7 @@ mod tests {
     /// [SAFETY] DEC-455 (`PTR-ab`): a point write that does not return ends the
     /// sweep `failed`, and on a header with a mode switch nothing more touches
     /// it — no further point, no restore (`skipped_unresponsive`), and no
-    /// pump-watch lookup, which takes the controller lock the parked write
-    /// still holds. The union flips to pump AT the stuck write, so this also
+    /// pump-watch lookup. The union flips to pump AT the stuck write, so this also
     /// pins 4A: no floored restore after a stuck write either. The engine's
     /// next tick hands the header back (DEC-382).
     #[tokio::test(start_paused = true)]

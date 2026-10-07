@@ -37,6 +37,14 @@
   the store over 64 MiB in all. Concurrent creates of one
   id no longer both succeed, a delete can no longer land between an activation's read and its swap, and a
   delete is now fsynced (FFA-j, audit F-16, F-20).
+- **A motherboard fan write that does not return no longer stalls the daemon.** Such a write keeps the
+  motherboard fan controller locked, and requests waited for that lock on the threads the fan engine runs
+  on — `/capabilities`, `/hwmon/headers`, an identify (of an OpenFan fan too), role edits and more. Enough
+  of them stopped the engine until the watchdog killed the daemon. Requests that only need header facts
+  now answer from the headers found at start-up without the lock; a diagnostic start and the preflight wait
+  at most 2 s for it, off those threads, and are refused with a retryable `503 hardware_unavailable`
+  (`details.reason: "hwmon_controller_busy"`) past that. Deactivating a profile still answers, and leaves
+  the engine's lease to the next activation (FFA-h, audit F-9).
 - **An OpenFan board that restarted during a firmware update now gets its fan duties again.** An update
   parks every channel at 100 %; a board that then restarted into its firmware instead of its bootloader
   was handed back with the daemon still believing it held 100 %, so a profile's 100 % was never sent and
