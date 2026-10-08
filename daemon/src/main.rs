@@ -340,11 +340,16 @@ const ALLOW_NON_ROOT_FLAG: &str = "--allow-non-root";
 
 /// Return `true` if the current process is running as effective UID 0.
 fn running_as_root() -> bool {
+    effective_uid() == 0
+}
+
+/// The process's effective UID.
+fn effective_uid() -> u32 {
     // SAFETY: `geteuid` is thread-safe, reentrant, signal-safe, and always
     // defined on Unix targets. It reads immutable per-process kernel state
     // (effective UID) with no memory safety concerns — no pointers, no
     // allocations, no mutable references involved.
-    unsafe { libc::geteuid() == 0 }
+    unsafe { libc::geteuid() }
 }
 
 /// Exit status for a command line the daemon cannot parse (DEC-467): the usual
@@ -595,6 +600,22 @@ fn take_instance_lock(state_dir: &Path) {
     }
 }
 
+/// Refuse a socket path in a directory another user can add entries to
+/// (`LIFE-b`): they could plant a socket that answers there, which
+/// [`refuse_if_socket_is_served`] would take for a running daemon. Runs before
+/// that probe and again once [`preflight_socket`] has created the directory.
+/// Exit 1: a configuration error, not another instance.
+fn refuse_unsafe_socket_dir(socket_path: &Path) {
+    if let Err(e) = single_instance::check_socket_dir(socket_path, effective_uid()) {
+        eprintln!("error: {e}");
+        eprintln!();
+        eprintln!("ipc.socket_path must be in a directory no other user can write,");
+        eprintln!("or another user could put a socket there first and stop the");
+        eprintln!("daemon starting. The default is /run/control-ofc/control-ofc.sock.");
+        std::process::exit(1);
+    }
+}
+
 /// Refuse to start if a daemon is serving on the configured socket, before
 /// anything writes a file a running daemon owns (DEC-467). The lock cannot see
 /// a daemon that predates it — during an upgrade the running service is the
@@ -689,6 +710,7 @@ fn preflight_socket(config: &DaemonConfig) -> UnixListener {
             std::process::exit(1);
         }
     }
+    refuse_unsafe_socket_dir(socket_path);
     if let Err(e) = clear_stale_socket(socket_path, SOCKET_PROBE_TIMEOUT) {
         exit_on_socket_error(&e);
     }
@@ -2242,6 +2264,7 @@ async fn async_main(cli: CliOptions) {
     // hardware. Both exit(1) themselves on failure.
     preflight_privileges(&config, cli.allow_non_root);
     take_instance_lock(Path::new(&config.state.state_dir));
+    refuse_unsafe_socket_dir(Path::new(&config.ipc.socket_path));
     refuse_if_socket_is_served(Path::new(&config.ipc.socket_path));
 
     // Init state directory from config (must happen before any state load/save)
@@ -4756,6 +4779,15 @@ mod tests {
         let probe = at("refuse_if_socket_is_served(Path::new(&config.ipc.socket_path));");
         assert!(lock < probe);
         assert_eq!(src.matches("refuse_if_socket_is_served(").count(), 2);
+        // `LIFE-b`: the socket's directory is vetted before the probe can take a
+        // socket another user planted there for a running daemon.
+        let dir_check = at("refuse_unsafe_socket_dir(Path::new(&config.ipc.socket_path));");
+        assert!(lock < dir_check && dir_check < probe);
+        assert_eq!(
+            src.matches("refuse_unsafe_socket_dir(").count(),
+            3,
+            "one definition, one call here and one in preflight_socket"
+        );
         for after in [
             "sweep_interrupted(",
             "prune_default()",
@@ -4784,6 +4816,16 @@ mod tests {
         let socket_fn = &src[src.find("fn preflight_socket(").unwrap()..];
         let socket_fn = &socket_fn[..socket_fn.find("\n}\n").unwrap()];
         assert!(socket_fn.contains("clear_stale_socket("));
+        // And re-vets the directory once it has created it, before the probe.
+        let in_socket = |needle: &str| {
+            socket_fn
+                .find(needle)
+                .unwrap_or_else(|| panic!("preflight_socket no longer contains `{needle}`"))
+        };
+        assert!(in_socket("create_dir_all(") < in_socket("refuse_unsafe_socket_dir(socket_path);"));
+        assert!(
+            in_socket("refuse_unsafe_socket_dir(socket_path);") < in_socket("clear_stale_socket(")
+        );
         assert!(
             !socket_fn.contains("remove_file"),
             "preflight_socket must not unlink the socket itself"

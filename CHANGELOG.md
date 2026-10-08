@@ -13,6 +13,16 @@
   replayed it, as systemd's emptying used to. systemd keeps retrying the refused service about once a minute,
   and it takes over once the other daemon exits (LIFE-a, DEC-487).
 
+### Security
+
+- **Another user can no longer stop the daemon starting by planting a socket where it is configured to
+  put its own.** With `ipc.socket_path` in a directory other users can write, someone could create a socket
+  that answers there first; the daemon took it for a running daemon and refused to start. The daemon now
+  refuses such a path itself, at startup, as a configuration error (exit 1): the socket's directory must not
+  be writable by other users, sticky bit or not, every directory and symlink on the way must be owned by
+  root, and one further up may be writable by others only if it is sticky, like `/tmp`.
+  The default `/run/control-ofc/control-ofc.sock` is unaffected (LIFE-b).
+
 ## [4.1.0] — 2026-10-07
 
 Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 4.1.0 is the matching

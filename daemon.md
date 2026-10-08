@@ -928,7 +928,7 @@ limit (below) — or, when `runtime.toml` cannot be read, nothing (`DC-cu`).
 Other paths:
 
 - **Profile loading** (DEC-435), tried in order, the first that loads winning: `--profile <name>` or `--profile-file <path>` (the first on the command line) → `$OPENFAN_PROFILE` → the saved profile in `daemon_state.json`. A source that names no file or will not load is logged and the next is tried. `<name>` is a file stem in a search directory, not the profile's display name. Neither `--profile` nor `OPENFAN_PROFILE` is saved: `daemon_state.json` records only `POST /profile/activate`/`deactivate`
-- **Socket**: `/run/control-ofc/control-ofc.sock` (configurable via `ipc.socket_path`)
+- **Socket**: `/run/control-ofc/control-ofc.sock` (configurable via `ipc.socket_path`). Before the socket probe, and again after creating a missing directory, `single_instance::check_socket_dir` refuses (exit 1) a path whose directory another user can write — sticky bit or not — or with a directory on the way owned by anyone but root (or the `--allow-non-root` user), or one further up writable by others without the sticky bit; a symlink on the way is judged by its owner and its target walked by the same rules, every link of a chain (at most 40 hops). Otherwise a planted socket that answers would be read as a running daemon and refused (`LIFE-b`)
 - **Persisted state**: `/var/lib/control-ofc/daemon_state.json` (configurable via `state.state_dir`)
 
 ### `daemon.toml` vs `runtime.toml` (the runtime overlay)

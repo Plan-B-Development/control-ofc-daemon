@@ -137,7 +137,7 @@ The keys, with their defaults:
 
 After an edit, `sudo systemctl reload control-ofc-daemon` applies the profile search directories, the exit minimum and the coolant limit at once; every other key needs `sudo systemctl restart control-ofc-daemon`. A reload that finds the file invalid logs the error and keeps the running values.
 
-**Moving `state_dir` or `socket_path` needs a drop-in as well.** The service runs with `ProtectSystem=strict`, so outside its private `/tmp` it can write files only under `/run/control-ofc`, `/var/lib/control-ofc` and `/sys/devices`. Add the new directory with `ReadWritePaths=` in `sudo systemctl edit control-ofc-daemon`, or the daemon cannot create its socket or save its state there.
+**Moving `state_dir` or `socket_path` needs a drop-in as well.** The service runs with `ProtectSystem=strict`, so outside its private `/tmp` it can write files only under `/run/control-ofc`, `/var/lib/control-ofc` and `/sys/devices`. Add the new directory with `ReadWritePaths=` in `sudo systemctl edit control-ofc-daemon`, or the daemon cannot create its socket or save its state there. Put the socket in a directory only root can write: the daemon refuses to start (exit 1) if another user can write the directory it goes in — sticky bit or not — owns any directory or symlink on the way to it, or can write a directory further up that is not sticky (`/tmp`-style `1777` is fine there), because they could put a socket there first and keep the daemon from starting.
 
 ## The system tray
 

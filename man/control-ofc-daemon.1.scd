@@ -92,6 +92,10 @@ _/etc/control-ofc/daemon.toml_
 	the profile search directories and the exit floor; every other key
 	needs a restart. Moving _state_dir_ or _socket_path_ also needs a
 	*ReadWritePaths=* drop-in, because the unit uses *ProtectSystem=strict*.
+	The daemon refuses to start (exit 1) if another user can write the
+	directory _socket_path_ goes in (sticky bit or not), owns a directory
+	or symlink on the way to it, or can write a directory further up that
+	is not sticky: they could put a socket there first and stop it starting.
 	See _/usr/share/doc/control-ofc-daemon/USER_GUIDE.md_.
 
 _/var/lib/control-ofc/runtime.toml_

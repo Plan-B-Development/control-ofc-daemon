@@ -196,6 +196,160 @@ fn classify_connect(outcome: Option<io::Result<()>>) -> SocketProbe {
     }
 }
 
+/// Why [`check_socket_dir`] refused the directories on the way to the socket.
+#[derive(Debug)]
+pub enum UnsafeSocketDir {
+    /// `path` belongs to `uid`, which is neither root nor this process.
+    Owner { path: PathBuf, uid: u32 },
+    /// Users other than its owner can add entries to `path` (`mode`).
+    Writable { path: PathBuf, mode: u32 },
+    /// `path` could not be examined.
+    Unreadable { path: PathBuf, error: io::Error },
+}
+
+impl std::fmt::Display for UnsafeSocketDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Owner { path, uid } => write!(
+                f,
+                "IPC socket directory '{}' is owned by uid {uid}, neither root nor this user",
+                path.display()
+            ),
+            Self::Writable { path, mode } => write!(
+                f,
+                "IPC socket directory '{}' is writable by other users (mode {mode:04o})",
+                path.display()
+            ),
+            Self::Unreadable { path, error } => write!(
+                f,
+                "cannot examine IPC socket directory '{}': {error}",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Refuse a socket path another user could plant a socket at first (`LIFE-b`).
+///
+/// [`probe_socket`] reads a socket that answers as a running daemon and the
+/// daemon then refuses to start, so whoever can create an entry where the
+/// socket goes can keep the daemon from starting. Nobody but root (or `euid`,
+/// for a developer's `--allow-non-root` run) may own a directory on the way,
+/// and the directory the socket — or the first directory the daemon has to
+/// create for it — goes in must not be writable by anyone else, sticky bit or
+/// not: the sticky bit stops others removing entries, not adding them. An
+/// ancestor further up may be writable by others only if it is sticky, so
+/// nobody can rename the directory below it away and put their own in its place.
+///
+/// A symlink on the way is judged by its owner, who can repoint it, and then
+/// the path it leads to is walked by the same rules — every link of a chain,
+/// and the directories each sits in. The default `/run/control-ofc` (root
+/// `0755`) passes.
+pub fn check_socket_dir(socket_path: &Path, euid: u32) -> Result<(), UnsafeSocketDir> {
+    let socket_path = std::path::absolute(socket_path).map_err(|e| unreadable(socket_path, e))?;
+    // The socket's directory, or — if it is not there yet — the nearest one
+    // that is, where the daemon creates the missing ones.
+    for dir in socket_path.ancestors().skip(1) {
+        match std::fs::symlink_metadata(dir) {
+            Ok(_) => return walk_socket_dirs(dir, euid, true, &mut 0),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(unreadable(dir, e)),
+        }
+    }
+    Ok(())
+}
+
+/// Symlinks [`check_socket_dir`] follows before giving up, as the kernel's
+/// `ELOOP` limit does.
+const MAX_SYMLINK_HOPS: u32 = 40;
+
+fn unreadable(path: &Path, error: io::Error) -> UnsafeSocketDir {
+    UnsafeSocketDir::Unreadable {
+        path: path.to_path_buf(),
+        error,
+    }
+}
+
+/// Judge `start` and each of its ancestors, following every symlink among them
+/// into its target. `holds_socket` marks `start` as the directory a new entry
+/// will be created in, and passes to a symlink's target.
+fn walk_socket_dirs(
+    start: &Path,
+    euid: u32,
+    holds_socket: bool,
+    hops: &mut u32,
+) -> Result<(), UnsafeSocketDir> {
+    for (i, dir) in start.ancestors().enumerate() {
+        let meta = std::fs::symlink_metadata(dir).map_err(|e| unreadable(dir, e))?;
+        let holds = holds_socket && i == 0;
+        judge_socket_dir(dir, &meta, euid, holds)?;
+        if meta.file_type().is_symlink() {
+            *hops += 1;
+            if *hops > MAX_SYMLINK_HOPS {
+                return Err(unreadable(
+                    dir,
+                    io::Error::other("too many levels of symbolic links"),
+                ));
+            }
+            let target = std::fs::read_link(dir).map_err(|e| unreadable(dir, e))?;
+            // A relative target is resolved from the link's directory; joining
+            // an absolute one replaces the base.
+            let target = dir.parent().unwrap_or(Path::new("/")).join(target);
+            walk_socket_dirs(&target, euid, holds, hops)?;
+        }
+    }
+    Ok(())
+}
+
+/// The rule [`check_socket_dir`] applies to one entry on the way to the socket;
+/// `holds_socket` marks the directory a new entry will be created in.
+fn judge_socket_dir(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    euid: u32,
+    holds_socket: bool,
+) -> Result<(), UnsafeSocketDir> {
+    use std::os::unix::fs::MetadataExt;
+    judge_socket_dir_bits(
+        path,
+        meta.uid(),
+        meta.mode(),
+        meta.file_type().is_symlink(),
+        euid,
+        holds_socket,
+    )
+}
+
+fn judge_socket_dir_bits(
+    path: &Path,
+    uid: u32,
+    mode: u32,
+    is_symlink: bool,
+    euid: u32,
+    holds_socket: bool,
+) -> Result<(), UnsafeSocketDir> {
+    if uid != 0 && uid != euid {
+        return Err(UnsafeSocketDir::Owner {
+            path: path.to_path_buf(),
+            uid,
+        });
+    }
+    // A symlink's own mode means nothing; where it leads is walked separately.
+    if is_symlink {
+        return Ok(());
+    }
+    let mode = mode & 0o7777;
+    let others_can_add = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    if others_can_add && (holds_socket || !sticky) {
+        return Err(UnsafeSocketDir::Writable {
+            path: path.to_path_buf(),
+            mode,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +482,152 @@ mod tests {
         assert!(matches!(
             classify_connect(Some(Err(denied))),
             SocketProbe::Unknown(_)
+        ));
+    }
+
+    fn euid() -> u32 {
+        // SAFETY: `geteuid` reads immutable per-process state; no pointers.
+        unsafe { libc::geteuid() }
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// The path `check_socket_dir` refused as writable by others, or a panic.
+    fn writable_dir(socket: &Path) -> PathBuf {
+        match check_socket_dir(socket, euid()) {
+            Err(UnsafeSocketDir::Writable { path, .. }) => path,
+            other => panic!(
+                "{} must be refused as writable, got {other:?}",
+                socket.display()
+            ),
+        }
+    }
+
+    /// `LIFE-b`'s opposite branch: a directory only its owner writes passes,
+    /// with or without directories the daemon still has to create.
+    #[test]
+    fn a_socket_in_a_private_directory_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        chmod(dir.path(), 0o755);
+        check_socket_dir(&dir.path().join("d.sock"), euid()).expect("0755, own uid");
+        check_socket_dir(&dir.path().join("new/deeper/d.sock"), euid())
+            .expect("created inside a 0755 directory");
+    }
+
+    /// `LIFE-b`: anyone who can add an entry where the socket
+    /// goes can plant one that answers, and the daemon then refuses to start.
+    /// The sticky bit does not stop the planting, so it does not help here.
+    #[test]
+    fn a_socket_directory_others_can_write_is_refused_sticky_or_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let socket = shared.join("d.sock");
+        for mode in [0o777, 0o1777, 0o770, 0o1733] {
+            chmod(&shared, mode);
+            assert_eq!(writable_dir(&socket), shared, "mode {mode:o}");
+        }
+        chmod(&shared, 0o755);
+        check_socket_dir(&socket, euid()).expect("precondition: 0755 passes");
+    }
+
+    /// A directory the daemon must create is judged by where it would be
+    /// created: another user could create it there first.
+    #[test]
+    fn a_missing_socket_directory_is_judged_where_it_would_be_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        chmod(&shared, 0o1777);
+        assert_eq!(writable_dir(&shared.join("ofc/d.sock")), shared);
+    }
+
+    /// Further up, a sticky world-writable directory (`/tmp`) is fine — nobody
+    /// can rename the root-owned directory inside it away — and a plain one is not.
+    #[test]
+    fn an_ancestor_others_can_write_passes_only_when_sticky() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        let private = shared.join("ofc");
+        std::fs::create_dir_all(&private).unwrap();
+        chmod(&private, 0o755);
+        let socket = private.join("d.sock");
+        chmod(&shared, 0o1777);
+        check_socket_dir(&socket, euid()).expect("sticky ancestor");
+        chmod(&shared, 0o777);
+        assert_eq!(writable_dir(&socket), shared);
+    }
+
+    /// A symlink on the way leads to directories judged by the same rules.
+    #[test]
+    fn a_symlinked_socket_directory_is_judged_by_where_it_leads() {
+        let dir = tempfile::tempdir().unwrap();
+        chmod(dir.path(), 0o755);
+        let shared = dir.path().join("shared");
+        let private = dir.path().join("private");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::create_dir(&private).unwrap();
+        chmod(&shared, 0o777);
+        chmod(&private, 0o755);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&private, &link).unwrap();
+        check_socket_dir(&link.join("d.sock"), euid()).expect("leads to 0755");
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&shared, &link).unwrap();
+        assert_eq!(writable_dir(&link.join("d.sock")), shared);
+    }
+
+    /// The middle of a chain counts too (the review of `LIFE-b`): `link` leads
+    /// through `hub/link2`, and whoever can write `hub` can repoint `link2`.
+    #[test]
+    fn every_link_of_a_symlink_chain_is_judged() {
+        let dir = tempfile::tempdir().unwrap();
+        chmod(dir.path(), 0o755);
+        let hub = dir.path().join("hub");
+        let private = dir.path().join("private");
+        std::fs::create_dir(&hub).unwrap();
+        std::fs::create_dir(&private).unwrap();
+        chmod(&private, 0o755);
+        std::os::unix::fs::symlink(&private, hub.join("link2")).unwrap();
+        // A relative target, resolved from the link's own directory.
+        std::os::unix::fs::symlink("hub/link2", dir.path().join("link")).unwrap();
+        let socket = dir.path().join("link/d.sock");
+        chmod(&hub, 0o755);
+        check_socket_dir(&socket, euid()).expect("every link in a 0755 directory");
+        chmod(&hub, 0o777);
+        assert_eq!(writable_dir(&socket), hub);
+    }
+
+    #[test]
+    fn a_symlink_loop_is_refused_not_followed_for_ever() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("b", dir.path().join("a")).unwrap();
+        std::os::unix::fs::symlink("a", dir.path().join("b")).unwrap();
+        assert!(matches!(
+            check_socket_dir(&dir.path().join("a/d.sock"), euid()),
+            Err(UnsafeSocketDir::Unreadable { .. })
+        ));
+    }
+
+    /// Ownership needs another uid, which a test cannot create; the rule itself.
+    #[test]
+    fn an_entry_owned_by_another_user_is_refused_even_a_symlink() {
+        let p = Path::new("/x");
+        let other = euid().wrapping_add(1).max(1);
+        for (is_symlink, mode) in [(false, 0o700), (true, 0o777)] {
+            assert!(matches!(
+                judge_socket_dir_bits(p, other, mode, is_symlink, euid(), true),
+                Err(UnsafeSocketDir::Owner { uid, .. }) if uid == other
+            ));
+            judge_socket_dir_bits(p, 0, mode, is_symlink, euid(), true).expect("root");
+            judge_socket_dir_bits(p, euid(), mode, is_symlink, euid(), true).expect("self");
+        }
+        // As root, only root.
+        assert!(matches!(
+            judge_socket_dir_bits(p, 1000, 0o755, false, 0, false),
+            Err(UnsafeSocketDir::Owner { .. })
         ));
     }
 }

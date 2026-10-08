@@ -144,3 +144,39 @@ fn an_unusable_lock_is_an_ordinary_failure() {
     assert!(stderr.contains("single-instance lock"), "{stderr}");
     assert_ne!(ANOTHER_INSTANCE_EXIT_CODE, 1);
 }
+
+/// `LIFE-b`: another user plants a socket that answers in a directory they can
+/// write, where `ipc.socket_path` points. The probe would read it as a running
+/// daemon and refuse with the another-instance status, so the daemon never
+/// starts and `ExecStopPost` skips its hand-back. The directory is refused
+/// first, as a configuration error (exit 1); the sticky bit does not help,
+/// because it stops others removing entries, not adding them.
+#[test]
+fn a_socket_planted_in_a_directory_others_can_write_is_a_configuration_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let shared = dir.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    let socket = shared.join("ofc.sock");
+    let _planted = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let cfg = config(dir.path(), &state, &socket);
+
+    for mode in [0o777, 0o1777] {
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(mode)).unwrap();
+        let (code, stderr) = run_daemon(&cfg);
+        assert_eq!(code, Some(1), "mode {mode:o}: {stderr}");
+        assert!(
+            stderr.contains("writable by other users"),
+            "mode {mode:o}: {stderr}"
+        );
+        assert!(socket.exists(), "the planted socket is left alone");
+    }
+
+    // The opposite branch: the same socket in a directory only its owner
+    // writes is a running daemon's, as before.
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (code, stderr) = run_daemon(&cfg);
+    assert_eq!(code, Some(ANOTHER_INSTANCE_EXIT_CODE), "{stderr}");
+}
