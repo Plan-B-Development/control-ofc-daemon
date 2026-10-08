@@ -4699,6 +4699,30 @@ mod tests {
         }
     }
 
+    /// The band computed from a curve's stored `hysteresis_c` (DEC-489): absent
+    /// is the default. The out-of-range `*_engine_backstop` cases pin the
+    /// engine's own clamp — `serde_json::from_value` skips the load-time net,
+    /// which (with `validate()`) rejects such a profile. The GUI holds hand
+    /// copies of both constants and checks the same section.
+    #[test]
+    fn parity_hysteresis_band_matches_oracle() {
+        let vectors = load_parity_vectors();
+        let cases = vectors["hysteresis_band"]
+            .as_array()
+            .expect("hysteresis_band");
+        assert!(!cases.is_empty(), "an empty section asserts nothing");
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let curve: CurveConfig = serde_json::from_value(case["curve"].clone()).expect("curve");
+            let expected = case["expected_c"].as_f64().unwrap();
+            let got = curve.effective_hysteresis_c();
+            assert!(
+                (got - expected).abs() < 1e-9,
+                "hysteresis_band[{name}]: got {got}, expected {expected}"
+            );
+        }
+    }
+
     #[test]
     fn parity_tuning_sequence_matches_oracle() {
         use std::collections::HashMap;

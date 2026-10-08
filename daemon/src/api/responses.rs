@@ -1197,8 +1197,11 @@ pub struct ControlCapability {
     /// the client then labels and interprets it as a thermal observation. The
     /// flag is the only thing that distinguishes the two before the request.
     ///
-    /// Carries `#[serde(default)]`, unlike the Batch 1 pair above: absent means
-    /// "an older daemon", which is exactly a denial here.
+    /// Absent on the wire means "an older daemon", which is exactly a denial
+    /// here; the client reads a missing flag as `false`. (The
+    /// `#[serde(default)]` below, like every one on this struct, is inert:
+    /// `ControlCapability` is only ever serialised, and this daemon always
+    /// sends the field.)
     #[serde(default)]
     pub thermal_observation: bool,
     /// AIO Phase 8 Run 2, daemon >= 2.43.0. Gates the
@@ -2842,11 +2845,15 @@ mod tests {
     /// populating them is realism rather than necessity — but keep doing it, since
     /// a future `skip_serializing_if` would otherwise change what this pins.
     ///
-    /// Scope covers the structs behind `/sensors`, `/fans`, `/poll`,
-    /// `/hwmon/headers`, `/inventory/hwmon`, `/inventory/cooling-devices`,
-    /// `/capabilities` (`Limits`) and `/diagnostics/hardware` (`VoltageEntry`),
-    /// plus the Phase 8 diagnostic surfaces — preflight, control-path discovery,
-    /// PWM characterisation, steady state and the startup fingerprint.
+    /// Scope covers the structs behind `/sensors`, `/fans`, `/poll` (its status
+    /// half included), `/hwmon/headers`, `/inventory/hwmon`,
+    /// `/inventory/cooling-devices`, `/capabilities` (`Limits`, `FeatureFlags`,
+    /// `ControlCapability`) and `/diagnostics/hardware` (`VoltageEntry`,
+    /// `ThermalSafetyInfo`), plus the Phase 8 diagnostic surfaces — preflight,
+    /// control-path discovery, PWM characterisation, steady state and the
+    /// startup fingerprint — and the OpenFAN maintenance surfaces.
+    /// `ControlCapability` is also the cross-repo pin on capability flag names:
+    /// the GUI checks its `daemon_supports` registry against the same entry.
     ///
     /// **All 29 fixture entries have a daemon-side arm (`P8-ca`), and the
     /// coverage is now asserted BOTH WAYS at the foot of this test.** A struct
@@ -3836,6 +3843,134 @@ mod tests {
         expect(&serde_json::to_value(&write).unwrap(), "FirmwareWrite");
         record.firmware_write = Some(write);
         expect(&serde_json::to_value(&record).unwrap(), "MaintenanceRecord");
+
+        // The status half of `/poll` and `/status`, the thermal-safety block of
+        // `/diagnostics/hardware`, and the `/capabilities` flags (2026-10-08
+        // interop audit, batch 7). `ControlCapability` is the cross-repo pin on
+        // capability flag NAMES: the GUI checks its `daemon_supports` registry
+        // against this same fixture entry.
+        let subsystem = SubsystemStatus {
+            name: "openfan".into(),
+            status: "ok".into(),
+            age_ms: Some(500),
+            reason: "readings fresh".into(),
+        };
+        expect(
+            &serde_json::to_value(&subsystem).unwrap(),
+            "SubsystemStatus",
+        );
+        let override_entry = OverrideStatusEntry {
+            control_id: "ctl1".into(),
+            pwm_percent: 60,
+            expires_in_secs: 12,
+        };
+        expect(
+            &serde_json::to_value(&override_entry).unwrap(),
+            "OverrideStatusEntry",
+        );
+        let unavailable = UnavailableSensorEntry {
+            id: "hwmon:nct6798:pci0:temp3".into(),
+            label: "AUXTIN0".into(),
+            reason: "read_failed".into(),
+            unavailable_for_ms: 4_000,
+        };
+        expect(
+            &serde_json::to_value(&unavailable).unwrap(),
+            "UnavailableSensorEntry",
+        );
+        let skipped = SkippedControlEntry {
+            control_id: "ctl2".into(),
+            control_name: "Case".into(),
+            reason: "sensor_unavailable".into(),
+            skipped_for_ms: 3_000,
+        };
+        expect(
+            &serde_json::to_value(&skipped).unwrap(),
+            "SkippedControlEntry",
+        );
+        let output = ControlOutputEntry {
+            control_id: "ctl1".into(),
+            output_pct: 42.0,
+        };
+        expect(
+            &serde_json::to_value(&output).unwrap(),
+            "ControlOutputEntry",
+        );
+        let status = StatusResponse {
+            api_version: API_VERSION,
+            daemon_version: "4.2.0".into(),
+            overall_status: "ok".into(),
+            subsystems: vec![subsystem],
+            uptime_seconds: Some(3600),
+            thermal_state: "normal".into(),
+            overrides: vec![override_entry],
+            fan_identify: vec![IdentifyStatusEntry {
+                fan_id: "openfan:ch00".into(),
+                expires_in_secs: 20,
+                mode: "stop".into(),
+                identify_pwm_percent: 0,
+            }],
+            unavailable_sensors: vec![unavailable],
+            skipped_controls: vec![skipped],
+            control_outputs: vec![output],
+            runtime_config_degraded: Some(crate::runtime_config::RuntimeConfigDegraded {
+                reason: "malformed".into(),
+                path: "/var/lib/control-ofc/runtime.toml".into(),
+                detail: "expected a table".into(),
+                phase: "startup".into(),
+                kept_as: None,
+            }),
+            validation_session: Some(ValidationSessionSummary {
+                session_id: "vs-1".into(),
+                kind: "validation".into(),
+                state: "running".into(),
+                elapsed_ms: 1_000,
+                sample_count: 1,
+                event_count: 0,
+                sample_limit_reached: false,
+                cooling_device_id: String::new(),
+            }),
+            active_profile_id: Some("p1".into()),
+            active_profile_name: Some("Quiet".into()),
+            has_active_profile: true,
+            readiness: Some(crate::hwmon::readiness::ReadinessRollup {
+                overall: crate::hwmon::readiness::ReadinessSeverity::Warning,
+                critical: 0,
+                warning: 1,
+                info: 0,
+                top_summary: None,
+                top_code: None,
+            }),
+            verify_active: false,
+            emergency_causes: vec!["cpu".into()],
+            pump_stalls: vec![pump_stall],
+            advisories: vec![advisory],
+            openfan_link: Some("connected".into()),
+            openfan_maintenance: Some(summary),
+            openfan_silent_board: Some(silent_entry),
+        };
+        expect(&serde_json::to_value(&status).unwrap(), "StatusResponse");
+        let thermal = ThermalSafetyInfo {
+            state: "normal".into(),
+            cpu_sensor_found: true,
+            emergency_threshold_c: 105.0,
+            release_threshold_c: 80.0,
+            coolant_limit_c: 60.0,
+            coolant_release_c: 55.0,
+        };
+        expect(
+            &serde_json::to_value(&thermal).unwrap(),
+            "ThermalSafetyInfo",
+        );
+        let features = FeatureFlags {
+            openfan_write_supported: true,
+            hwmon_write_supported: true,
+        };
+        expect(&serde_json::to_value(&features).unwrap(), "FeatureFlags");
+        expect(
+            &serde_json::to_value(ControlCapability::default()).unwrap(),
+            "ControlCapability",
+        );
 
         // **Both directions, and this is what makes the oracle an interlock
         // rather than a workflow (`P8-cb`).** A struct declared in the fixture
