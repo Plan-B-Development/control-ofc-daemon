@@ -767,6 +767,13 @@ struct DualChipEntry {
     /// chip here is a curated, evidenced claim and every row must make the
     /// choice. Today only the B450 AORUS PRO's IT8792E is evidenced (it87 #21).
     fanless: &'static [&'static str],
+    /// Chips the board may expose **in place of** `chips[0]` (`DC-cp`, decision
+    /// `U14`): where the SIV catalogue gives the board's SIV a stanza for a
+    /// second primary chip as well, either one is that board's primary.
+    /// [`expected_chips_for_board`] reports the alternative only when it is the
+    /// one bound, so a board that has it is not told its listed primary is
+    /// missing. Empty on almost every row.
+    alt_primary: &'static [&'static str],
 }
 
 const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
@@ -777,6 +784,7 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X870E AORUS MASTER",
         chips: &["it8696", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // it87 #70 (`it8696-isa-0a40` + `it87952-isa-0a60`); also covers PRO ICE and
     // PRO X3D (ICE), which share SIV A008090A in the it87 SIV catalogue.
@@ -784,6 +792,7 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X870E AORUS PRO",
         chips: &["it8696", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // DEC-421 (was the bare "X870E AORUS ELITE", which also matched the
     // single-chip ELITE WIFI7 and raised a false missing-chip warning there).
@@ -793,6 +802,7 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X870E AORUS ELITE X3D",
         chips: &["it8696", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // Single chip, kept under the guard (DEC-421): IT8696E only, 6 fan headers
     // (it87 PR #131 — "loads without force_id", six fan inputs; vendor manual).
@@ -800,18 +810,21 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X870E AORUS ELITE WIFI7",
         chips: &["it8696"],
         fanless: &[],
+        alt_primary: &[],
     },
     // LHM PR #1647 + SIV 0xA10A090A (5 + 5 headers). Evidence B.
     DualChipEntry {
         board_name: "X870E AORUS XTREME AI TOP",
         chips: &["it8696", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // it87 #39, LHM PR #1510.
     DualChipEntry {
         board_name: "X870 AORUS ELITE WIFI7",
         chips: &["it8696", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // Resolved 2026-09-24: the ICE variant IS dual-chip — it87 #51's own
     // `sensors` output shows `it8696-isa-0a40` + `it87952-isa-0a60`, #75 agrees,
@@ -823,6 +836,7 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X870 AORUS ELITE WIFI7 ICE",
         chips: &["it8696", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // ── AM5 600-series (IT8689E + IT8792E — NOT IT87952E) ───────
     // DEC-421: the secondary on these boards is an IT8792E/IT8795E (ID 0x8733),
@@ -834,6 +848,7 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X670E AORUS MASTER",
         chips: &["it8689", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     // Evidence C (SIV catalogue 0x90080909 only: it8689 + it8792) — no
     // exact-board log. The previous `it87952` had no source at all.
@@ -841,6 +856,7 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X670E AORUS PRO X",
         chips: &["it8689", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     // Single chip, kept under the guard (DEC-421): IT8689E only, 5 fan headers
     // (manual rev 1304; SIV 0x90050506 single it8689 stanza). The dual-chip
@@ -851,6 +867,7 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X670 AORUS ELITE AX",
         chips: &["it8689"],
         fanless: &[],
+        alt_primary: &[],
     },
     // ── LGA1700 Z690 / Z790 (IT8689E + IT87952E) ───────────────
     // SIV 0x8108090A; LHM lists IT87952E as the second chip. Evidence B.
@@ -858,12 +875,14 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "Z690 AORUS PRO",
         chips: &["it8689", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // LHM `SuperIOHardware.cs` IT87952E config; SIV catalogue. Evidence B.
     DualChipEntry {
         board_name: "Z690 AORUS MASTER",
         chips: &["it8689", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // Single chip, kept under the guard (DEC-421): IT8689E only, 6 fan headers
     // (SIV 0x90060606 single it8689 stanza, shared by ELITE / ELITE AX / AX ICE /
@@ -874,6 +893,7 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "Z790 AORUS ELITE AX",
         chips: &["it8689"],
         fanless: &[],
+        alt_primary: &[],
     },
     // it87 #22 / #128: IT8689E rev 1 @0xa40 + IT87952E rev 1 at **0x0b10**
     // (`it87952-isa-0b10`); SIV 900A090A, 10 headers (2 on an IT57xx EC).
@@ -881,18 +901,21 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "Z790 AORUS MASTER",
         chips: &["it8689", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // SIV catalogue 0x910A090A only. Evidence C.
     DualChipEntry {
         board_name: "Z790 AORUS XTREME",
         chips: &["it8689", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // LHM (PRO X config) + SIV catalogue; covers PRO X WIFI7. Evidence B.
     DualChipEntry {
         board_name: "Z790 AORUS PRO X",
         chips: &["it8689", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // ── LGA1851 Z890 (IT8696E + IT87952E) ──────────────────────
     // LHM PR #2512 (MASTER / MASTER-CF / MASTER AI TOP) + SIV 0xA00A090B.
@@ -902,6 +925,7 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "Z890 AORUS MASTER",
         chips: &["it8696", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // The rest of the LGA1851 dual-chip SIVs, enrolled at the catalogue-only tier
     // as "Z790 AORUS XTREME" is (G161, Q19): each SIV has both an `it8696_<siv>`
@@ -915,11 +939,13 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "Z890 AORUS ELITE X ICE",
         chips: &["it8696", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     DualChipEntry {
         board_name: "Z890 AORUS PRO ICE",
         chips: &["it8696", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // SIV 0xA009090B. "TACHYON ICE" is not a substring of "TACHYON DUO X ICE",
     // so both are listed.
@@ -927,58 +953,123 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "Z890 AORUS TACHYON ICE",
         chips: &["it8696", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     DualChipEntry {
         board_name: "Z890 AORUS TACHYON DUO X ICE",
         chips: &["it8696", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // SIV 0xA00B090B.
     DualChipEntry {
         board_name: "Z890 AORUS XTREME AI TOP",
         chips: &["it8696", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // SIV 0xA108090B (W880 is the workstation chipset of the same socket).
     DualChipEntry {
         board_name: "Z890 AI TOP",
         chips: &["it8696", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     DualChipEntry {
         board_name: "Z890 AERO D",
         chips: &["it8696", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     DualChipEntry {
         board_name: "W880 AI TOP",
         chips: &["it8696", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // ── LGA1200 / LGA1151 (IT8688E + IT8792E) ──────────────────
     // hw-probe `it8792-isa-0a60` samples; LHM; SIV catalogue. Evidence A.
     // "Z390 AORUS MASTER" also covers the G2 EDITION; "Z390 AORUS PRO" the PRO
     // WIFI; "Z390 AORUS ULTRA" the ULTRA-CF.
+    //
+    // `DC-cp` (`U14`): the catalogue (`gigabyte-it87-intel.conf`, 626ad08) gives
+    // the Z390 SIVs 0x4008090B and 0x4008090A an `it8686` stanza beside the
+    // `it8688` one, so every Z390 row accepts either as its primary.
     DualChipEntry {
         board_name: "Z390 AORUS MASTER",
         chips: &["it8688", "it8792"],
         fanless: &[],
+        alt_primary: &["it8686"],
     },
     DualChipEntry {
         board_name: "Z390 AORUS PRO",
         chips: &["it8688", "it8792"],
         fanless: &[],
+        alt_primary: &["it8686"],
     },
     DualChipEntry {
         board_name: "Z390 AORUS ULTRA",
         chips: &["it8688", "it8792"],
         fanless: &[],
+        alt_primary: &["it8686"],
     },
     // hw-probe (3 samples) + SIV catalogue it8688 + it8792. Evidence A.
+    // Also covers the MASTER WATERFORCE (SIV 0x6508090B, the same pair).
     DualChipEntry {
         board_name: "Z490 AORUS MASTER",
         chips: &["it8688", "it8792"],
         fanless: &[],
+        alt_primary: &[],
+    },
+    // The rest of the LGA1151 / LGA1200 dual-chip SIVs, enrolled at the
+    // catalogue-only tier as the LGA1851 ones above were (`DC-cp`, `U14`): each
+    // SIV has both an `it8688_<siv>` and an `it8792_<siv>` stanza in the it87
+    // fork's `gigabyte-it87-intel.conf` (626ad08). No exact-board log. Evidence
+    // C. Every name matches only boards of its own pair among the catalogue's
+    // 750 board names; the single-chip siblings (Z390 I AORUS PRO WIFI, Z390
+    // AORUS ELITE, Z490I AORUS ULTRA, Z490 AORUS ELITE, Z490 VISION G …) reach
+    // none of them.
+    // SIV 0x4008090B; also covers the XTREME WATERFORCE (/ 5G), SIV 0x4008090A,
+    // whose `it8686` stanza makes the same alternative primary.
+    DualChipEntry {
+        board_name: "Z390 AORUS XTREME",
+        chips: &["it8688", "it8792"],
+        fanless: &[],
+        alt_primary: &["it8686"],
+    },
+    // SIV 0x6008090B.
+    DualChipEntry {
+        board_name: "Z490 AORUS PRO AX",
+        chips: &["it8688", "it8792"],
+        fanless: &[],
+        alt_primary: &[],
+    },
+    DualChipEntry {
+        board_name: "Z490 VISION D",
+        chips: &["it8688", "it8792"],
+        fanless: &[],
+        alt_primary: &[],
+    },
+    // SIV 0x6208090B (the MASTER row above shares it); covers the ULTRA G2.
+    DualChipEntry {
+        board_name: "Z490 AORUS ULTRA",
+        chips: &["it8688", "it8792"],
+        fanless: &[],
+        alt_primary: &[],
+    },
+    // SIV 0x6208090B; also covers the XTREME WATERFORCE, SIV 0x6108090A.
+    DualChipEntry {
+        board_name: "Z490 AORUS XTREME",
+        chips: &["it8688", "it8792"],
+        fanless: &[],
+        alt_primary: &[],
+    },
+    // SIV 0x6308090B (W480 is the workstation chipset of the same socket).
+    DualChipEntry {
+        board_name: "W480 VISION D",
+        chips: &["it8688", "it8792"],
+        fanless: &[],
+        alt_primary: &[],
     },
     // ── AM4 500-series X570 (IT8688E + IT8792E/IT8795E) ────────
     // The driver groups IT8792E and IT8795E under one ID (0x8733); hwmon names
@@ -987,28 +1078,33 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X570 AORUS MASTER",
         chips: &["it8688", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     DualChipEntry {
         board_name: "X570 AORUS PRO",
         chips: &["it8688", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     // Shadowed by "X570 AORUS PRO" (same pair); kept so the guard names it.
     DualChipEntry {
         board_name: "X570 AORUS PRO WIFI",
         chips: &["it8688", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     DualChipEntry {
         board_name: "X570 AORUS ULTRA",
         chips: &["it8688", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     // hw-probe `it8792-isa-0a60` ×3; SIV catalogue. Evidence B.
     DualChipEntry {
         board_name: "X570 AORUS XTREME",
         chips: &["it8688", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     // ── AM4 X570S refresh (IT8689E + IT87952E) ─────────────────
     // it87 PR #119's config header: "Chip 1 (it8689-isa-0a40) = IT8689E …
@@ -1017,6 +1113,7 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X570S AERO G",
         chips: &["it8689", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // LHM PR #1091 (owner-contributor: "I can now control FAN4, FAN5_PUMP and
     // FAN6_PUMP"); SIV 0x800A090A. Evidence B. "X570 AORUS MASTER" above is not a
@@ -1025,6 +1122,7 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X570S AORUS MASTER",
         chips: &["it8689", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // ── AM4 500-series B550 (IT8688E + IT8792E) ────────────────
     // hw-probe (MASTER 7×, PRO 7×, PRO AC 5×, PRO V2 5×); LHM. Evidence A.
@@ -1034,11 +1132,13 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "B550 AORUS MASTER",
         chips: &["it8688", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     DualChipEntry {
         board_name: "B550 AORUS PRO",
         chips: &["it8688", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     // ── sTRX4 TRX40 (IT8688E + IT8792E) ────────────────────────
     // it87 #2 config, hw-probe; SIV catalogue. Evidence A.
@@ -1046,21 +1146,25 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "TRX40 AORUS XTREME",
         chips: &["it8688", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     DualChipEntry {
         board_name: "TRX40 AORUS MASTER",
         chips: &["it8688", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     DualChipEntry {
         board_name: "TRX40 AORUS PRO WIFI",
         chips: &["it8688", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     DualChipEntry {
         board_name: "TRX40 DESIGNARE",
         chips: &["it8688", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     // ── AM4 400-series AORUS boards (IT8686E + IT8792E) ────────
     // X470 AORUS ULTRA GAMING: upstream lm-sensors config
@@ -1072,16 +1176,19 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X470 AORUS ULTRA GAMING",
         chips: &["it8686", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     DualChipEntry {
         board_name: "X470 AORUS GAMING 7 WIFI",
         chips: &["it8686", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     DualChipEntry {
         board_name: "X470 AORUS GAMING 5 WIFI",
         chips: &["it8686", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     // "B450 AORUS PRO" matches the plain board, the WIFI and the -CF variants.
     // it87 #21: `sensors` shows both chips — but the IT8792E here carries NO fan
@@ -1091,12 +1198,14 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "B450 AORUS PRO",
         chips: &["it8686", "it8792"],
         fanless: &["it8792"],
+        alt_primary: &[],
     },
     // Shadowed by "B450 AORUS PRO"; kept so the guard names it.
     DualChipEntry {
         board_name: "B450 AORUS PRO-CF",
         chips: &["it8686", "it8792"],
         fanless: &["it8792"],
+        alt_primary: &[],
     },
     // ── TR4 X399 (IT8686E + IT8792E) ───────────────────────────
     // Was "X399 DESIGNARE EX-CF"; the SIV catalogue spells the board "X399
@@ -1105,6 +1214,7 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X399 DESIGNARE EX",
         chips: &["it8686", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     // it87 #135 dmesg (PRO-CF: "IT8686E at 0xa40, revision 2 / IT8792E/IT8795E
     // at 0xa60, revision 3"); hw-probe (PRO, XTREME, Gaming 7). Evidence A.
@@ -1112,16 +1222,19 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X399 AORUS PRO",
         chips: &["it8686", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     DualChipEntry {
         board_name: "X399 AORUS XTREME",
         chips: &["it8686", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     DualChipEntry {
         board_name: "X399 AORUS GAMING 7",
         chips: &["it8686", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     // ── B550 VISION D (IT8688E + IT8792E) ──────────────────────
     // Upstream lm-sensors config (`configs/Gigabyte/GA-B550-VISION-D.conf`,
@@ -1132,12 +1245,14 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "B550 VISION D",
         chips: &["it8688", "it8792"],
         fanless: &[],
+        alt_primary: &[],
     },
     // it87 #93 `sensors`: IT8696E (5 fans) + IT87952E (3 fans). Evidence A.
     DualChipEntry {
         board_name: "B850 AI TOP",
         chips: &["it8696", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // DEC-332: enrolled after the 0x8883 latch was measured recoverable. Its
     // secondary is an IT87952E behind an ITE eSPI→LPC bridge, evidenced by
@@ -1147,6 +1262,7 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X870 AORUS STEALTH ICE",
         chips: &["it8696", "it87952"],
         fanless: &[],
+        alt_primary: &[],
     },
     // X870 AORUS STEALTH ICE: now ENROLLED above (DEC-332), after two rounds of
     // getting this wrong in opposite directions.
@@ -1219,10 +1335,41 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
 /// expose. Returns an empty Vec if the board is not in the table or
 /// `board_name` is empty — i.e. callers can treat empty as "no info" and
 /// the GUI will skip the warning UI.
-pub fn expected_chips_for_board(board_vendor: &str, board_name: &str) -> Vec<String> {
-    board_entry(board_vendor, board_name)
-        .map(|e| e.chips.iter().map(|s| (*s).to_string()).collect())
-        .unwrap_or_default()
+///
+/// `bound_chips` are the chip names bound on this machine. Where the row
+/// accepts an alternative primary ([`DualChipEntry::alt_primary`]) and the
+/// listed primary is not bound but an alternative is, the alternative is
+/// reported in its place (`DC-cp`), so the client's expected-vs-bound
+/// comparison does not call the board's real primary missing. With neither
+/// bound, the listed primary stands.
+pub fn expected_chips_for_board(
+    board_vendor: &str,
+    board_name: &str,
+    bound_chips: &[&str],
+) -> Vec<String> {
+    let Some(entry) = board_entry(board_vendor, board_name) else {
+        return Vec::new();
+    };
+    let is_bound = |chip: &str| {
+        bound_chips.iter().any(|b| {
+            crate::hwmon::chip_name::canonical_chip_name(b.trim()).eq_ignore_ascii_case(chip)
+        })
+    };
+    let mut chips: Vec<String> = entry.chips.iter().map(|s| (*s).to_string()).collect();
+    if let Some(primary) = chips.first_mut() {
+        if !is_bound(primary) {
+            if let Some(alt) = entry.alt_primary.iter().find(|a| is_bound(a)) {
+                *primary = (*alt).to_string();
+            }
+        }
+    }
+    chips
+}
+
+/// The chips the board's row lists, before [`expected_chips_for_board`]
+/// resolves an alternative primary against what is bound.
+fn listed_chips_for_board(board_vendor: &str, board_name: &str) -> Vec<String> {
+    expected_chips_for_board(board_vendor, board_name, &[])
 }
 
 /// The chips [`expected_chips_for_board`] lists that carry **no fan header**
@@ -1283,7 +1430,7 @@ fn board_entry(board_vendor: &str, board_name: &str) -> Option<&'static DualChip
 /// silently false. A Nuvoton dual-chip board needs a second table, not a row in
 /// this one.
 pub fn board_expects_only_ite_chips(board_vendor: &str, board_name: &str) -> bool {
-    let chips = expected_chips_for_board(board_vendor, board_name);
+    let chips = listed_chips_for_board(board_vendor, board_name);
     !chips.is_empty() && chips.iter().all(|c| expected_driver_for_chip(c) == "it87")
 }
 
@@ -1862,7 +2009,7 @@ mod tests {
     fn expected_chips_x870e_aorus_master() {
         // The reference case — the user's reported board, has IT8696E +
         // IT87952E. If this regresses the dual-chip warning never fires.
-        let chips = expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X870E AORUS MASTER");
+        let chips = listed_chips_for_board("Gigabyte Technology Co., Ltd.", "X870E AORUS MASTER");
         assert!(chips.contains(&"it8696".to_string()));
         assert!(chips.contains(&"it87952".to_string()));
         assert_eq!(chips.len(), 2);
@@ -1872,8 +2019,8 @@ mod tests {
     fn expected_chips_handles_empty_board_name() {
         // Older firmwares with empty DMI must not panic and must return
         // empty so the GUI hides the dual-chip warning.
-        assert!(expected_chips_for_board("Gigabyte", "").is_empty());
-        assert!(expected_chips_for_board("", "").is_empty());
+        assert!(listed_chips_for_board("Gigabyte", "").is_empty());
+        assert!(listed_chips_for_board("", "").is_empty());
     }
 
     /// `DC-da`: the guard's decision table, row by row. The script itself is
@@ -1936,7 +2083,7 @@ mod tests {
         // ASUS/MSI boards aren't in the dual-chip table; even if a board
         // name happened to match, vendor mismatch should suppress the
         // lookup so we don't false-positive other vendors.
-        assert!(expected_chips_for_board("ASUSTeK COMPUTER INC.", "X870E AORUS MASTER").is_empty());
+        assert!(listed_chips_for_board("ASUSTeK COMPUTER INC.", "X870E AORUS MASTER").is_empty());
     }
 
     #[test]
@@ -1944,7 +2091,7 @@ mod tests {
         // Single-chip boards or unknown boards return empty so the GUI
         // treats them as "no info" and hides the warning.
         assert!(
-            expected_chips_for_board("Gigabyte Technology Co., Ltd.", "B650 AORUS ELITE AX")
+            listed_chips_for_board("Gigabyte Technology Co., Ltd.", "B650 AORUS ELITE AX")
                 .is_empty()
         );
     }
@@ -1953,7 +2100,7 @@ mod tests {
     fn expected_chips_substring_match_tolerates_dmi_suffix() {
         // Some firmwares append "  Rev 1.0" or trailing whitespace —
         // substring match must still succeed.
-        let chips = expected_chips_for_board(
+        let chips = listed_chips_for_board(
             "Gigabyte Technology Co., Ltd.",
             "Z790 AORUS MASTER  Rev 1.0",
         );
@@ -1965,7 +2112,7 @@ mod tests {
         // Older X570 generation pairs the primary IT8688E with the smaller
         // IT8792E (or 8795E, same hwmon name). Regression: do not confuse
         // X570 with X670/X870 chip pairings.
-        let chips = expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X570 AORUS MASTER");
+        let chips = listed_chips_for_board("Gigabyte Technology Co., Ltd.", "X570 AORUS MASTER");
         assert_eq!(chips, vec!["it8688".to_string(), "it8792".to_string()]);
     }
 
@@ -1979,7 +2126,7 @@ mod tests {
         // dual-chip missing-PWM warning either misfires or never fires
         // on this board generation.
         let chips =
-            expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X470 AORUS ULTRA GAMING");
+            listed_chips_for_board("Gigabyte Technology Co., Ltd.", "X470 AORUS ULTRA GAMING");
         assert_eq!(chips, vec!["it8686".to_string(), "it8792".to_string()]);
     }
 
@@ -1987,7 +2134,7 @@ mod tests {
     fn expected_chips_b450_aorus_pro_uses_am4_400_chip_pair() {
         // The B450 generation uses IT8686E (not IT8688E — that's X570).
         // Matches the existing B450 AORUS PRO-CF entry's chip list.
-        let chips = expected_chips_for_board("Gigabyte Technology Co., Ltd.", "B450 AORUS PRO");
+        let chips = listed_chips_for_board("Gigabyte Technology Co., Ltd.", "B450 AORUS PRO");
         assert_eq!(chips, vec!["it8686".to_string(), "it8792".to_string()]);
     }
 
@@ -1997,8 +2144,7 @@ mod tests {
         // generic "B450 AORUS PRO" substring entry — keeping that
         // consolidation deliberate so adding new WIFI/CF variants does
         // not require a new entry per SKU.
-        let chips =
-            expected_chips_for_board("Gigabyte Technology Co., Ltd.", "B450 AORUS PRO WIFI");
+        let chips = listed_chips_for_board("Gigabyte Technology Co., Ltd.", "B450 AORUS PRO WIFI");
         assert_eq!(chips, vec!["it8686".to_string(), "it8792".to_string()]);
     }
 
@@ -2017,7 +2163,7 @@ mod tests {
             );
         }
         assert_eq!(
-            expected_chips_for_board(gb, "X870E AORUS MASTER").len(),
+            listed_chips_for_board(gb, "X870E AORUS MASTER").len(),
             2,
             "precondition: a known dual-chip board"
         );
@@ -2050,7 +2196,7 @@ mod tests {
         // DEC-106: AM4 500-series Gigabyte AORUS topology — verified
         // against upstream lm-sensors GA-B550-VISION-D.conf
         // (primary it8688-isa-0a40 + secondary it8792-isa-0a60).
-        let chips = expected_chips_for_board("Gigabyte Technology Co., Ltd.", "B550 VISION D");
+        let chips = listed_chips_for_board("Gigabyte Technology Co., Ltd.", "B550 VISION D");
         assert_eq!(chips, vec!["it8688".to_string(), "it8792".to_string()]);
     }
 
@@ -2059,7 +2205,7 @@ mod tests {
         // DEC-106: AM5 800-series Gigabyte AI-TOP variant — confirmed by
         // frankcrawford/it87 issue #93. Same dual-chip topology as the
         // X870E AORUS MASTER family.
-        let chips = expected_chips_for_board("Gigabyte Technology Co., Ltd.", "B850 AI TOP");
+        let chips = listed_chips_for_board("Gigabyte Technology Co., Ltd.", "B850 AI TOP");
         assert_eq!(chips, vec!["it8696".to_string(), "it87952".to_string()]);
     }
 
@@ -2071,15 +2217,15 @@ mod tests {
         // owner-confirmed dual-chip report is the X3D.
         let gb = "Gigabyte Technology Co., Ltd.";
         assert_eq!(
-            expected_chips_for_board(gb, "X870E AORUS ELITE X3D"),
+            listed_chips_for_board(gb, "X870E AORUS ELITE X3D"),
             vec!["it8696".to_string(), "it87952".to_string()]
         );
         assert_eq!(
-            expected_chips_for_board(gb, "X870E AORUS ELITE X3D ICE"),
+            listed_chips_for_board(gb, "X870E AORUS ELITE X3D ICE"),
             vec!["it8696".to_string(), "it87952".to_string()]
         );
         assert_eq!(
-            expected_chips_for_board(gb, "X870E AORUS ELITE WIFI7"),
+            listed_chips_for_board(gb, "X870E AORUS ELITE WIFI7"),
             vec!["it8696".to_string()],
             "the WIFI7 is single-chip: expecting a second chip is a false alarm"
         );
@@ -2093,8 +2239,7 @@ mod tests {
         // the guard names the board and its no-vendor fallback covers it (DEC-424
         // suppresses on any Gigabyte-vendor board). Must not be shadowed by (or
         // shadow) the X670E entries.
-        let chips =
-            expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X670 AORUS ELITE AX");
+        let chips = listed_chips_for_board("Gigabyte Technology Co., Ltd.", "X670 AORUS ELITE AX");
         assert_eq!(chips, vec!["it8689".to_string()]);
     }
 
@@ -2104,7 +2249,7 @@ mod tests {
         // IT8792E/IT8795E chip at 0xa60, revision 3", which hwmon names `it8792`.
         // Expecting `it87952` made a correctly working X670E AORUS MASTER report
         // a missing secondary chip.
-        let chips = expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X670E AORUS MASTER");
+        let chips = listed_chips_for_board("Gigabyte Technology Co., Ltd.", "X670E AORUS MASTER");
         assert_eq!(chips, vec!["it8689".to_string(), "it8792".to_string()]);
         assert!(!chips.iter().any(|c| c == "it87952"));
     }
@@ -2121,7 +2266,7 @@ mod tests {
             "Z790 AORUS ELITE AX ICE",
         ] {
             assert_eq!(
-                expected_chips_for_board(gb, name),
+                listed_chips_for_board(gb, name),
                 vec!["it8689".to_string()],
                 "{name}"
             );
@@ -2157,14 +2302,14 @@ mod tests {
             ("X399 DESIGNARE EX-CF", &["it8686", "it8792"]),
         ];
         for (board, want) in cases {
-            let got = expected_chips_for_board(gb, board);
+            let got = listed_chips_for_board(gb, board);
             let want: Vec<String> = want.iter().map(|s| (*s).to_string()).collect();
             assert_eq!(got, want, "{board}");
         }
         // Single-chip siblings the new rows must NOT reach.
-        assert!(expected_chips_for_board(gb, "B550M AORUS PRO").is_empty());
-        assert!(expected_chips_for_board(gb, "B550I AORUS PRO AX").is_empty());
-        assert!(expected_chips_for_board(gb, "Z890 AORUS ELITE WIFI7").is_empty());
+        assert!(listed_chips_for_board(gb, "B550M AORUS PRO").is_empty());
+        assert!(listed_chips_for_board(gb, "B550I AORUS PRO AX").is_empty());
+        assert!(listed_chips_for_board(gb, "Z890 AORUS ELITE WIFI7").is_empty());
     }
 
     #[test]
@@ -2183,7 +2328,7 @@ mod tests {
             "Z890 AERO D",
             "W880 AI TOP",
         ] {
-            assert_eq!(expected_chips_for_board(gb, board), pair, "{board}");
+            assert_eq!(listed_chips_for_board(gb, board), pair, "{board}");
         }
         // The catalogue's single-chip LGA1851 siblings (IT8696E stanza only) must
         // stay unmatched, or their owners get a false missing-chip warning.
@@ -2195,8 +2340,124 @@ mod tests {
             "Z890 EAGLE WIFI7",
             "Z890M AORUS ELITE WIFI7",
         ] {
-            assert!(expected_chips_for_board(gb, board).is_empty(), "{board}");
+            assert!(listed_chips_for_board(gb, board).is_empty(), "{board}");
         }
+    }
+
+    #[test]
+    fn expected_chips_resolves_the_lga1151_lga1200_catalogue_enrolments() {
+        // `DC-cp` (`U14`): every LGA1151 / LGA1200 SIV the it87 catalogue gives
+        // both an `it8688` and an `it8792` stanza is enrolled, each name with the
+        // substring siblings it is meant to reach.
+        let gb = "Gigabyte Technology Co., Ltd.";
+        let pair = vec!["it8688".to_string(), "it8792".to_string()];
+        for board in [
+            "Z390 AORUS XTREME",
+            "Z390 AORUS XTREME WATERFORCE",
+            "Z390 AORUS XTREME WATERFORCE 5G",
+            "Z490 AORUS PRO AX",
+            "Z490 VISION D",
+            "Z490 AORUS ULTRA",
+            "Z490 AORUS ULTRA G2",
+            "Z490 AORUS XTREME",
+            "Z490 AORUS XTREME WATERFORCE",
+            "Z490 AORUS MASTER WATERFORCE",
+            "W480 VISION D",
+        ] {
+            assert_eq!(listed_chips_for_board(gb, board), pair, "{board}");
+        }
+        // The catalogue's single-chip siblings (no `it8792` stanza for their SIV).
+        for board in [
+            "Z390 I AORUS PRO WIFI",
+            "Z390 AORUS ELITE",
+            "Z390 DESIGNARE",
+            "Z390 GAMING X",
+            "Z490I AORUS ULTRA",
+            "Z490 AORUS ELITE AC",
+            "Z490 VISION G",
+            "Z490 GAMING X AX",
+        ] {
+            assert!(listed_chips_for_board(gb, board).is_empty(), "{board}");
+        }
+    }
+
+    /// `DC-cp` (`U14`): a Z390 board whose primary binds as `it8686` is
+    /// expected to have `it8686`, not told its `it8688` is missing — on every
+    /// Z390 row, suffixed (it87 v2.0) names included — while the listed
+    /// primary stands when it is the one bound, when neither is, and on a row
+    /// that accepts no alternative.
+    #[test]
+    fn expected_chips_take_an_alternative_primary_only_when_it_is_bound() {
+        let gb = "Gigabyte Technology Co., Ltd.";
+        let listed = vec!["it8688".to_string(), "it8792".to_string()];
+        let alt = vec!["it8686".to_string(), "it8792".to_string()];
+        for board in [
+            "Z390 AORUS MASTER G2 EDITION",
+            "Z390 AORUS PRO WIFI",
+            "Z390 AORUS ULTRA",
+            "Z390 AORUS XTREME WATERFORCE",
+        ] {
+            assert_eq!(listed_chips_for_board(gb, board), listed, "{board}");
+            assert_eq!(
+                expected_chips_for_board(gb, board, &["it8686", "it8792"]),
+                alt,
+                "{board}"
+            );
+            assert_eq!(
+                expected_chips_for_board(gb, board, &["it8686_4008090b", "it8792_4008090b"]),
+                alt,
+                "{board}: suffixed names"
+            );
+            assert_eq!(
+                expected_chips_for_board(gb, board, &["it8688", "it8792"]),
+                listed,
+                "{board}"
+            );
+            assert_eq!(
+                expected_chips_for_board(gb, board, &["it8688", "it8686"]),
+                listed,
+                "{board}: the listed primary wins when both are bound"
+            );
+            assert_eq!(
+                expected_chips_for_board(gb, board, &["k10temp"]),
+                listed,
+                "{board}"
+            );
+        }
+        // A row without the alternative ignores a bound it8686.
+        assert_eq!(
+            expected_chips_for_board(gb, "Z490 AORUS MASTER", &["it8686", "it8792"]),
+            listed
+        );
+    }
+
+    /// An alternative primary is a different chip that the same driver binds,
+    /// and the listed primary it stands in for is not a fanless one (the
+    /// fanless list names the listed chip, which a substitution would orphan).
+    #[test]
+    fn every_alternative_primary_is_a_distinct_chip_of_the_same_driver() {
+        let mut rows_with_alt = 0;
+        for entry in GIGABYTE_DUAL_CHIP_BOARDS {
+            if entry.alt_primary.is_empty() {
+                continue;
+            }
+            rows_with_alt += 1;
+            let primary = entry.chips[0];
+            assert!(!entry.fanless.contains(&primary), "{}", entry.board_name);
+            for a in entry.alt_primary {
+                assert!(!entry.chips.contains(a), "{}: {a}", entry.board_name);
+                assert_eq!(
+                    expected_driver_for_chip(a),
+                    expected_driver_for_chip(primary),
+                    "{}: {a}",
+                    entry.board_name
+                );
+            }
+        }
+        assert!(
+            rows_with_alt > 0,
+            "precondition: some row has an alternative"
+        );
     }
 
     #[test]
@@ -2234,7 +2495,7 @@ mod tests {
         // X670E SKUs — "X670E AORUS ELITE AX" is deliberately NOT in the
         // table and must return empty, not inherit the X670 pairing.
         assert!(
-            expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X670E AORUS ELITE AX")
+            listed_chips_for_board("Gigabyte Technology Co., Ltd.", "X670E AORUS ELITE AX")
                 .is_empty()
         );
     }
@@ -2248,7 +2509,7 @@ mod tests {
         // X870E AORUS ELITE X3D was enrolled on the same tier of evidence was the
         // inconsistency `X87-f` recorded.
         let chips =
-            expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X870 AORUS STEALTH ICE");
+            listed_chips_for_board("Gigabyte Technology Co., Ltd.", "X870 AORUS STEALTH ICE");
         assert_eq!(
             chips,
             vec!["it8696".to_string(), "it87952".to_string()],
@@ -2263,7 +2524,7 @@ mod tests {
         // X470 AORUS GAMING 7 WIFI uses the same it8686+it8792 topology
         // per the it87.c DMI table and vendor service manual.
         let chips =
-            expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X470 AORUS GAMING 7 WIFI");
+            listed_chips_for_board("Gigabyte Technology Co., Ltd.", "X470 AORUS GAMING 7 WIFI");
         assert_eq!(chips, vec!["it8686".to_string(), "it8792".to_string()]);
     }
 

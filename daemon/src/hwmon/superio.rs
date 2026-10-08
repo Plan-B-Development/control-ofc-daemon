@@ -353,7 +353,8 @@ pub fn detect_superio(ev: &dyn SuperIoEvidence) -> SuperIoReport {
 
     // Union evidence into a name-keyed map (BTreeMap ⇒ deterministic ordering).
     let mut acc: BTreeMap<String, EvidenceAcc> = BTreeMap::new();
-    for b in ev.bound_chips() {
+    let bound_chips = ev.bound_chips();
+    for b in bound_chips.iter().cloned() {
         // Only BOUND chips that are recognised Super-I/O monitoring chips become
         // candidates. An ordinary sensor chip (k10temp/coretemp/amdgpu/nvme/
         // spd5118/…) is a legitimate hwmon device but NOT a Super-I/O chip, and
@@ -373,7 +374,8 @@ pub fn detect_superio(ev: &dyn SuperIoEvidence) -> SuperIoReport {
         acc.entry(normalize(&c)).or_default().kmsg = true;
     }
     let (board_vendor, board_name) = ev.board();
-    for c in chip_db::expected_chips_for_board(&board_vendor, &board_name) {
+    let bound_names: Vec<&str> = bound_chips.iter().map(|b| b.chip_name.as_str()).collect();
+    for c in chip_db::expected_chips_for_board(&board_vendor, &board_name, &bound_names) {
         acc.entry(normalize(&c)).or_default().dmi = true;
     }
     // `DC-da`: the board is known here, so the per-chip advice can be exact
@@ -944,6 +946,33 @@ mod tests {
                 c.recommendation.is_none(),
                 "a bound chip needs no fix: {c:?}"
             );
+        }
+    }
+
+    /// `DC-cp`: a Z390 board whose primary is bound as `it8686` gets one card
+    /// for it, carrying the board-table evidence — not an unbound `it8688`
+    /// card recommending a driver for a chip the board does not have. With
+    /// `it8688` bound the listed primary is the board-table chip as before.
+    #[test]
+    fn a_bound_alternative_primary_takes_the_board_table_evidence() {
+        let board = (
+            "Gigabyte Technology Co., Ltd.".to_string(),
+            "Z390 AORUS PRO WIFI".to_string(),
+        );
+        for primary in ["it8686", "it8688"] {
+            let ev = FakeEvidence {
+                board: board.clone(),
+                bound: vec![bound(primary, "it87.2624"), bound("it8792", "it87.2656")],
+                loaded: vec!["it87".into()],
+                ..Default::default()
+            };
+            let r = detect_superio(&ev);
+            let names: Vec<&str> = r.chips.iter().map(|c| c.chip_name.as_str()).collect();
+            assert_eq!(names, vec![primary, "it8792"], "{:?}", r.chips);
+            for c in &r.chips {
+                assert!(c.evidence.contains(&Evidence::DmiBoardTable), "{c:?}");
+                assert!(c.recommendation.is_none(), "{c:?}");
+            }
         }
     }
 

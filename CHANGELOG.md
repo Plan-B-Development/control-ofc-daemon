@@ -2,7 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Ten more Gigabyte LGA1151 / LGA1200 board names are in the dual-chip board table** (DC-cp): the Z390
+  AORUS XTREME (and its WATERFORCE / 5G), the Z490 AORUS PRO AX, ULTRA (and G2) and XTREME (and
+  WATERFORCE), the Z490 VISION D and the W480 VISION D. The it87 sensor catalogue gives each an
+  IT8688E and an IT8792E; there is no board report yet, so the catalogue is the only evidence, as for the
+  LGA1851 boards. `/diagnostics/hardware` now lists both chips in `expected_chips` on these boards, the port
+  probe skips its Nuvoton unlock there, and the packaged Super-I/O guard names them where the firmware
+  reports no board vendor.
+
 ### Fixed
+
+- **A Gigabyte Z390 AORUS board whose primary sensor chip binds as an IT8686E is no longer told it is missing
+  its IT8688E.** The it87 catalogue gives these boards' firmware IDs a stanza for either chip. When `it8686`
+  is bound and `it8688` is not, `expected_chips` and the Super-I/O report now name `it8686` (DC-cp).
 
 - **Starting the service while a daemon you started by hand is running no longer disturbs that daemon.** The
   service's daemon was refused, as it should be, but systemd then ran the unit's restore script, which handed

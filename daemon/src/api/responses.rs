@@ -1896,7 +1896,9 @@ pub struct HardwareDiagnosticsResponse {
     pub kernel_release: Option<String>,
     /// Chip names this DMI board is *expected* to expose, sourced from a
     /// curated dual-chip board lookup (`it87.c` DMI table + community
-    /// reports). Empty when the board is not in the lookup. The GUI
+    /// reports). Empty when the board is not in the lookup. A row's
+    /// alternative primary replaces the listed one when only it is in
+    /// `chips_detected` (`DC-cp`, the Z390 rows' `it8686`). The GUI
     /// compares this against `hwmon.chips_detected[].chip_name` to detect
     /// missing chips that the driver failed to enumerate (DEC-101 — most
     /// commonly: the secondary IT87952E on Gigabyte X670/X870/Z790 boards

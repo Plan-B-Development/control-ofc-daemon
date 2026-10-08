@@ -320,7 +320,15 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
     // best-effort kmsg parse. Both fields default to empty Vec on
     // failure paths and are skipped from the wire when empty so older
     // clients ignore them.
-    let expected_chips = diagnostics::expected_chips_for_board(&board.vendor, &board.name);
+    // `DC-cp`: resolved against the chips bound here, the same list a client
+    // compares `expected_chips` with, so an accepted alternative primary that
+    // is the one bound is not reported as a missing chip.
+    let bound_names: Vec<&str> = chips_detected
+        .iter()
+        .map(|c| c.chip_name.as_str())
+        .collect();
+    let expected_chips =
+        diagnostics::expected_chips_for_board(&board.vendor, &board.name, &bound_names);
     // `BRD-j`: the subset of `expected_chips` that carries no fan header, from
     // the same table row — so a client can word a missing one as lost
     // temperatures and voltages rather than lost fan headers.
