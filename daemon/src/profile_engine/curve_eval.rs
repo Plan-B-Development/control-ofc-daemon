@@ -10,24 +10,39 @@ use super::*;
 /// stateless `interpolate()` and has no deadband.
 pub(crate) const DEADBAND_ANCHOR_DELTA_PCT: f64 = 0.5;
 
-/// Evaluate a curve with the 2°C falling-temperature deadband applied.
+/// Evaluate a curve with its falling-temperature deadband applied.
 ///
-/// Returns the cached previous curve output when current temperature has
-/// fallen within the deadband below the last transition anchor; otherwise
-/// re-interpolates the curve and updates the anchor. Side-effects on
-/// ``ProfileEngineState`` are scoped to per-control state so unrelated
-/// controls are unaffected.
+/// The band is the curve's own `hysteresis_c`, else the 2 °C default (DEC-096,
+/// DEC-489); 0 turns it off. Returns the cached previous curve output when the
+/// current temperature has fallen within the band below the last transition
+/// anchor; otherwise re-interpolates the curve and updates the anchor.
+/// Side-effects on ``ProfileEngineState`` are scoped to per-control state so
+/// unrelated controls are unaffected.
+///
+/// [SAFETY] A hold never sits below what the curve asks for now (DEC-489). The
+/// deadband exists to stop a fan slowing down in small steps; holding is only
+/// ever a reason to stay *higher*. So when the curve's current output is above
+/// the held one the hold is skipped and the curve re-evaluates. On a curve
+/// whose output rises with temperature that only happens when the reading
+/// climbs back up inside the band past the temperature last evaluated (the
+/// anchor stays put while the output glides in sub-0.5 % steps) — a rise, which
+/// the deadband was never meant to hold. On a curve whose output falls with
+/// temperature it is what stops a wider band from holding a fan below its
+/// curve while the temperature drops.
 pub(crate) fn evaluate_curve_with_deadband(
     control: &LogicalControl,
     curve: &crate::profile::CurveConfig,
     current_temp: f64,
     state: &mut ProfileEngineState,
 ) -> f64 {
+    let band = curve.effective_hysteresis_c();
+    let curve_output = evaluate_curve(curve, current_temp).clamp(0.0, 100.0);
     let prev_pwm = state.last_curve_output.get(&control.id).copied();
     let prev_transition = state.last_transition_temp.get(&control.id).copied();
 
     if let (Some(prev_out), Some(anchor)) = (prev_pwm, prev_transition) {
-        if current_temp <= anchor && current_temp >= anchor - constants::HYSTERESIS_DEADBAND_C {
+        let in_band = band > 0.0 && current_temp <= anchor && current_temp >= anchor - band;
+        if in_band && curve_output <= prev_out {
             // Inside the deadband. Normally hold the previously commanded output
             // (do not move the anchor; do not update last_curve_output).
             //
@@ -51,11 +66,10 @@ pub(crate) fn evaluate_curve_with_deadband(
         }
     }
 
-    // Re-evaluating (curve glide, band exit, or an open valve) ends any hold
-    // streak so the next settle starts its own DEADBAND_MAX_HOLD_CYCLES window.
+    // Re-evaluating (curve glide, band exit, a curve asking for more than the
+    // hold, or an open valve) ends any hold streak so the next settle starts
+    // its own DEADBAND_MAX_HOLD_CYCLES window.
     state.deadband_hold_cycles.remove(&control.id);
-
-    let curve_output = evaluate_curve(curve, current_temp).clamp(0.0, 100.0);
 
     // Move the transition anchor only when the new curve output meaningfully
     // differs from the last one — keeps the deadband stationary as the curve
@@ -77,7 +91,8 @@ pub(crate) fn evaluate_curve_with_deadband(
 
 /// Two-state latch (DEC-149): below the idle temp run idle speed; at/above the
 /// load temp run load speed; within the idle..load band hold the current state.
-/// Owns its own hysteresis, so it bypasses the 2°C deadband. Latch state lives
+/// Owns its own hysteresis, so it bypasses the falling-temperature deadband
+/// and ignores `hysteresis_c`. Latch state lives
 /// in `ProfileEngineState::trigger_latch` (`true` = load) keyed by control id.
 /// Daemon-owned outright since the 2.0.0 sole-writer cutover (DEC-165) — the
 /// GUI kept only the stateless `interpolate` tier; latched behaviour is pinned
@@ -294,7 +309,7 @@ pub(crate) fn resolve_sync_output(
 /// Resolve the raw curve output for one control, before the tuning pipeline.
 ///
 /// Routes trigger to the latch, mix/sync to the context resolvers, and every
-/// single-temperature type to the 2°C deadband path (daemon-owned since the
+/// single-temperature type to the deadband path (daemon-owned since the
 /// 2.0.0 cutover, DEC-165). Returns None when the control must be skipped
 /// this tick (missing sensor, unresolvable composite).
 pub(crate) fn curve_output_for_control(

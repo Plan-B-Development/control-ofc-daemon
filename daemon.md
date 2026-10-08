@@ -297,8 +297,10 @@ GUI ──POST intent──> API handlers ──> profile_engine
      (activate profile / override / identify — never a direct PWM write)
 ```
 
-The engine keeps per-control cross-tick state (step-rate anchors, the 2°C
-falling-temperature deadband DEC-096, trigger latches). Two rules stop that state
+The engine keeps per-control cross-tick state (step-rate anchors, the
+falling-temperature deadband DEC-096 — 2 °C, or the curve's own `hysteresis_c`
+(0–10 °C, DEC-489), never holding below the curve's current output — trigger
+latches). Two rules stop that state
 from masking a change the user just made (DEC-188): an explicit
 `POST /profile/activate` — **including re-applying the same profile id** after
 editing its curve — re-anchors all of it on the next tick (an activation-epoch

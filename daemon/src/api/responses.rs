@@ -1379,6 +1379,13 @@ pub struct ControlCapability {
     /// this is true.
     #[serde(default)]
     pub openfan_firmware_silent_update: bool,
+    /// A curve's `hysteresis_c` sets its own falling-temperature deadband width
+    /// (DEC-489), 0 to `HYSTERESIS_DEADBAND_MAX_C` °C. Load-bearing for
+    /// truthfulness: an older daemon stores the field (profiles are saved
+    /// losslessly) and silently runs the 2 °C default, so a client offers the
+    /// setting only when this is true.
+    #[serde(default)]
+    pub curve_hysteresis: bool,
 }
 
 /// Per-device-group capability info.

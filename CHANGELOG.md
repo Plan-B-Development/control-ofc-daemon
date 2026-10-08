@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Added
+
+- **A curve can set its own slow-down band** (DEC-489). `graph`, `stepped` and `linear` curves take an
+  optional `hysteresis_c`: how far, in °C, a falling temperature must drop below where the output last
+  changed before the engine lets the fans slow down. 0–10 °C, 0 turns the band off, and a curve without
+  the field keeps the 2 °C default, so existing profiles run exactly as before. `POST`/`PUT /profiles`
+  and loading a profile from disk reject a value outside the range, and the engine clamps it as well.
+  `GET /capabilities` advertises `control.curve_hysteresis`. Trigger curves keep their own band; Mix and
+  Sync still bypass it. The 30-second release (DEC-188) applies at every width.
+
+### Changed
+
+- **A held output never sits below what the curve asks for now** (DEC-489, safety). The deadband holds a
+  fan's speed while the temperature falls; on a curve whose output rises as the temperature falls, it
+  used to hold the lower, hotter-temperature speed for up to 30 s. Now a curve asking for more than the
+  held value is followed at once. On an ordinary curve this only changes the case where the reading
+  climbs back inside the band after gliding below it, which now follows the curve up instead of holding.
+
 ## [4.1.1] — 2026-10-08
 
 Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 4.1.1 is the matching

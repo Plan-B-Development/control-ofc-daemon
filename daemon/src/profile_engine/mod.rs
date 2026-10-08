@@ -61,7 +61,7 @@ pub struct PwmCommand {
 /// against the previous cycle's tuned output. Matches the GUI's per-target
 /// `TargetState.last_output` in `control_loop.py`.
 ///
-/// Also holds the per-control 2°C temperature deadband state so headless
+/// Also holds the per-control temperature deadband state so headless
 /// profile mode behaves like GUI-driven mode at curve transitions
 /// (DEC-096). The deadband fields mirror the GUI's
 /// ``TargetState.last_commanded_pwm`` / ``last_transition_temp``.
@@ -98,14 +98,15 @@ pub struct ProfileEngineState {
     last_curve_output: HashMap<String, f64>,
     /// Temperature at which the last meaningful curve transition occurred.
     /// The deadband keeps the cached output as long as the current
-    /// temperature falls within ``[t - HYSTERESIS_DEADBAND_C, t]``.
+    /// temperature falls within ``[t - band, t]``, where the band is the curve's
+    /// ``hysteresis_c`` or ``HYSTERESIS_DEADBAND_C`` (DEC-489).
     last_transition_temp: HashMap<String, f64>,
     /// DEC-149 two-state trigger latch per control id (`true` = load state).
-    /// Trigger curves own their idle..load hysteresis and bypass the 2°C
+    /// Trigger curves own their idle..load hysteresis and bypass the
     /// deadband; this holds the latch across cycles. Mirrors the GUI's
     /// ``TargetState.trigger_latch``.
     trigger_latch: HashMap<String, bool>,
-    /// DEC-188 steady-state safety valve: consecutive ticks the 2°C deadband has
+    /// DEC-188 steady-state safety valve: consecutive ticks the deadband has
     /// HELD this control's output. Reset whenever the curve actually
     /// re-evaluates (any in-band rise or a fall past the band). Once it reaches
     /// [`constants::DEADBAND_MAX_HOLD_CYCLES`] the deadband is bypassed for one
@@ -5994,6 +5995,212 @@ mod tests {
             42,
             "valve fires only after a full fresh window → curve(66) = 42%"
         );
+    }
+
+    // ── DEC-489: per-curve deadband width + the never-below-demand hold ──
+
+    /// The deadband test profile with its curve's `hysteresis_c` set.
+    fn deadband_profile_with_band(band: Option<f64>) -> DaemonProfile {
+        let mut profile = make_graph_profile_for_deadband();
+        profile.curves[0].hysteresis_c = band;
+        profile
+    }
+
+    /// Drive one profile over a temperature sequence; the wire PWM per tick.
+    fn pwm_sequence(profile: &DaemonProfile, temps: &[f64]) -> Vec<u8> {
+        let mut state = ProfileEngineState::new();
+        temps
+            .iter()
+            .map(|&t| {
+                evaluate_profile(
+                    profile,
+                    &make_cache_with_sensor("cpu", t).sensors_snapshot(),
+                    &mut state,
+                )[0]
+                .pwm_percent
+            })
+            .collect()
+    }
+
+    #[test]
+    fn curve_hysteresis_sets_the_band_width() {
+        // Curve: 60 °C → 30 %, 70 °C → 50 % (2 % per °C). Anchor at 70.
+        let temps = [70.0, 66.0, 65.0, 64.5];
+        // A 5 °C band holds 50 % down to 65 °C and lets go below it:
+        // curve(64.5) = 30 + 4.5 * 2 = 39.
+        assert_eq!(
+            pwm_sequence(&deadband_profile_with_band(Some(5.0)), &temps),
+            vec![50, 50, 50, 39]
+        );
+        // The opposite arm: the default band lets go at 66 °C already
+        // (curve(66) = 42) and re-anchors there, so 65 and 64.5 sit inside the
+        // new [64, 66] band — the 5 °C hold above is the field's doing.
+        assert_eq!(
+            pwm_sequence(&deadband_profile_with_band(None), &temps),
+            vec![50, 42, 42, 42]
+        );
+    }
+
+    #[test]
+    fn curve_hysteresis_absent_is_the_default_band() {
+        // A profile written before the field existed must behave exactly as it
+        // did: absent and the constant are indistinguishable on every arm
+        // (hold, release, rise, glide).
+        let temps = [70.0, 69.0, 68.0, 67.9, 69.5, 72.0, 71.0, 60.0, 61.0];
+        assert_eq!(
+            pwm_sequence(&deadband_profile_with_band(None), &temps),
+            pwm_sequence(
+                &deadband_profile_with_band(Some(constants::HYSTERESIS_DEADBAND_C)),
+                &temps
+            )
+        );
+    }
+
+    #[test]
+    fn curve_hysteresis_zero_turns_the_deadband_off() {
+        let temps = [70.0, 69.5, 69.0];
+        // curve(69.5) = 49, curve(69) = 48 — every fall follows the curve.
+        assert_eq!(
+            pwm_sequence(&deadband_profile_with_band(Some(0.0)), &temps),
+            vec![50, 49, 48]
+        );
+        // The default band holds both ticks, so the change is the field's.
+        assert_eq!(
+            pwm_sequence(&deadband_profile_with_band(None), &temps),
+            vec![50, 50, 50]
+        );
+    }
+
+    #[test]
+    fn curve_hysteresis_beyond_the_maximum_is_clamped_by_the_engine() {
+        // validate() and the load-time net reject this; the engine's own clamp
+        // is what stands if such a profile reaches it another way.
+        let max = constants::HYSTERESIS_DEADBAND_MAX_C;
+        let wide = deadband_profile_with_band(Some(max * 10.0));
+        let at_max = deadband_profile_with_band(Some(max));
+        // Just inside the maximum band holds; just past it releases. Read off the
+        // anchor (70 °C) rather than a literal, so a change to the maximum moves
+        // the test with it.
+        let temps = [70.0, 70.0 - max + 0.5, 70.0 - max - 0.5];
+        let got = pwm_sequence(&wide, &temps);
+        assert_eq!(got, pwm_sequence(&at_max, &temps));
+        assert_eq!(got[1], 50, "inside the maximum band: held");
+        assert_ne!(got[2], 50, "past the maximum band: released");
+    }
+
+    #[test]
+    fn curve_hysteresis_non_finite_falls_back_to_the_default() {
+        let temps = [70.0, 69.0, 67.5];
+        assert_eq!(
+            pwm_sequence(&deadband_profile_with_band(Some(f64::NAN)), &temps),
+            pwm_sequence(&deadband_profile_with_band(None), &temps)
+        );
+    }
+
+    #[test]
+    fn deadband_valve_still_releases_a_wide_band() {
+        // DEC-188 is independent of the width: a reading settled inside a wide
+        // band is released after the same hold window.
+        let profile = deadband_profile_with_band(Some(constants::HYSTERESIS_DEADBAND_MAX_C));
+        let n = constants::DEADBAND_MAX_HOLD_CYCLES as usize;
+        let mut temps = vec![70.0];
+        temps.extend(std::iter::repeat_n(62.0, n));
+        let got = pwm_sequence(&profile, &temps);
+        assert!(
+            got[1..n].iter().all(|&p| p == 50),
+            "held for the window: {got:?}"
+        );
+        // curve(62) = 30 + 2 * 2 = 34.
+        assert_eq!(got[n], 34, "the valve lets the wide band go");
+    }
+
+    #[test]
+    fn trigger_and_mix_ignore_curve_hysteresis() {
+        // Trigger owns its own idle..load band and Mix bypasses the deadband, so
+        // the field is inert on both.
+        let mut trigger = make_graph_profile_for_deadband();
+        trigger.curves[0].curve_type = "trigger".into();
+        trigger.curves[0].trigger_idle_temp_c = Some(40.0);
+        trigger.curves[0].trigger_load_temp_c = Some(60.0);
+        trigger.curves[0].trigger_idle_pct = Some(30.0);
+        trigger.curves[0].trigger_load_pct = Some(80.0);
+        let temps = [65.0, 55.0, 45.0, 39.0, 50.0, 61.0];
+        let base = pwm_sequence(&trigger, &temps);
+        trigger.curves[0].hysteresis_c = Some(constants::HYSTERESIS_DEADBAND_MAX_C);
+        assert_eq!(pwm_sequence(&trigger, &temps), base);
+
+        // Mix: the child carries a wide band. A Mix child is evaluated
+        // statelessly, so every fall still follows the curve.
+        let mut mix = deadband_profile_with_band(Some(constants::HYSTERESIS_DEADBAND_MAX_C));
+        mix.curves.push(CurveConfig {
+            id: "mx".into(),
+            name: "Mix".into(),
+            curve_type: "mix".into(),
+            mix_function: Some("max".into()),
+            mix_curve_ids: vec!["c1".into()],
+            hysteresis_c: Some(constants::HYSTERESIS_DEADBAND_MAX_C),
+            ..Default::default()
+        });
+        mix.controls[0].curve_id = "mx".into();
+        assert_eq!(pwm_sequence(&mix, &[70.0, 69.0, 66.0]), vec![50, 48, 42]);
+    }
+
+    #[test]
+    fn deadband_never_holds_below_a_falling_curves_demand() {
+        // [SAFETY] DEC-489. A curve whose output RISES as the temperature falls:
+        // 60 °C → 50 %, 70 °C → 30 %. Before the fix a falling reading inside
+        // the band held the hotter, lower output — the fan sat below its curve,
+        // and a wider band widened that window.
+        let mut profile = deadband_profile_with_band(None);
+        profile.curves[0].points[0].output_pct = 50.0;
+        profile.curves[0].points[1].output_pct = 30.0;
+        // curve(69) = 32, curve(68) = 34: each in-band fall follows the curve.
+        assert_eq!(
+            pwm_sequence(&profile, &[70.0, 69.0, 68.0]),
+            vec![30, 32, 34]
+        );
+
+        profile.curves[0].hysteresis_c = Some(constants::HYSTERESIS_DEADBAND_MAX_C);
+        // curve(62) = 46 — the widest band still never holds the fan under it.
+        assert_eq!(pwm_sequence(&profile, &[70.0, 62.0]), vec![30, 46]);
+    }
+
+    #[test]
+    fn deadband_follows_a_rise_inside_the_band_after_a_glide() {
+        // [SAFETY] DEC-489, the rising-curve arm. A shallow curve (30 °C → 20 %,
+        // 80 °C → 30 %; 0.2 % per °C) lets the output glide below the band in
+        // sub-0.5 % steps without moving the anchor. When the reading climbs back
+        // up inside the band, the curve now asks for more than the held output;
+        // before the fix the band held the lower value.
+        let mut profile = make_graph_profile_for_deadband();
+        profile.curves[0].points[0] = CurvePoint {
+            temp_c: 30.0,
+            output_pct: 20.0,
+        };
+        profile.curves[0].points[1] = CurvePoint {
+            temp_c: 80.0,
+            output_pct: 30.0,
+        };
+        let mut state = ProfileEngineState::new();
+        let tick = |t: f64, st: &mut ProfileEngineState| {
+            evaluate_profile(
+                &profile,
+                &make_cache_with_sensor("cpu", t).sensors_snapshot(),
+                st,
+            );
+        };
+        tick(60.0, &mut state); // 26 %, anchor 60
+        tick(57.9, &mut state); // below the band: 25.58 %, a 0.42 % step — the anchor stays
+        assert_eq!(state.last_transition_temp("ctrl1"), Some(60.0));
+        let glided = state.last_curve_output("ctrl1").unwrap();
+
+        tick(59.0, &mut state); // back inside [58, 60]; the curve asks for 25.8 %
+        let now = state.last_curve_output("ctrl1").unwrap();
+        assert!(
+            now > glided,
+            "a rise inside the band must follow the curve up: {glided} -> {now}"
+        );
+        assert!((now - 25.8).abs() < 1e-9, "re-evaluated at 59 °C: {now}");
     }
 
     // ── Profile engine loop integration tests (T2 audit finding) ───

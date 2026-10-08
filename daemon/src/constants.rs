@@ -190,16 +190,27 @@ pub const GPU_RESET_LOCK_WAIT: Duration = Duration::from_millis(750);
 
 // ── Profile engine ───────────────────────────────────────────────────
 
-/// Temperature deadband (°C) that the profile engine holds the previous
+/// Default temperature deadband (°C) that the profile engine holds the previous
 /// curve output across when temperature is falling — it prevents audible fan
 /// oscillation as the temperature hovers around a curve knee. Since the 2.0.0
 /// sole-writer cutover (DEC-165) the daemon is the only evaluator and owns this
 /// behaviour outright; it was historically kept in parity with the (now-deleted)
 /// GUI control loop. See DEC-096.
+///
+/// A curve may set its own width in `CurveConfig::hysteresis_c` (DEC-489); this
+/// is the width of every curve that does not, so a profile written before the
+/// field existed behaves exactly as it did.
 pub const HYSTERESIS_DEADBAND_C: f64 = 2.0;
 
+/// Widest per-curve deadband (°C) a profile may set (DEC-489). `validate()` and
+/// the load-time numeric net reject anything wider, and the evaluator clamps to
+/// it as well, so no path can hand the engine a band that holds a fan down
+/// across most of its curve. 0 is the narrowest: it turns the deadband off.
+pub const HYSTERESIS_DEADBAND_MAX_C: f64 = 10.0;
+
 /// Maximum consecutive 1 Hz engine ticks the falling-temperature deadband
-/// ([`HYSTERESIS_DEADBAND_C`], DEC-096) may hold a control's output before it
+/// ([`HYSTERESIS_DEADBAND_C`] or a curve's own width, DEC-096/489) may hold a
+/// control's output before it
 /// is force-released for a single tick so the curve re-anchors to the current
 /// temperature (DEC-188). Without this valve a temperature that settles just
 /// inside the 2°C band pins the pre-settle fan speed indefinitely — the
@@ -813,6 +824,8 @@ const _: () = assert!(NO_SENSOR_SAFE_PCT > 0);
 const _: () = assert!(THERMAL_TRIGGER_MAX_C >= THERMAL_EMERGENCY_TRIGGER_C);
 const _: () = assert!(THERMAL_TRIGGER_MARGIN_C > 0.0);
 const _: () = assert!(DEADBAND_MAX_HOLD_CYCLES > 0);
+const _: () =
+    assert!(HYSTERESIS_DEADBAND_C >= 0.0 && HYSTERESIS_DEADBAND_C <= HYSTERESIS_DEADBAND_MAX_C);
 // AIO-MB Phase 3: 0% must be unreachable through characterisation, the settle
 // clamp must be a non-empty range, and the whole per-point window (settle plus
 // slack) must fit inside the pause deadman that is renewed once per point.

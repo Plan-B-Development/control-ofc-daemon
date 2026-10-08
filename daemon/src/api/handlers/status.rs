@@ -497,6 +497,8 @@ pub async fn capabilities_handler(
             openfan_firmware_write: true,
             // DEC-484: an update of a board that does not answer.
             openfan_firmware_silent_update: true,
+            // DEC-489: a curve's own deadband width.
+            curve_hysteresis: true,
         },
     })
 }

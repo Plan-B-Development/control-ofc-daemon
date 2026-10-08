@@ -4252,6 +4252,46 @@ async fn profile_create_invalid_returns_field_violations() {
     );
 }
 
+/// DEC-489: the capability is advertised, an in-range `hysteresis_c` is stored
+/// and served back, and one past the maximum is refused before it is persisted.
+#[tokio::test]
+async fn curve_hysteresis_is_advertised_stored_and_bounded() {
+    let (state, store) = state_with_temp_store();
+    let (sock, _tx, _sock_tmp) = start_test_server(state).await;
+
+    let (_st, caps) = uds_get(&sock, "/capabilities").await;
+    assert_eq!(caps["control"]["curve_hysteresis"], true);
+
+    let mut good = valid_profile("band");
+    good["curves"] = serde_json::json!([{
+        "id": "fc", "name": "G", "type": "graph", "sensor_id": "",
+        "points": [{"temp_c": 30.0, "output_pct": 30.0}, {"temp_c": 70.0, "output_pct": 80.0}],
+        "hysteresis_c": 4.5,
+    }]);
+    let (st, body) = uds_send(&sock, "POST", "/profiles", Some(&good)).await;
+    assert_eq!(st, 201, "create: {body}");
+    let (st, body) = uds_get(&sock, "/profiles/band").await;
+    assert_eq!(st, 200);
+    assert_eq!(body["curves"][0]["hysteresis_c"], 4.5);
+
+    let mut bad = good.clone();
+    bad["id"] = "toowide".into();
+    bad["curves"][0]["hysteresis_c"] =
+        (control_ofc_daemon::constants::HYSTERESIS_DEADBAND_MAX_C + 0.5).into();
+    let (st, body) = uds_send(&sock, "POST", "/profiles", Some(&bad)).await;
+    assert_eq!(st, 400, "{body}");
+    let violations = body["error"]["details"]["field_violations"]
+        .as_array()
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|v| v["field"] == "curves[0].hysteresis_c" && v["reason"] == "OUT_OF_RANGE"),
+        "{violations:?}"
+    );
+    assert!(!store.path().join("toowide.json").exists());
+}
+
 // Semantic 400 `validation_error` envelope: a VALID-JSON body that is *missing a
 // required field* on a `Json<serde_json::Value>` handler returns the standard
 // error envelope {code, message, retryable, source}. NOTE: a *syntactically*

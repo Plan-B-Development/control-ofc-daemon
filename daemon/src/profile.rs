@@ -138,6 +138,29 @@ pub struct CurveConfig {
     pub sync_control_id: String,
     #[serde(default)]
     pub sync_offset_pct: Option<f64>,
+    // Falling-temperature deadband width in °C (DEC-489). Absent means the
+    // daemon default (`constants::HYSTERESIS_DEADBAND_C`), 0 turns the deadband
+    // off. Read only by the graph/stepped/linear path
+    // (`evaluate_curve_with_deadband`); trigger owns its own band and Mix/Sync
+    // bypass the deadband, so it is inert on those types.
+    #[serde(default)]
+    pub hysteresis_c: Option<f64>,
+}
+
+impl CurveConfig {
+    /// The deadband width the engine applies to this curve (DEC-489).
+    ///
+    /// Absent or non-finite falls back to the default; anything else is clamped
+    /// into `0..=HYSTERESIS_DEADBAND_MAX_C`. `validate()` and the load-time net
+    /// already reject an out-of-range value, so the clamp is the engine's own
+    /// guard rather than a second validator: a profile that reached the engine
+    /// some other way still cannot hold a fan down across a wider band.
+    pub(crate) fn effective_hysteresis_c(&self) -> f64 {
+        match self.hysteresis_c {
+            Some(v) if v.is_finite() => v.clamp(0.0, crate::constants::HYSTERESIS_DEADBAND_MAX_C),
+            _ => crate::constants::HYSTERESIS_DEADBAND_C,
+        }
+    }
 }
 
 /// A single point on a graph curve.
@@ -450,8 +473,8 @@ pub fn parse_profile(content: &str, path: &Path) -> Result<DaemonProfile, String
 /// paths skip `validate` because a profile may legitimately reference a sensor
 /// or header this machine does not have right now, and those stay tolerated (the
 /// engine falls back safely per member). Ranges mirror `check_pct` (0..=100),
-/// `check_offset` (-100..=100) and `check_finite` exactly, so any profile the
-/// API accepts still loads.
+/// `check_offset` (-100..=100), `check_opt_hysteresis` and `check_finite`
+/// exactly, so any profile the API accepts still loads.
 fn check_numeric_ranges(profile: &DaemonProfile) -> Result<(), String> {
     fn finite(field: String, v: f64) -> Result<(), String> {
         if v.is_finite() {
@@ -519,6 +542,14 @@ fn check_numeric_ranges(profile: &DaemonProfile) -> Result<(), String> {
         }
         if let Some(v) = curve.sync_offset_pct {
             in_range(format!("{p}.sync_offset_pct"), v, -100.0, 100.0)?;
+        }
+        if let Some(v) = curve.hysteresis_c {
+            in_range(
+                format!("{p}.hysteresis_c"),
+                v,
+                0.0,
+                crate::constants::HYSTERESIS_DEADBAND_MAX_C,
+            )?;
         }
     }
 
@@ -1032,6 +1063,7 @@ pub fn validate(profile: &DaemonProfile, known_sensor_ids: &HashSet<String>) -> 
         check_opt_pct(&mut report, &p, "trigger_idle_pct", curve.trigger_idle_pct);
         check_opt_pct(&mut report, &p, "trigger_load_pct", curve.trigger_load_pct);
         check_opt_offset(&mut report, &p, "sync_offset_pct", curve.sync_offset_pct);
+        check_opt_hysteresis(&mut report, &p, curve.hysteresis_c);
 
         // Sensor reference is machine-dependent → warning, never an error.
         if !curve.sensor_id.is_empty() && !known_sensor_ids.contains(&curve.sensor_id) {
@@ -1248,6 +1280,23 @@ fn check_opt_pct(r: &mut ValidationReport, prefix: &str, name: &str, v: Option<f
 fn check_opt_offset(r: &mut ValidationReport, prefix: &str, name: &str, v: Option<f64>) {
     if let Some(v) = v {
         check_offset(r, format!("{prefix}.{name}"), v);
+    }
+}
+
+/// A curve's deadband width (DEC-489): finite and within
+/// `0..=HYSTERESIS_DEADBAND_MAX_C`. Mirrors the load-time net exactly.
+fn check_opt_hysteresis(r: &mut ValidationReport, prefix: &str, v: Option<f64>) {
+    let Some(v) = v else { return };
+    let field = format!("{prefix}.hysteresis_c");
+    let max = crate::constants::HYSTERESIS_DEADBAND_MAX_C;
+    if !v.is_finite() {
+        r.error(field, "NON_FINITE", "value must be a finite number");
+    } else if !(0.0..=max).contains(&v) {
+        r.error(
+            field,
+            "OUT_OF_RANGE",
+            format!("hysteresis {v} must be between 0 and {max} °C"),
+        );
     }
 }
 
@@ -2634,6 +2683,90 @@ mod tests {
         let mut curve = graph_curve("cv2", "cpu");
         curve.sync_offset_pct = Some(-250.0);
         assert!(check_numeric_ranges(&mk_profile(vec![curve], vec![])).is_err());
+    }
+
+    // ── DEC-489: per-curve deadband width ──────────────────────────────────
+
+    #[test]
+    fn hysteresis_c_round_trips_and_defaults_to_absent() {
+        let json =
+            r#"{"id": "c", "name": "C", "type": "graph", "sensor_id": "cpu", "hysteresis_c": 4.5}"#;
+        let curve: CurveConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(curve.hysteresis_c, Some(4.5));
+        assert_eq!(curve.effective_hysteresis_c(), 4.5);
+
+        let bare: CurveConfig =
+            serde_json::from_str(r#"{"id": "c", "name": "C", "type": "graph"}"#).unwrap();
+        assert!(bare.hysteresis_c.is_none());
+        assert_eq!(
+            bare.effective_hysteresis_c(),
+            crate::constants::HYSTERESIS_DEADBAND_C,
+            "a profile written before the field existed keeps the default band"
+        );
+    }
+
+    #[test]
+    fn effective_hysteresis_c_clamps_and_rejects_non_finite() {
+        let max = crate::constants::HYSTERESIS_DEADBAND_MAX_C;
+        let mut curve = graph_curve("cv", "cpu");
+        for (raw, want) in [
+            (0.0, 0.0),
+            (max, max),
+            (max + 50.0, max),
+            (-3.0, 0.0),
+            (f64::NAN, crate::constants::HYSTERESIS_DEADBAND_C),
+            (f64::INFINITY, crate::constants::HYSTERESIS_DEADBAND_C),
+        ] {
+            curve.hysteresis_c = Some(raw);
+            assert_eq!(curve.effective_hysteresis_c(), want, "raw {raw}");
+        }
+    }
+
+    #[test]
+    fn validate_bounds_hysteresis_c() {
+        let max = crate::constants::HYSTERESIS_DEADBAND_MAX_C;
+        let check = |v: f64| {
+            let mut curve = graph_curve("c", "cpu");
+            curve.hysteresis_c = Some(v);
+            let profile = mk_profile(vec![curve], vec![curve_control("ctl", "c")]);
+            validate(&profile, &sset(&["cpu"]))
+        };
+        // Both boundaries are accepted — 0 is "off", max is the widest band.
+        assert!(check(0.0).is_valid());
+        assert!(check(max).is_valid());
+        for (bad, reason) in [
+            (max + 0.5, "OUT_OF_RANGE"),
+            (-0.5, "OUT_OF_RANGE"),
+            (f64::NAN, "NON_FINITE"),
+        ] {
+            let report = check(bad);
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|e| e.reason == reason && e.field == "curves[0].hysteresis_c"),
+                "{bad}: {:?}",
+                report.errors
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_net_bounds_hysteresis_c() {
+        // The boot paths skip validate(), so the load-time net must reach the
+        // field too, with exactly the same range.
+        let max = crate::constants::HYSTERESIS_DEADBAND_MAX_C;
+        let with = |v: f64| {
+            let mut curve = graph_curve("cv", "cpu");
+            curve.hysteresis_c = Some(v);
+            check_numeric_ranges(&mk_profile(vec![curve], vec![]))
+        };
+        assert!(with(0.0).is_ok());
+        assert!(with(max).is_ok());
+        let err = with(max + 0.5).unwrap_err();
+        assert!(err.contains("hysteresis_c"), "{err}");
+        assert!(with(-0.5).is_err());
+        assert!(with(f64::NAN).is_err());
     }
 
     #[test]
