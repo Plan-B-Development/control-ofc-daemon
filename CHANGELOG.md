@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [4.2.0] — 2026-10-08
+
+Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 4.2.0 is the matching
+release and the first to offer the slow-down band. `GET /capabilities` adds `control.curve_hysteresis`;
+no endpoint changes. A curve without `hysteresis_c` keeps the 2 °C band.
+
 ### Added
 
 - **A curve can set its own slow-down band** (DEC-489). `graph`, `stepped` and `linear` curves take an
