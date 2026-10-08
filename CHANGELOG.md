@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [4.1.1] — 2026-10-08
+
+Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 4.1.1 is the matching
+release. No capability flag or endpoint changes. A daemon refused because another is already running now
+exits with status 75 (was 1), and an `ipc.socket_path` in a directory other users can write is refused at
+startup (below).
+
 ### Added
 
 - **Ten more Gigabyte LGA1151 / LGA1200 board names are in the dual-chip board table** (DC-cp): the Z390
