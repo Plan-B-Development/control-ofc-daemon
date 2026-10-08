@@ -176,7 +176,7 @@ pub fn evaluate_curve(curve: &CurveConfig, temp_c: f64) -> f64 {
         "graph" => evaluate_graph(curve, temp_c),
         "stepped" => evaluate_stepped(curve, temp_c),
         "linear" => evaluate_linear(curve, temp_c),
-        "flat" => curve.flat_output_pct.unwrap_or(50.0),
+        "flat" => flat_output(curve),
         "trigger" => evaluate_trigger_stateless(curve, temp_c),
         _ => {
             log::warn!(
@@ -187,6 +187,13 @@ pub fn evaluate_curve(curve: &CurveConfig, temp_c: f64) -> f64 {
             50.0
         }
     }
+}
+
+/// A flat curve's output: a constant, read from no sensor. The engine resolves
+/// it without a temperature, so a flat curve with an empty `sensor_id` (Configure
+/// AIO's Fixed pump, "Add Flat Curve") is commanded rather than skipped.
+pub fn flat_output(curve: &CurveConfig) -> f64 {
+    curve.flat_output_pct.unwrap_or(50.0)
 }
 
 fn evaluate_graph(curve: &CurveConfig, temp_c: f64) -> f64 {

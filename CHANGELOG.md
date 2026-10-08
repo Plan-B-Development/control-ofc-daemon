@@ -20,6 +20,15 @@
   held value is followed at once. On an ordinary curve this only changes the case where the reading
   climbs back inside the band after gliding below it, which now follows the curve up instead of holding.
 
+### Fixed
+
+- **A flat curve is commanded without a sensor.** A flat curve is a constant, but the engine looked its
+  `sensor_id` up like any other curve's. With the field empty, as the GUI's Configure AIO **Fixed** pump
+  and **Add Flat Curve** write it, or naming a sensor not present, the control was skipped as
+  `sensor_unavailable` and its fans never commanded. A flat input to a Mix was dropped the same way, so
+  the Mix ran on its other inputs alone. Both now use `flat_output_pct` directly. Pump and CPU floors
+  still apply to the result, and a flat curve that already had a live sensor runs as before.
+
 ## [4.1.1] — 2026-10-08
 
 Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 4.1.1 is the matching

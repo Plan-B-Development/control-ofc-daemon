@@ -3601,6 +3601,10 @@ mod tests {
         /// default arm is the correct answer for them. Adding to this list is a
         /// claim that must be true of the dispatcher arm.
         const FOLDS_INTO_SENSOR_UNAVAILABLE: &[&str] = &["trigger"];
+        /// Types with NO `None` path, so a skip of one never happens and needs
+        /// no classification. Same claim discipline: the behaviour is pinned by
+        /// `flat_curve_is_commanded_without_any_sensor`.
+        const NEVER_SKIPPED: &[&str] = &["flat"];
 
         let src = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -3637,6 +3641,7 @@ mod tests {
         let unclassified: Vec<&String> = dispatcher
             .difference(&classifier)
             .filter(|t| !FOLDS_INTO_SENSOR_UNAVAILABLE.contains(&t.as_str()))
+            .filter(|t| !NEVER_SKIPPED.contains(&t.as_str()))
             .collect();
         assert!(
             unclassified.is_empty(),
@@ -3649,6 +3654,7 @@ mod tests {
 
         let stale: Vec<&&str> = FOLDS_INTO_SENSOR_UNAVAILABLE
             .iter()
+            .chain(NEVER_SKIPPED)
             .filter(|t| !dispatcher.contains(**t))
             .collect();
         assert!(
@@ -3656,6 +3662,97 @@ mod tests {
             "exemption(s) {stale:?} name curve types the dispatcher no longer has — \
              an exemption list that outlives its subject quietly widens"
         );
+    }
+
+    fn flat_curve(id: &str, sensor: &str, pct: f64) -> CurveConfig {
+        CurveConfig {
+            id: id.into(),
+            name: id.into(),
+            curve_type: "flat".into(),
+            sensor_id: sensor.into(),
+            flat_output_pct: Some(pct),
+            ..Default::default()
+        }
+    }
+
+    fn single_control_profile(control: LogicalControl, curves: Vec<CurveConfig>) -> DaemonProfile {
+        DaemonProfile {
+            id: "p".into(),
+            name: "P".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![control],
+            curves,
+        }
+    }
+
+    /// A flat curve reads no sensor, so neither an empty `sensor_id` (Configure
+    /// AIO's Fixed pump, "Add Flat Curve") nor one naming a sensor that is not in
+    /// the snapshot may skip the control. Before the fix both returned None from
+    /// `sensors.get(..)?` and the fans were never commanded.
+    #[test]
+    fn flat_curve_is_commanded_without_any_sensor() {
+        for sensor in ["", "hwmon:gone:0:temp1"] {
+            let profile = single_control_profile(
+                openfan_control("c", "f", "openfan:ch00"),
+                vec![flat_curve("f", sensor, 80.0)],
+            );
+            let cmds = evaluate_profile(&profile, &HashMap::new(), &mut ProfileEngineState::new());
+            assert_eq!(
+                cmds.len(),
+                1,
+                "sensor_id {sensor:?}: the control was skipped"
+            );
+            assert_eq!(cmds[0].pwm_percent, 80, "sensor_id {sensor:?}");
+        }
+    }
+
+    /// [SAFETY] The flat arm replaces only the sensor lookup; the per-member
+    /// floor still runs after it. A sensorless flat curve below the pump floor on
+    /// a pump member is raised to it, and a non-pump member on the same value is
+    /// not.
+    #[test]
+    fn sensorless_flat_on_a_pump_still_gets_the_pump_floor() {
+        // hwmon: the label term of the pump union applies to hwmon members only.
+        let mut pump = openfan_control("c", "f", "hwmon:z53:n:pwm1:pwm1");
+        pump.members[0].source = "hwmon".into();
+        pump.members[0].member_label = "AIO_PUMP".into();
+        let profile = single_control_profile(pump, vec![flat_curve("f", "", 10.0)]);
+        let cmds = evaluate_profile(&profile, &HashMap::new(), &mut ProfileEngineState::new());
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(f64::from(cmds[0].pwm_percent), HARD_PUMP_CPU_FLOOR_PCT);
+
+        let chassis = single_control_profile(
+            openfan_control("c", "f", "openfan:ch00"),
+            vec![flat_curve("f", "", 10.0)],
+        );
+        let cmds = evaluate_profile(&chassis, &HashMap::new(), &mut ProfileEngineState::new());
+        assert_eq!(
+            cmds[0].pwm_percent, 10,
+            "a non-pump member keeps the flat value"
+        );
+    }
+
+    /// A sensorless flat child of a Mix resolves, so the Mix is not degraded and
+    /// combines it. Before the fix the child dropped out: `max(36, 60)` became 36.
+    #[test]
+    fn mix_with_a_sensorless_flat_child_combines_it() {
+        let profile = single_control_profile(
+            openfan_control("c", "m", "openfan:ch00"),
+            vec![
+                mix_curve("m", "max", &["l", "f"]),
+                linear_curve("l", "cpu"),
+                flat_curve("f", "", 60.0),
+            ],
+        );
+        let cache = make_cache_with_sensor("cpu", 40.0); // linear → 36 %
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].pwm_percent, 60);
     }
 
     #[test]
@@ -3792,7 +3889,7 @@ mod tests {
         // changes the value rather than being masked by max().
         let mut term = mix_curve("term", "max", &[]);
         term.curve_type = "flat".into();
-        term.sensor_id = "cpu".into(); // non-mix curves resolve at their own sensor
+        term.sensor_id = "cpu".into(); // inert: a flat curve reads no sensor
         term.flat_output_pct = Some(40.0);
 
         let profile = DaemonProfile {
@@ -6988,12 +7085,30 @@ mod tests {
     /// stable temperature the reading never leaves the band. This drives the loop
     /// exactly as `activate_profile_handler` would — swap the profile and bump
     /// the epoch under the same lock — and asserts the new value is written.
+    ///
+    /// A graph curve, and an edit that LOWERS the output: the deadband holds
+    /// only a falling output (DEC-489) and a flat curve bypasses it entirely, so
+    /// a flat or rising edit would apply at once and test nothing.
     #[tokio::test(start_paused = true)]
     async fn loop_reactivation_reanchors_through_deadband() {
         let cache = make_cache_with_sensor("cpu", 50.0);
+        let graph_at = |pct: f64| {
+            let mut profile = make_profile("curve", "graph", 0.0);
+            profile.curves[0].points = vec![
+                CurvePoint {
+                    temp_c: 30.0,
+                    output_pct: pct,
+                },
+                CurvePoint {
+                    temp_c: 80.0,
+                    output_pct: pct,
+                },
+            ];
+            profile
+        };
 
-        // Initial active profile: flat 30%, one openfan member.
-        let profile_arc = Arc::new(Mutex::new(Some(make_profile("curve", "flat", 30.0))));
+        // Initial active profile: a graph flat at 80%, one openfan member.
+        let profile_arc = Arc::new(Mutex::new(Some(graph_at(80.0))));
         let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
 
         let (transport, written) = LoopTestTransport::new(10);
@@ -7017,40 +7132,40 @@ mod tests {
             shutdown_rx,
         ));
 
-        // Several ticks: the first anchors at 30%; the rest are deadband holds
+        // Several ticks: the first anchors at 80%; the rest are deadband holds
         // (temperature unchanged, inside the band) — the engine is now "stuck"
-        // at 30% and would stay there for DEADBAND_MAX_HOLD_CYCLES.
+        // at 80% and would stay there for DEADBAND_MAX_HOLD_CYCLES.
         tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
 
-        // Edit the active profile's curve to 80% (SAME id) and re-apply, exactly
+        // Edit the active profile's curve down to 30% (SAME id) and re-apply, exactly
         // as the activate handler does: swap the profile and bump the epoch under
         // the same `active_profile` lock the engine reads it under.
         {
             let mut guard = profile_arc.lock();
-            *guard = Some(make_profile("curve", "flat", 80.0));
+            *guard = Some(graph_at(30.0));
             cache.bump_profile_activation_epoch();
         }
 
-        // One more tick: the epoch bump re-anchors, so the new 80% applies now
-        // instead of waiting for the temperature to leave the deadband.
+        // One more tick: the epoch bump re-anchors, so the new 30% applies now
+        // instead of the deadband holding the pre-edit 80%.
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
         shutdown_tx.send(true).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         let _ = handle.await;
 
-        // The final SetPwm must be 80%, not the held 30%. (Writes coalesce, so in
-        // the unfixed code the only frame would be the initial 30%.)
+        // The final SetPwm must be 30%, not the held 80%. (Writes coalesce, so in
+        // the unfixed code the only frame would be the initial 80%.)
         let cmds = written.lock();
         let set_pwm_cmds: Vec<_> = cmds.iter().filter(|c| c.starts_with(">02")).collect();
         let last = set_pwm_cmds.last().expect("expected SetPwm commands");
         let hex_value = &last[last.len() - 3..last.len() - 1];
-        let expected = format!("{:02X}", crate::pwm::percent_to_raw(80));
-        let stale = format!("{:02X}", crate::pwm::percent_to_raw(30));
+        let expected = format!("{:02X}", crate::pwm::percent_to_raw(30));
+        let stale = format!("{:02X}", crate::pwm::percent_to_raw(80));
         assert_eq!(
             hex_value, expected,
-            "re-activation must re-anchor through the deadband (expected 80% = 0x{expected}; \
-             stale-hold bug yields 30% = 0x{stale}); commands: {set_pwm_cmds:?}"
+            "re-activation must re-anchor through the deadband (expected 30% = 0x{expected}; \
+             stale-hold bug yields 80% = 0x{stale}); commands: {set_pwm_cmds:?}"
         );
     }
 

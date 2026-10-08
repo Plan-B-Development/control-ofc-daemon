@@ -155,10 +155,11 @@ pub(crate) fn combine_mix(function: &str, values: &[f64]) -> f64 {
 /// Mix recurses over its children (combining raw outputs); `visited` carries
 /// the current resolution path so a curve reappearing on its own path drops out
 /// (cycle → safe fallback). Sync is not a valid Mix child (Mix does not nest
-/// Sync; the editor prevents it). Every single-temperature type uses the pure
-/// `evaluate_curve` at its own sensor, clamped 0–100 — the "raw child-curve
-/// output" the Mix combines. Returns None when the value cannot be resolved
-/// (missing sensor, unresolvable/cyclic Mix). Daemon-owned outright since the
+/// Sync; the editor prevents it). A flat child is its constant, read from no
+/// sensor. Every single-temperature type uses the pure `evaluate_curve` at its
+/// own sensor, clamped 0–100 — the "raw child-curve output" the Mix combines.
+/// Returns None when the value cannot be resolved (missing sensor,
+/// unresolvable/cyclic Mix). Daemon-owned outright since the
 /// 2.0.0 cutover (DEC-165) — the GUI no longer resolves composites; behaviour
 /// is pinned by the `tuning_sequence` golden vectors (DEC-126).
 pub(crate) fn resolve_curve_output(
@@ -171,6 +172,7 @@ pub(crate) fn resolve_curve_output(
     match curve.curve_type.as_str() {
         "mix" => resolve_mix(curve, profile, sensors, visited, degraded),
         "sync" => None, // Mix does not nest Sync (editor-prevented)
+        "flat" => Some(crate::profile::flat_output(curve).clamp(0.0, 100.0)),
         _ => {
             let sensor = sensors.get(&curve.sensor_id)?;
             Some(evaluate_curve(curve, sensor.value_c).clamp(0.0, 100.0))
@@ -308,10 +310,15 @@ pub(crate) fn resolve_sync_output(
 
 /// Resolve the raw curve output for one control, before the tuning pipeline.
 ///
-/// Routes trigger to the latch, mix/sync to the context resolvers, and every
-/// single-temperature type to the deadband path (daemon-owned since the
-/// 2.0.0 cutover, DEC-165). Returns None when the control must be skipped
-/// this tick (missing sensor, unresolvable composite).
+/// Routes trigger to the latch, mix/sync to the context resolvers, flat to its
+/// constant, and every single-temperature type to the deadband path
+/// (daemon-owned since the 2.0.0 cutover, DEC-165). Returns None when the
+/// control must be skipped this tick (missing sensor, unresolvable composite).
+///
+/// Flat reads no sensor, so it never returns None: a flat curve with an empty
+/// or vanished `sensor_id` is commanded. Routing it through the sensor lookup
+/// skipped such a control outright, leaving an AIO pump on Configure AIO's Fixed
+/// strategy uncommanded and reported as `sensor_unavailable`.
 pub(crate) fn curve_output_for_control(
     control: &LogicalControl,
     curve: &crate::profile::CurveConfig,
@@ -352,6 +359,7 @@ pub(crate) fn curve_output_for_control(
             })
         }
         "sync" => resolve_sync_output(control, curve, tick_outputs),
+        "flat" => Some(crate::profile::flat_output(curve).clamp(0.0, 100.0)),
         "trigger" => {
             let sensor = sensors.get(&curve.sensor_id)?;
             Some(evaluate_trigger(control, curve, sensor.value_c, state))
@@ -390,9 +398,10 @@ pub(crate) fn skip_reason(curve: &crate::profile::CurveConfig) -> SkipReason {
     match curve.curve_type.as_str() {
         "mix" => SkipReason::MixUnresolvable,
         "sync" => SkipReason::SyncUnresolvable,
-        // Every single-temperature type (graph, stepped, trigger) resolves
-        // unconditionally once its sensor is in the map — `sensors.get(...)?` is
-        // their only None path.
+        // Every single-temperature type (graph, stepped, linear, trigger)
+        // resolves unconditionally once its sensor is in the map —
+        // `sensors.get(...)?` is their only None path. Flat has no None path at
+        // all, so its value here is never published.
         _ => SkipReason::SensorUnavailable,
     }
 }
