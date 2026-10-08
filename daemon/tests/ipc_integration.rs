@@ -4388,6 +4388,49 @@ async fn profile_put_id_mismatch_rejected() {
     assert_eq!(body["error"]["code"], "validation_error");
 }
 
+/// The GUI percent-encodes every id it puts in a path (`quote(id, safe=":")`,
+/// and a whole-segment `.`/`..` as `%2E`, which its HTTP client would otherwise
+/// remove as a dot segment),
+/// because a profile id may hold `#`, `?`, `%` or a space and sent raw those
+/// change the target: `#` starts a fragment the client drops, `?` a query. This
+/// pins the daemon half — the encoded segment decodes back to the exact id, and
+/// to no other profile.
+#[tokio::test]
+async fn profile_routes_decode_a_percent_encoded_id() {
+    let (state, _store) = state_with_temp_store();
+    let (sock, _tx, _sock_tmp) = start_test_server(state).await;
+
+    let id = "quiet #2?x%";
+    let path = "/profiles/quiet%20%232%3Fx%25";
+    // What a raw path would have hit instead: everything before the `#`.
+    let decoy = "quiet";
+    for p in [id, decoy] {
+        let (st, body) = uds_send(&sock, "POST", "/profiles", Some(&valid_profile(p))).await;
+        assert!((200..300).contains(&st), "create {p:?}: {st} {body}");
+    }
+
+    let (st, body) = uds_send(&sock, "GET", path, None).await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["id"], id);
+
+    let (st, body) = uds_send(&sock, "PUT", path, Some(&valid_profile(id))).await;
+    assert_eq!(st, 200, "PUT must match the decoded id: {body}");
+
+    let (st, body) = uds_send(&sock, "DELETE", path, None).await;
+    assert!((200..300).contains(&st), "{st} {body}");
+    let (st, _) = uds_send(&sock, "GET", path, None).await;
+    assert_eq!(st, 404, "the encoded id was deleted");
+    let (st, body) = uds_send(&sock, "GET", "/profiles/quiet", None).await;
+    assert_eq!(st, 200, "the decoy must survive: {body}");
+
+    // A dot id, as the GUI spells it.
+    let (st, body) = uds_send(&sock, "POST", "/profiles", Some(&valid_profile("."))).await;
+    assert!((200..300).contains(&st), "create \".\": {st} {body}");
+    let (st, body) = uds_send(&sock, "GET", "/profiles/%2E", None).await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["id"], ".");
+}
+
 #[tokio::test]
 async fn delete_active_profile_returns_409() {
     // Mark a profile active in-memory directly (no activate → no /var/lib write).
