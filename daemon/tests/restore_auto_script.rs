@@ -56,11 +56,23 @@ impl Tree {
     }
 
     fn run_script(&self) -> std::process::Output {
-        Command::new("bash")
-            .arg(script())
+        self.run_script_after(None)
+    }
+
+    /// Run the script as systemd runs it after a main process that ended as
+    /// `(EXIT_CODE, EXIT_STATUS)` — `None` leaves both unset, as a run by hand
+    /// does. Never inherited from the test's own environment.
+    fn run_script_after(&self, ended: Option<(&str, &str)>) -> std::process::Output {
+        let mut cmd = Command::new("bash");
+        cmd.arg(script())
             .env("RUNTIME_DIRECTORY", &self.run)
             .env("CONTROL_OFC_SYSFS_ROOT", &self.sys)
-            .output()
+            .env_remove("EXIT_CODE")
+            .env_remove("EXIT_STATUS");
+        if let Some((code, status)) = ended {
+            cmd.env("EXIT_CODE", code).env("EXIT_STATUS", status);
+        }
+        cmd.output()
             .expect("bash must be available to run the ExecStopPost script")
     }
 
@@ -436,5 +448,148 @@ fn a_pmfw_line_naming_a_foreign_path_is_skipped() {
         read(&zrp),
         "untouched",
         "no line named this card's own zero-RPM file"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// LIFE-a (DEC-487) — a start refused because another daemon is running. Its
+// runtime directory holds THAT daemon's records, so the script must not replay
+// them; every other ending replays them and then removes them, because the
+// unit now keeps the directory (`RuntimeDirectoryPreserve=yes`) and systemd no
+// longer empties it after the script.
+// ---------------------------------------------------------------------------
+
+/// A runtime directory as a running daemon leaves it: a header it took from
+/// mode 5, a PMFW card it drives, and the paths of both records.
+struct Running {
+    t: Tree,
+    enable: PathBuf,
+    curve: PathBuf,
+    records: [PathBuf; 2],
+}
+
+fn a_running_daemons_records() -> Running {
+    use control_ofc_daemon::hwmon::gpu_fan::{PmfwHandBack, PMFW_RECORD_FILE_NAME};
+    let t = Tree::new();
+    let (enable, pwm) = t.header(1);
+    t.record(&[line(&enable, &pwm, "mode", "5")]);
+    let [(curve, zrp), _] = pmfw_cards(&t);
+    let pmfw = PmfwHandBack::default();
+    pmfw.set_record_path(t.run.join(PMFW_RECORD_FILE_NAME));
+    pmfw.note_take("amd_gpu:1", &curve, Some(&zrp));
+    let records = [
+        t.run.join("hwmon-handback"),
+        t.run.join(PMFW_RECORD_FILE_NAME),
+    ];
+    Running {
+        t,
+        enable,
+        curve,
+        records,
+    }
+}
+
+/// [SAFETY] A start refused by a running daemon — the lock held, or the socket
+/// served — exits `ANOTHER_INSTANCE_EXIT_CODE`, and the script then writes
+/// nothing and removes nothing: the header and the card stay as the running
+/// daemon has them, and its records survive for its own crash backstop. Before
+/// LIFE-a the header was handed back (`5`) and the card's curve reset.
+#[test]
+fn a_start_refused_by_a_running_daemon_hands_nothing_back() {
+    use control_ofc_daemon::single_instance::ANOTHER_INSTANCE_EXIT_CODE;
+    let r = a_running_daemons_records();
+
+    let status = ANOTHER_INSTANCE_EXIT_CODE.to_string();
+    let out = r.t.run_script_after(Some(("exited", &status)));
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        read(&r.enable),
+        "1",
+        "the running daemon's header is not handed back"
+    );
+    assert_eq!(read(&r.curve), "untouched", "nor its card's curve reset");
+    for record in &r.records {
+        assert!(
+            record.exists(),
+            "{} must be left for the running daemon",
+            record.display()
+        );
+    }
+}
+
+/// [SAFETY] The other half: every other ending still hands back — a clean stop,
+/// an ordinary failure, a signal, a core dump, and a run with nothing set — and
+/// then removes each record it replayed, so a later start that fails before its
+/// daemon writes records of its own cannot replay these over whatever has the
+/// headers by then. A skip that fired on any of these endings reddens here.
+#[test]
+fn every_other_ending_hands_back_and_consumes_the_records() {
+    let endings: [Option<(&str, &str)>; 6] = [
+        Some(("exited", "0")),
+        Some(("exited", "1")),
+        Some(("killed", "KILL")),
+        Some(("killed", "TERM")),
+        Some(("dumped", "ABRT")),
+        None,
+    ];
+    for ended in endings {
+        let r = a_running_daemons_records();
+        for record in &r.records {
+            assert!(
+                record.exists(),
+                "precondition: {} written",
+                record.display()
+            );
+        }
+
+        let out = r.t.run_script_after(ended);
+
+        assert!(out.status.success(), "{ended:?}: {out:?}");
+        assert_eq!(
+            read(&r.enable),
+            "5",
+            "{ended:?}: the header must be handed back"
+        );
+        assert_eq!(
+            read(&r.curve),
+            "c",
+            "{ended:?}: the card's curve must be reset"
+        );
+        for record in &r.records {
+            assert!(
+                !record.exists(),
+                "{ended:?}: {} must be removed once replayed",
+                record.display()
+            );
+        }
+    }
+}
+
+/// The legacy GPU record is consumed the same way as the other two.
+#[test]
+fn the_legacy_gpu_record_is_consumed_too() {
+    use control_ofc_daemon::hwmon::gpu_fan::{
+        note_legacy_take, LegacyOriginal, GPU_RECORD_FILE_NAME,
+    };
+    let t = Tree::new();
+    let card = t.sys.join("class/hwmon/hwmon1");
+    std::fs::create_dir_all(&card).unwrap();
+    std::fs::write(card.join("pwm1"), "200\n").unwrap();
+    std::fs::write(card.join("pwm1_enable"), "1\n").unwrap();
+    let record = t.run.join(GPU_RECORD_FILE_NAME);
+    note_legacy_take(&record, &card, LegacyOriginal::Mode(2));
+    assert!(
+        record.exists(),
+        "precondition: the verify recorded the card"
+    );
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&card.join("pwm1_enable")), "2");
+    assert!(
+        !record.exists(),
+        "the legacy GPU record must be removed once replayed"
     );
 }

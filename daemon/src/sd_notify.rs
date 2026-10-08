@@ -118,8 +118,9 @@ const SLEEP_RESTORE_RETRY: Duration = Duration::from_secs(1);
 
 /// The file the daemon writes its PID to once the sleep signals are handled, so
 /// the hook signals only a daemon that understands them (`SIGUSR1`'s default
-/// action is to terminate). Lives in the unit's runtime directory, which systemd
-/// empties whenever the unit stops.
+/// action is to terminate). Lives in the unit's runtime directory, which the unit
+/// keeps across a stop (DEC-487), so the file can outlive its daemon; the hook
+/// signals only a PID that is also the unit's `MainPID`, which a stale one is not.
 pub const SLEEP_HOOK_PID_FILE: &str = "sleep-hook.pid";
 /// The acknowledgement the hook waits for before letting the sleep proceed.
 pub const SLEEP_HOOK_ACK_FILE: &str = "sleep-hook.ack";

@@ -22,11 +22,13 @@
 //!   which holds no lock, and a hand-started new one would otherwise delete its
 //!   socket. A socket something answers on is never removed.
 //!
-//! **Why the state directory, not `/run/control-ofc`.** systemd empties the
-//! `RuntimeDirectory=` when the unit stops, so a lock file there could be
-//! unlinked while another process holds it, and a third daemon would then lock a
-//! fresh inode and run. The `StateDirectory=` is preserved, owned by root and
-//! `0700`, so nobody else can create or replace the file. The lock *file*
+//! **Why the state directory, not `/run/control-ofc`.** systemd empties a
+//! `RuntimeDirectory=` when the unit stops unless the unit preserves it — this
+//! one does since DEC-487, but a drop-in or `systemctl clean --what=runtime` can
+//! undo that — so a lock file there could be unlinked while another process
+//! holds it, and a third daemon would then lock a fresh inode and run. The
+//! `StateDirectory=` is preserved, owned by root and `0700`, so nobody else can
+//! create or replace the file. The lock *file*
 //! surviving a crash is harmless: the claim is the lock, never the file's
 //! existence, so there is no stale state to clean up and no unlink to race.
 //!
@@ -45,6 +47,20 @@ use std::time::Duration;
 
 /// Basename of the lock file inside the state directory.
 pub const LOCK_FILE_NAME: &str = "daemon.lock";
+
+/// The exit status of a daemon refused because another one is running — it
+/// holds the lock, serves on the socket, or bound the socket path between this
+/// daemon's probe and its own bind (`LIFE-a`). `EX_TEMPFAIL` from
+/// `sysexits.h`, which systemd shows as `TEMPFAIL`; no other path exits with it.
+///
+/// `control-ofc-restore-auto` (`ExecStopPost`) returns early on it: the
+/// hand-back records and the socket in the runtime directory belong to the
+/// daemon that is running, and replaying them would hand back the headers it
+/// drives. Every refusal happens before this process writes anything there.
+/// The unit still restarts on it, deliberately (DEC-487): the holder may be the
+/// unit's own previous process, kept alive by a thread stuck in a wedged sysfs
+/// write, and a retry is what brings the service back once that lock frees.
+pub const ANOTHER_INSTANCE_EXIT_CODE: i32 = 75;
 
 /// How long [`probe_socket`] waits for a connect to complete. A blocking
 /// connect to a Unix socket whose listener has a full backlog waits for room,

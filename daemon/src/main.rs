@@ -324,7 +324,9 @@ use control_ofc_daemon::serial::controller::FanController;
 use control_ofc_daemon::serial::real_transport::{
     enumerate_serial_candidates, RealSerialTransport,
 };
-use control_ofc_daemon::single_instance::{self, SocketProbe, SOCKET_PROBE_TIMEOUT};
+use control_ofc_daemon::single_instance::{
+    self, SocketProbe, ANOTHER_INSTANCE_EXIT_CODE, SOCKET_PROBE_TIMEOUT,
+};
 use tokio::net::UnixListener;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -472,9 +474,12 @@ fn unrecognised(arg: &str) -> String {
 ///    to 0o666 (DEC-049). The returned listener is handed straight to
 ///    `server::serve`, so there is no bind/unbind/re-bind race.
 ///
-/// Any failure prints an actionable error to stderr and exits(1). The hint
-/// always points back to `sudo systemctl enable --now control-ofc-daemon`,
-/// which is the only supported way to run the daemon.
+/// Any failure prints an actionable error to stderr and exits(1) — except a
+/// refusal because another daemon is running, which exits with
+/// [`ANOTHER_INSTANCE_EXIT_CODE`] so `ExecStopPost` leaves that daemon's
+/// runtime files alone (`LIFE-a`). The hint always points back to
+/// `sudo systemctl enable --now control-ofc-daemon`, which is the only
+/// supported way to run the daemon.
 fn preflight_privileges(config: &DaemonConfig, allow_non_root: bool) {
     // ── 1. EUID check ───────────────────────────────────────────────────
     if !running_as_root() && !allow_non_root {
@@ -578,7 +583,7 @@ fn take_instance_lock(state_dir: &Path) {
             eprintln!("To start with a particular profile, set --profile in a drop-in");
             eprintln!("(systemctl edit control-ofc-daemon) instead of running the");
             eprintln!("binary by hand.");
-            std::process::exit(1);
+            std::process::exit(ANOTHER_INSTANCE_EXIT_CODE);
         }
         Err(e @ single_instance::AcquireError::Unavailable { .. }) => {
             eprintln!("error: {e}");
@@ -617,6 +622,7 @@ fn exit_on_socket_error(e: &StaleSocketError) -> ! {
         eprintln!("that one:");
         eprintln!();
         eprintln!("    systemctl status control-ofc-daemon");
+        std::process::exit(ANOTHER_INSTANCE_EXIT_CODE);
     }
     std::process::exit(1);
 }
@@ -706,6 +712,10 @@ fn preflight_socket(config: &DaemonConfig) -> UnixListener {
                 eprintln!("running. Check with:");
                 eprintln!();
                 eprintln!("    systemctl status control-ofc-daemon");
+                // Something created the path after the probe found it free —
+                // another daemon, which the runtime directory's records belong
+                // to; this one has written nothing there yet (LIFE-a).
+                std::process::exit(ANOTHER_INSTANCE_EXIT_CODE);
             }
             std::process::exit(1);
         }
@@ -2291,7 +2301,8 @@ async fn async_main(cli: CliOptions) {
     // Pre-flight, second half: bind the IPC socket *before* starting any
     // subsystem. A failure here is fatal — the daemon is useless without IPC,
     // and a half-started daemon only confuses operators. preflight_socket
-    // exits(1) itself on failure, including when a daemon is serving on it.
+    // exits(1) itself on failure, and with ANOTHER_INSTANCE_EXIT_CODE when
+    // another daemon serves on the socket or binds it first (LIFE-a).
     let listener = preflight_socket(&config);
 
     // Configurable startup delay — wait for hardware to appear after boot

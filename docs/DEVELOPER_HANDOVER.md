@@ -50,11 +50,12 @@ cargo build --release
 something is still serving on, so `cargo run` or a bare `sudo control-ofc-daemon`
 just exits with *another control-ofc-daemon is already running*. (Older daemons
 deleted the service's socket and ran a second profile engine: two writers on the
-same fans.) The reverse is not guarded: starting the service while a hand-started
-daemon runs makes the unit fail, and its `ExecStopPost` hands back headers the
-hand-started daemon is driving (register row `LIFE-a`). Stop the service first
-(`sudo systemctl stop control-ofc-daemon`), and stop your own daemon before you
-start the service again.
+same fans.) The reverse is guarded too (DEC-487): a service started while a
+hand-started daemon runs is refused with exit status 75, its `ExecStopPost`
+leaves the runtime directory alone, and the unit keeps the directory, so your
+daemon keeps its socket and its headers. systemd restarts the refused service
+about once a minute and takes over when your daemon exits. Stop the service
+first all the same (`sudo systemctl stop control-ofc-daemon`).
 
 The supported way to run your own build is to install the package once and then
 swap in your binary, so the unit, `control-ofc-restore-auto` (the crash-time

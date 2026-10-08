@@ -484,6 +484,38 @@ fn restarts_back_off_instead_of_hitting_a_start_limit() {
     );
 }
 
+/// [SAFETY] LIFE-a (DEC-487). A start refused because another daemon is running
+/// must neither empty the runtime directory — that daemon's socket and hand-back
+/// records live there — nor stop being restarted: the lock holder may be this
+/// unit's own previous process, held alive by a wedged sysfs write, and a retry
+/// is what brings the service back once it releases. Listing the status in
+/// `RestartPreventExitStatus=` (or `SuccessExitStatus=`, which also ends the
+/// restarts) would leave the machine with no daemon until someone starts it.
+#[test]
+fn a_start_refused_by_a_running_daemon_keeps_the_runtime_directory_and_is_retried() {
+    let unit = daemon_unit();
+    assert_eq!(
+        unit_value(&unit, "RuntimeDirectoryPreserve").as_deref(),
+        Some("yes"),
+        "the refused start's stop must not delete the running daemon's socket and records"
+    );
+    assert_eq!(unit_value(&unit, "Restart").as_deref(), Some("on-failure"));
+    let refused = control_ofc_daemon::single_instance::ANOTHER_INSTANCE_EXIT_CODE.to_string();
+    for key in ["RestartPreventExitStatus", "SuccessExitStatus"] {
+        let listed: Vec<String> = unit
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+            .flat_map(|v| v.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+            .collect();
+        assert!(
+            !listed.iter().any(|s| s == &refused || s == "TEMPFAIL"),
+            "{key}= must not list {refused}: the refused service must keep retrying"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DEC-239 — the GitHub Release carries the clean-room package as an asset so
 // `pacman -U` is a complete install path while the AUR is read-only (the

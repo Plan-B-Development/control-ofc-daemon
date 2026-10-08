@@ -43,6 +43,17 @@
 # ':'-separated, and this unit has one entry. CONTROL_OFC_SYSFS_ROOT exists only
 # so the test suite can point this at a fake tree; the unit never sets it.
 runtime_dir="${RUNTIME_DIRECTORY:-/run/control-ofc}"
+
+# LIFE-a (DEC-487): a daemon refused because another one is running -- one
+# started by hand holds the lock or serves on the socket -- exits 75
+# (single_instance::ANOTHER_INSTANCE_EXIT_CODE) before it writes anything here.
+# The records in this directory are the running daemon's, so replaying them
+# would hand back the headers it drives. systemd passes how the main process
+# ended as EXIT_CODE and EXIT_STATUS (systemd.exec(5)).
+if [ "${EXIT_CODE:-}" = exited ] && [ "${EXIT_STATUS:-}" = 75 ]; then
+    exit 0
+fi
+
 records=("${runtime_dir%%:*}/hwmon-handback" "${runtime_dir%%:*}/gpu-handback")
 sysfs_root="${CONTROL_OFC_SYSFS_ROOT:-/sys}"
 
@@ -120,6 +131,11 @@ for record in "${records[@]}"; do
         hand_back "$enable" "$pwm" "$kind" "$value" \
             || echo "control-ofc-restore-auto: could not give $enable back" >&2
     done < "$record"
+    # Consumed, as systemd used to consume it by emptying this directory: the
+    # unit keeps the directory now (RuntimeDirectoryPreserve=yes), and a record
+    # left here would be replayed again by a later start that fails before its
+    # daemon writes its own -- over whatever has the headers by then.
+    rm -f -- "$record"
 done
 
 # DEC-435 (DC-aa): a GPU fan curve is reset only on a card the daemon drove.
@@ -155,6 +171,7 @@ if [ -r "$pmfw_record" ]; then
                 || echo "control-ofc-restore-auto: could not re-enable $zero_rpm" >&2
         fi
     done < "$pmfw_record"
+    rm -f -- "$pmfw_record" # consumed, as the hwmon records are above
 fi
 
 # ExecStopPost's status is not a verdict on the fans — each failure is reported

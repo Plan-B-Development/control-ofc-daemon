@@ -20,11 +20,13 @@
 //! A crashed daemon cannot give anything back itself, so every take is written
 //! to a small record **before** the `pwm_enable=1` write, and `ExecStopPost`
 //! (`control-ofc-restore-auto`) replays it. It lives in the unit's
-//! `RuntimeDirectory` because that directory has exactly the lifetime the record
-//! needs: systemd removes it once the unit has stopped — after `ExecStopPost` has
-//! run — and a reboot, which returns every header to its BIOS mode anyway, empties
-//! `/run`. It is tmpfs, so a take costs no disk I/O, and it needs no `fsync`: the
-//! only failure it has to survive is the death of this process.
+//! `RuntimeDirectory`, so it has exactly the lifetime the record needs:
+//! `ExecStopPost` removes it once it has replayed it (the unit keeps the
+//! directory itself since DEC-487, so a start refused by a running daemon cannot
+//! delete that daemon's record), and a reboot, which returns every header to its
+//! BIOS mode anyway, empties `/run`. It is tmpfs, so a take costs no disk I/O,
+//! and it needs no `fsync`: the only failure it has to survive is the death of
+//! this process.
 //!
 //! One line per header the daemon holds right now, tab-separated:
 //!

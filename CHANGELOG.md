@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Starting the service while a daemon you started by hand is running no longer disturbs that daemon.** The
+  service's daemon was refused, as it should be, but systemd then ran the unit's restore script, which handed
+  back the fan headers the running daemon was driving, and emptied `/run/control-ofc`, deleting its socket —
+  again at every restart. A daemon refused because another is running now exits with status 75 (`TEMPFAIL`,
+  was 1), the restore script does nothing after that status, and the unit keeps `/run/control-ofc` when it
+  stops (`RuntimeDirectoryPreserve=yes`); the restore script removes each hand-back record once it has
+  replayed it, as systemd's emptying used to. systemd keeps retrying the refused service about once a minute,
+  and it takes over once the other daemon exits (LIFE-a, DEC-487).
+
 ## [4.1.0] — 2026-10-07
 
 Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 4.1.0 is the matching

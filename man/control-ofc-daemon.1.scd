@@ -66,12 +66,15 @@ Any other argument, a flag given without its value, or a value joined to its
 flag with *=* (*--profile=quiet*) is refused: the daemon prints the usage and
 exits with status 2, without starting.
 
-Only one daemon runs at a time. A second one exits with status 1 before it
-touches the socket or a fan: it holds an advisory lock on _daemon.lock_ in the
-state directory, and never removes a socket another daemon is serving on. Do not
-run the binary by hand while the service is active; to start with a profile, set
-*--profile* or *OPENFAN_PROFILE* in a drop-in (*systemctl edit
-control-ofc-daemon*).
+Only one daemon runs at a time. A second one exits with status 75
+(*TEMPFAIL*) before it touches the socket or a fan: it holds an advisory lock on
+_daemon.lock_ in the state directory, and never removes a socket another daemon
+is serving on. Do not run the binary by hand while the service is active; to
+start with a profile, set *--profile* or *OPENFAN_PROFILE* in a drop-in
+(*systemctl edit control-ofc-daemon*). A service started while a daemon run by
+hand is serving is refused the same way and leaves that daemon's files alone;
+systemd retries it about once a minute, and it takes over once the other daemon
+exits.
 
 The startup profile is the first that loads of: *--profile* or
 *--profile-file*, then *OPENFAN_PROFILE*, then the profile saved in
@@ -139,14 +142,16 @@ _/run/control-ofc/hwmon-handback_, _gpu-handback_, _gpu-pmfw-handback_
 	What the daemon took and must give back: each motherboard header's
 	original mode or duty, and each GPU it put in manual mode or drove a
 	fan curve on. Written before the first write that needs it, and
-	replayed by *control-ofc-restore-auto* after every stop.
+	replayed, then removed, by *control-ofc-restore-auto* after every stop.
 
 _/run/control-ofc/sleep-hook.pid_, _sleep-hook.ack_
 	The handshake between the daemon and its system-sleep hook.
 
 _/usr/bin/control-ofc-restore-auto_
 	Run by the unit's *ExecStopPost=* after every stop, crash or kill: gives
-	each header and GPU in the records above back to what it had.
+	each header and GPU in the records above back to what it had. It does
+	nothing after a start refused with status 75, whose records belong to
+	the daemon that is running.
 
 _/usr/lib/systemd/system-sleep/control-ofc-daemon_
 	The system-sleep hook (see *SIGUSR1*, *SIGUSR2*).

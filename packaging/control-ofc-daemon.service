@@ -103,6 +103,13 @@ RuntimeDirectory=control-ofc
 # /run/control-ofc to reach the 0666 socket the daemon chmods after bind
 # (DEC-049); a future UMask/hardening change then can't silently lock the GUI out.
 RuntimeDirectoryMode=0755
+# Kept when the unit stops (LIFE-a, DEC-487). A start refused because a daemon
+# run by hand is serving would otherwise have its stop empty this directory,
+# deleting that daemon's socket and hand-back records. Each hand-back record is
+# removed by ExecStopPost once replayed, and a starting daemon removes a socket
+# nothing serves on before it binds, so nothing a stopped daemon left behind is
+# acted on later.
+RuntimeDirectoryPreserve=yes
 StateDirectory=control-ofc
 # Socket: /run/control-ofc/control-ofc.sock (created by daemon)
 # State: /var/lib/control-ofc/daemon_state.json (active profile pointer)
@@ -117,6 +124,14 @@ Environment=HOME=/root
 
 # Restart on a crash, a non-zero exit (DEC-266's engine or sensor-feed death) or
 # a watchdog timeout — on-failure covers all three.
+#
+# A start refused because another daemon is running exits 75 (TEMPFAIL, LIFE-a)
+# and is restarted too, deliberately (DEC-487): it is not listed in
+# RestartPreventExitStatus=. The lock holder may be this unit's own previous
+# process, kept alive after SIGKILL by a thread stuck in a wedged sysfs write,
+# and only a retry brings the service back once that releases. A daemon run by
+# hand costs one refused start a minute at the backoff below, and the service
+# takes over when it exits. ExecStopPost returns early on 75.
 Restart=on-failure
 # Exponential backoff (DEC-387), replacing the start limit above: 3 s, then about
 # 5.5, 10, 18 and 33 s, then 60 s for every restart after that. The first restart
