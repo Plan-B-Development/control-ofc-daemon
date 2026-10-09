@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [4.3.0] — 2026-10-09
+
+Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 4.3.0 is the matching
+release and the first to show memory temperatures as memory. No capability flag or endpoint changes;
+`GET /inventory/hwmon` adds the `memory_temp` classification, and memory-module sensor ids change form
+(old-form profile curves keep working).
+
 ### Added
 
 - **Memory temperatures are recognised as memory** (DEC-491). `GET /inventory/hwmon` classifies a
