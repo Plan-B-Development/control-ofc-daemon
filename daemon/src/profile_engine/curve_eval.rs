@@ -150,6 +150,35 @@ pub(crate) fn combine_mix(function: &str, values: &[f64]) -> f64 {
     result.clamp(0.0, 100.0)
 }
 
+/// The reading a curve's `sensor_id` names (DEC-492).
+///
+/// The exact id first. On a miss, a memory-module id saved in the other form
+/// (bus-numbered ↔ bus-independent) is followed to its single live counterpart
+/// by [`crate::hwmon::memory_id::resolve`], so a profile written before the
+/// re-key — or by an older daemon — keeps driving its fans. `quarantined` are
+/// the ids the cache evicted as unreadable (`unavailable_sensors`, DEC-193): a
+/// quarantined twin at the same address makes the id ambiguous rather than
+/// handing the curve to the other module. Ambiguity refuses (the control is
+/// skipped as `sensor_unavailable`, exactly as a missing sensor is). The miss
+/// path parses nothing unless the saved id is itself a memory-module id, and a
+/// memory-module id is never `kind: cpu_temp`, so nothing here can reach the
+/// thermal ladder.
+pub(crate) fn curve_sensor<'a>(
+    sensors: &'a HashMap<String, CachedSensorReading>,
+    sensor_id: &str,
+    quarantined: &[String],
+) -> Option<&'a CachedSensorReading> {
+    sensors.get(sensor_id).or_else(|| {
+        crate::hwmon::memory_id::parse(sensor_id)?;
+        let live = crate::hwmon::memory_id::resolve(
+            sensor_id,
+            sensors.keys().map(String::as_str),
+            quarantined.iter().map(String::as_str),
+        )?;
+        sensors.get(live)
+    })
+}
+
 /// Resolve a curve's raw output in the Mix evaluation context (DEC-150).
 ///
 /// Mix recurses over its children (combining raw outputs); `visited` carries
@@ -166,15 +195,16 @@ pub(crate) fn resolve_curve_output(
     curve: &crate::profile::CurveConfig,
     profile: &DaemonProfile,
     sensors: &HashMap<String, CachedSensorReading>,
+    quarantined: &[String],
     visited: &mut HashSet<String>,
     degraded: &mut bool,
 ) -> Option<f64> {
     match curve.curve_type.as_str() {
-        "mix" => resolve_mix(curve, profile, sensors, visited, degraded),
+        "mix" => resolve_mix(curve, profile, sensors, quarantined, visited, degraded),
         "sync" => None, // Mix does not nest Sync (editor-prevented)
         "flat" => Some(crate::profile::flat_output(curve).clamp(0.0, 100.0)),
         _ => {
-            let sensor = sensors.get(&curve.sensor_id)?;
+            let sensor = curve_sensor(sensors, &curve.sensor_id, quarantined)?;
             Some(evaluate_curve(curve, sensor.value_c).clamp(0.0, 100.0))
         }
     }
@@ -197,6 +227,7 @@ pub(crate) fn resolve_mix(
     curve: &crate::profile::CurveConfig,
     profile: &DaemonProfile,
     sensors: &HashMap<String, CachedSensorReading>,
+    quarantined: &[String],
     visited: &mut HashSet<String>,
     degraded: &mut bool,
 ) -> Option<f64> {
@@ -232,7 +263,9 @@ pub(crate) fn resolve_mix(
             .curves
             .iter()
             .find(|c| &c.id == child_id)
-            .and_then(|child| resolve_curve_output(child, profile, sensors, visited, degraded));
+            .and_then(|child| {
+                resolve_curve_output(child, profile, sensors, quarantined, visited, degraded)
+            });
         values.push(resolved);
         if resolved.is_none() {
             *degraded = true;
@@ -330,8 +363,14 @@ pub(crate) fn curve_output_for_control(
     match curve.curve_type.as_str() {
         "mix" => {
             let mut degraded = false;
-            let value =
-                resolve_curve_output(curve, profile, sensors, &mut HashSet::new(), &mut degraded)?;
+            let value = resolve_curve_output(
+                curve,
+                profile,
+                sensors,
+                &state.quarantined_sensor_ids,
+                &mut HashSet::new(),
+                &mut degraded,
+            )?;
             if !degraded {
                 return Some(value);
             }
@@ -361,11 +400,11 @@ pub(crate) fn curve_output_for_control(
         "sync" => resolve_sync_output(control, curve, tick_outputs),
         "flat" => Some(crate::profile::flat_output(curve).clamp(0.0, 100.0)),
         "trigger" => {
-            let sensor = sensors.get(&curve.sensor_id)?;
+            let sensor = curve_sensor(sensors, &curve.sensor_id, &state.quarantined_sensor_ids)?;
             Some(evaluate_trigger(control, curve, sensor.value_c, state))
         }
         _ => {
-            let sensor = sensors.get(&curve.sensor_id)?;
+            let sensor = curve_sensor(sensors, &curve.sensor_id, &state.quarantined_sensor_ids)?;
             Some(evaluate_curve_with_deadband(
                 control,
                 curve,
@@ -400,7 +439,7 @@ pub(crate) fn skip_reason(curve: &crate::profile::CurveConfig) -> SkipReason {
         "sync" => SkipReason::SyncUnresolvable,
         // Every single-temperature type (graph, stepped, linear, trigger)
         // resolves unconditionally once its sensor is in the map —
-        // `sensors.get(...)?` is their only None path. Flat has no None path at
+        // `curve_sensor(...)?` is their only None path. Flat has no None path at
         // all, so its value here is never published.
         _ => SkipReason::SensorUnavailable,
     }

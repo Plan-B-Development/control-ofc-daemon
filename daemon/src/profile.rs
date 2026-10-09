@@ -1073,7 +1073,17 @@ pub fn validate(profile: &DaemonProfile, known_sensor_ids: &HashSet<String>) -> 
         check_opt_hysteresis(&mut report, &p, curve.hysteresis_c);
 
         // Sensor reference is machine-dependent → warning, never an error.
-        if !curve.sensor_id.is_empty() && !known_sensor_ids.contains(&curve.sensor_id) {
+        // A memory-module id in the other form resolves to its live module
+        // (DEC-492), exactly as the engine reads it, so it is not "missing".
+        if !curve.sensor_id.is_empty()
+            && !known_sensor_ids.contains(&curve.sensor_id)
+            && crate::hwmon::memory_id::resolve(
+                &curve.sensor_id,
+                known_sensor_ids.iter().map(String::as_str),
+                std::iter::empty(),
+            )
+            .is_none()
+        {
             report.warn(
                 format!("{p}.sensor_id"),
                 "UNKNOWN_SENSOR",
@@ -2455,6 +2465,28 @@ mod tests {
             "unexpected warnings: {:?}",
             report.warnings
         );
+    }
+
+    /// DEC-492: a memory-module id saved in the other form names a live module,
+    /// so it is not "missing" — the engine reads it. An ambiguous one still warns.
+    #[test]
+    fn validate_follows_a_memory_id_across_forms() {
+        let warns = |saved: &str, live: &[&str]| {
+            let profile = mk_profile(
+                vec![graph_curve("c", saved)],
+                vec![curve_control("ctl", "c")],
+            );
+            validate(&profile, &sset(live))
+                .warnings
+                .iter()
+                .any(|w| w.reason == "UNKNOWN_SENSOR")
+        };
+        let legacy = "hwmon:spd5118:21-0051:temp1";
+        let p0 = "hwmon:spd5118:0000:00:14.0-p0-0051:temp1";
+        let p2 = "hwmon:spd5118:0000:00:14.0-p2-0051:temp1";
+        assert!(!warns(legacy, &[p0]));
+        assert!(warns(legacy, &[p0, p2]), "two candidates refuse");
+        assert!(warns(p2, &[p0]), "stable never moves to stable");
     }
 
     #[test]

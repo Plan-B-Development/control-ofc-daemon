@@ -68,6 +68,7 @@ daemon/src/
   hwmon/
     mod.rs             — hwmon subsystem re-exports
     discovery.rs       — sensor enumeration + stable ID generation
+    memory_id.rs       — bus-independent ids for memory-module sensors + the cross-form resolve rule (DEC-492)
     reader.rs          — temperature reading from sysfs
     plausibility.rs    — [SAFETY] cross-sensor plausibility filter for CPU temps (`294-c`).
                          reader.rs's [-50, 250]C bound (DEC-288) is per-sensor, so it

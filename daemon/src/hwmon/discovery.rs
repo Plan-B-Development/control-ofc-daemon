@@ -481,7 +481,11 @@ fn discover_device_sensors(
     // built below match the ones saved before that driver's rename (DEC-442).
     let chip_name = crate::hwmon::chip_name::read_chip_name(hwmon_dir)?.canonical;
 
-    let device_id = device_id_for_hwmon_dir(hwmon_dir);
+    // DEC-492: a memory-module sensor is named by its SMBus controller, port and
+    // SPD address rather than the kernel's dynamic bus number, where the
+    // topology can be named; every other chip keeps its device id.
+    let device_id = crate::hwmon::memory_id::device_id_for_memory_chip(&chip_name, hwmon_dir)
+        .unwrap_or_else(|| device_id_for_hwmon_dir(hwmon_dir));
 
     // Find all temp*_input files
     let mut sensors = Vec::new();

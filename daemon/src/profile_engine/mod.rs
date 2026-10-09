@@ -90,6 +90,11 @@ struct StaticEvalCache {
 
 #[derive(Debug, Default)]
 pub struct ProfileEngineState {
+    /// Sensor ids quarantined this tick (DEC-193 `unavailable_sensors`), set by
+    /// the loop. Read only by the DEC-492 memory-id resolver, so a quarantined
+    /// module blocks a cross-form match to its twin. Empty in `new()`, so the
+    /// parity oracle is unperturbed.
+    pub(crate) quarantined_sensor_ids: Vec<String>,
     /// Last tuned output (pre-rounding f64) per control id.
     last_output: HashMap<String, f64>,
     /// Last raw curve output returned for the control (post-deadband).
@@ -1549,6 +1554,7 @@ pub async fn profile_engine_loop(
 
             match *profile_guard {
                 Some(ref active_profile) => {
+                    engine_state.quarantined_sensor_ids = cache.unavailable_sensor_ids();
                     let cmds = evaluate_profile_with_overrides(
                         active_profile,
                         &sensors,
@@ -2692,6 +2698,130 @@ mod tests {
         );
     }
 
+    /// DEC-492: a curve saved against a memory module's bus-numbered id keeps
+    /// driving its fans once discovery names the module by its controller and
+    /// port — through every lookup site (the deadband path, a trigger, a Mix
+    /// child). The duty is the one the live id itself produces.
+    #[test]
+    fn a_memory_sensor_saved_in_the_old_form_still_drives_its_curve() {
+        let legacy = "hwmon:spd5118:21-0051:temp1";
+        let live = "hwmon:spd5118:0000:00:14.0-p0-0051:temp1";
+        let cache = Arc::new(StateCache::new());
+        cache.update_sensors(vec![
+            reading(live, SensorKind::MbTemp, 55.0),
+            reading("cpu", SensorKind::CpuTemp, 40.0),
+        ]);
+        let snapshot = cache.sensors_snapshot();
+        fn trigger(id: &str, sensor: &str) -> CurveConfig {
+            CurveConfig {
+                id: id.into(),
+                name: id.into(),
+                curve_type: "trigger".into(),
+                sensor_id: sensor.into(),
+                ..Default::default()
+            }
+        }
+        type Shape = fn(&str) -> Vec<CurveConfig>;
+        let shapes: [(&str, Shape); 3] = [
+            ("linear", |s| vec![linear_curve("c", s)]),
+            ("trigger", |s| vec![trigger("c", s)]),
+            ("mix child", |s| {
+                vec![mix_curve("c", "max", &["k"]), linear_curve("k", s)]
+            }),
+        ];
+        for (shape, curves) in shapes {
+            let run = |sensor: &str| {
+                let profile =
+                    single_control_profile(deliverable_control("ctl", "c"), curves(sensor));
+                let mut state = ProfileEngineState::new();
+                let cmds = evaluate_profile(&profile, &snapshot, &mut state);
+                (
+                    cmds.iter().map(|c| c.pwm_percent).collect::<Vec<_>>(),
+                    state.skipped_this_tick,
+                )
+            };
+            let (want, want_skipped) = run(live);
+            assert!(
+                !want.is_empty() && want_skipped.is_empty(),
+                "{shape}: live id runs"
+            );
+            let (got, skipped) = run(legacy);
+            assert!(
+                skipped.is_empty(),
+                "{shape}: the old-form id was skipped: {skipped:?}"
+            );
+            assert_eq!(
+                got, want,
+                "{shape}: the old-form id must read the same module"
+            );
+        }
+    }
+
+    /// DEC-492, the refusals: two modules at the same address, or a stable id
+    /// whose module is missing while its twin is present, are skipped as
+    /// `sensor_unavailable` — never bound to a guess.
+    #[test]
+    fn an_ambiguous_or_same_form_memory_id_is_skipped() {
+        let cases = [
+            (
+                "hwmon:spd5118:21-0051:temp1",
+                vec![
+                    "hwmon:spd5118:0000:00:14.0-p0-0051:temp1",
+                    "hwmon:spd5118:0000:00:14.0-p2-0051:temp1",
+                ],
+            ),
+            (
+                "hwmon:spd5118:0000:00:14.0-p2-0051:temp1",
+                vec!["hwmon:spd5118:0000:00:14.0-p0-0051:temp1"],
+            ),
+        ];
+        for (saved, live) in cases {
+            let cache = Arc::new(StateCache::new());
+            cache.update_sensors(
+                live.iter()
+                    .map(|id| reading(id, SensorKind::MbTemp, 55.0))
+                    .collect(),
+            );
+            let profile = single_control_profile(
+                deliverable_control("ctl", "c"),
+                vec![linear_curve("c", saved)],
+            );
+            let mut state = ProfileEngineState::new();
+            let cmds = evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
+            assert!(cmds.is_empty(), "{saved}: must not be commanded");
+            assert_eq!(state.skipped_this_tick.len(), 1, "{saved}");
+            assert_eq!(
+                state.skipped_this_tick[0].reason,
+                SkipReason::SensorUnavailable
+            );
+        }
+    }
+
+    /// DEC-492 review P2: the saved module (p0) quarantined — evicted from the
+    /// live set — must not hand its curve to the other DIMM at the same address.
+    /// The opposite branch (no quarantined twin → it moves) is
+    /// `a_memory_sensor_saved_in_the_old_form_still_drives_its_curve`.
+    #[test]
+    fn a_quarantined_twin_blocks_a_cross_form_match() {
+        let p2 = "hwmon:spd5118:0000:00:14.0-p2-0051:temp1";
+        let cache = Arc::new(StateCache::new());
+        cache.update_sensors(vec![reading(p2, SensorKind::MbTemp, 55.0)]);
+        let profile = single_control_profile(
+            deliverable_control("ctl", "c"),
+            vec![linear_curve("c", "hwmon:spd5118:21-0051:temp1")],
+        );
+        let run = |quarantined: Vec<String>| {
+            let mut state = ProfileEngineState::new();
+            state.quarantined_sensor_ids = quarantined;
+            let cmds = evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
+            (cmds.len(), state.skipped_this_tick)
+        };
+        assert_eq!(run(vec![]).0, 1, "precondition: without the twin it moves");
+        let (n, skipped) = run(vec!["hwmon:spd5118:0000:00:14.0-p0-0051:temp1".into()]);
+        assert_eq!(n, 0);
+        assert_eq!(skipped[0].reason, SkipReason::SensorUnavailable);
+    }
+
     #[test]
     fn a_control_whose_sensor_is_absent_is_recorded_as_sensor_unavailable() {
         let profile = DaemonProfile {
@@ -3133,6 +3263,44 @@ mod tests {
         );
         assert_eq!(skipped[0].control_id, "ctl");
         assert_eq!(skipped[0].reason, SkipReason::MixUnresolvable);
+    }
+
+    /// DEC-492 review P2, the wiring: the loop hands the cache's quarantined ids
+    /// to the engine. Without that line the legacy curve would bind to the other
+    /// module at its address and be commanded (or skipped for its backend), not
+    /// skipped for its sensor.
+    #[tokio::test]
+    async fn the_loop_feeds_quarantined_sensors_to_the_memory_id_resolver() {
+        let cache = Arc::new(StateCache::new());
+        cache.update_sensors(vec![
+            reading("cpu", SensorKind::CpuTemp, 40.0),
+            reading(
+                "hwmon:spd5118:0000:00:14.0-p2-0051:temp1",
+                SensorKind::MbTemp,
+                55.0,
+            ),
+        ]);
+        cache.update_unavailable_sensors(vec![crate::health::state::UnavailableSensor {
+            id: "hwmon:spd5118:0000:00:14.0-p0-0051:temp1".into(),
+            label: "temp1".into(),
+            reason: "temperature sensor disabled".into(),
+            since: std::time::Instant::now(),
+        }]);
+        let profile = single_control_profile(
+            openfan_control("ctl", "c", "openfan:ch00"),
+            vec![linear_curve("c", "hwmon:spd5118:21-0051:temp1")],
+        );
+        let observed = cache.clone();
+        run_engine_ticks_until(
+            cache.clone(),
+            Some(profile),
+            SKIP_DEBOUNCE_TICKS,
+            move || observed.read_with(|s| !s.skipped_controls.is_empty()),
+        )
+        .await;
+        let skipped = cache.read_with(|s| s.skipped_controls.clone());
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].reason, SkipReason::SensorUnavailable);
     }
 
     /// [SAFETY-adjacent] 277-i — the skipped list must survive a thermal event.

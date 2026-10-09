@@ -11,6 +11,14 @@
   `Agent0 Dimm0`…, Dell `SODIMM`). Their `kind` stays
   `mb_temp`, so nothing about fan control or the thermal ladder changes, and a memory sensor still counts
   as a board reading in the CPU plausibility check.
+- **Memory-module sensor ids no longer change when the kernel renumbers i2c buses** (DEC-492). An
+  `spd5118` or `jc42` sensor is now named by its SMBus controller, the adapter's port (`p<N>`) or mux
+  channel (`ch<K>`), and its SPD address — `hwmon:spd5118:0000:00:14.0-p0-0051:temp1` instead of
+  `hwmon:spd5118:21-0051:temp1`. Where the topology cannot be named unambiguously the bus-numbered id is
+  kept (logged once). A profile curve saved against the other form keeps driving its fans: the engine
+  follows it to the single module with the same chip, address and label in the other form, and skips the
+  control as `sensor_unavailable` if any second module matches, even an unreadable (quarantined) one. `validate` no longer warns `UNKNOWN_SENSOR` for such a curve. No fan,
+  header or other sensor id changes.
 
 ### Fixed
 

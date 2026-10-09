@@ -22,6 +22,7 @@ pub mod intel_gpu_detect;
 pub mod inventory;
 pub mod kernel_warnings;
 pub mod lease;
+pub mod memory_id;
 pub mod nouveau_detect;
 pub mod nvidia;
 pub mod nvml;
@@ -161,17 +162,20 @@ mod tests {
         assert!(outcome.failures[0].reason.contains("invalid temperature"));
     }
 
-    /// DEC-491 (end-to-end): a DDR5 SPD hub on an i2c device. Discovery names it
-    /// by its bus device (`21-0051`), keeps it `MbTemp` so it still counts as
-    /// board evidence for the CPU plausibility check, and once its sensor is
-    /// switched off it reads as a failure the DEC-193 tracker quarantines.
+    /// DEC-491/492 (end-to-end): a DDR5 SPD hub on piix4 port 0. Discovery names
+    /// it by its controller, port and SPD address (DEC-492) — not the dynamic
+    /// bus number — keeps it `MbTemp` so it still counts as board evidence for
+    /// the CPU plausibility check, and once its sensor is switched off it reads
+    /// as a failure the DEC-193 tracker quarantines.
     #[test]
     fn spd5118_dimm_is_board_evidence_and_quarantines_when_disabled() {
         use crate::health::sensor_failure::SensorFailureTracker;
 
         let tmp = tempfile::tempdir().unwrap();
-        let i2c_dev = tmp.path().join("devices/i2c-21/21-0051");
+        let adapter = tmp.path().join("devices/pci0000:00/0000:00:14.0/i2c-21");
+        let i2c_dev = adapter.join("21-0051");
         fs::create_dir_all(&i2c_dev).unwrap();
+        fs::write(adapter.join("name"), "SMBus PIIX4 adapter port 0 at 0b00\n").unwrap();
         let root = tmp.path().join("class");
         let cpu = root.join("hwmon0");
         let dimm = root.join("hwmon9");
@@ -190,7 +194,7 @@ mod tests {
             .iter()
             .find(|d| d.chip_name == "spd5118")
             .expect("the DIMM is discovered");
-        assert_eq!(d.id, "hwmon:spd5118:21-0051:temp1");
+        assert_eq!(d.id, "hwmon:spd5118:0000:00:14.0-p0-0051:temp1");
         assert_eq!(d.kind, SensorKind::MbTemp);
 
         // Enabled: the DIMM is the board evidence that rejects a 0 °C CPU.
@@ -212,7 +216,7 @@ mod tests {
         }
         let unavailable = tracker.unavailable();
         assert_eq!(unavailable.len(), 1);
-        assert_eq!(unavailable[0].id, "hwmon:spd5118:21-0051:temp1");
+        assert_eq!(unavailable[0].id, d.id);
         assert!(unavailable[0].reason.contains("disabled"));
     }
 

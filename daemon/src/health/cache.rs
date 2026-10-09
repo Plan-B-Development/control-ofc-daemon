@@ -1452,6 +1452,17 @@ impl StateCache {
     /// The common case (nothing unavailable, nothing previously unavailable)
     /// takes only a shared read lock and returns — the poll loop calls this every
     /// tick.
+    /// The ids currently quarantined (DEC-193): evicted from the live sensors,
+    /// so the engine's memory-id resolver (DEC-492) can still count them.
+    pub fn unavailable_sensor_ids(&self) -> Vec<String> {
+        let state = self.inner.read();
+        state
+            .unavailable_sensors
+            .iter()
+            .map(|u| u.id.clone())
+            .collect()
+    }
+
     pub fn update_unavailable_sensors(&self, unavailable: Vec<UnavailableSensor>) {
         // Deliberate double-checked shape: the fast-path read guard is dropped
         // before the write lock is taken, so another caller can interleave
