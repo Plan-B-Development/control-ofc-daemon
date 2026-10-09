@@ -58,6 +58,15 @@ const PLAUSIBLE_MAX_C: f64 = 250.0;
 /// An implausible value is an **error**, not a clamped reading (DEC-288) — see the
 /// rejection below for why that distinction is safety-critical.
 pub fn read_temp(descriptor: &SensorDescriptor) -> Result<SensorReading, HwmonError> {
+    if let Some(enable_path) = disabled_sensor_enable_path(descriptor) {
+        return Err(HwmonError::ReadError {
+            path: enable_path,
+            message: "temperature sensor disabled (enable = 0); the driver keeps returning \
+                      its last value, so the reading is not used"
+                .into(),
+        });
+    }
+
     let path = Path::new(&descriptor.input_path);
     let raw = std::fs::read_to_string(path).map_err(|e| HwmonError::ReadError {
         path: descriptor.input_path.clone(),
@@ -124,6 +133,29 @@ pub fn read_temp(descriptor: &SensorDescriptor) -> Result<SensorReading, HwmonEr
         temp_type: descriptor.temp_type,
         thresholds: descriptor.thresholds.clone(),
     })
+}
+
+/// Chips whose `tempN_input` keeps answering after the sensor is switched off.
+///
+/// `spd5118` (DDR5 SPD hub): the read path never checks the TS_DISABLE bit, so
+/// with `temp1_enable = 0` the hub stops converting and `temp1_input` returns
+/// the last register value with no error — a silently frozen reading (DEC-491).
+/// `temp1_enable` reads the regmap cache (TEMP_CONFIG is not a volatile
+/// register), so checking it every tick costs no SMBus traffic.
+const ENABLE_UNCHECKED_CHIPS: &[&str] = &["spd5118"];
+
+/// The `tempN_enable` path of a sensor that reports itself disabled, if any.
+///
+/// Only an explicit `0` disables. A missing or unreadable attribute leaves the
+/// reading as it was before this check existed: the value is still read, and a
+/// real fault there fails on its own.
+fn disabled_sensor_enable_path(descriptor: &SensorDescriptor) -> Option<String> {
+    if !ENABLE_UNCHECKED_CHIPS.contains(&descriptor.chip_name.as_str()) {
+        return None;
+    }
+    let enable_path = format!("{}_enable", descriptor.input_path.strip_suffix("_input")?);
+    let raw = std::fs::read_to_string(&enable_path).ok()?;
+    (raw.trim() == "0").then_some(enable_path)
 }
 
 /// Read all sensors from a list of descriptors.
@@ -286,5 +318,64 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results[0].is_ok());
         assert!(results[1].is_err());
+    }
+
+    /// A DDR5 SPD-hub descriptor reading `temp1_input` in `dir`.
+    fn spd5118_descriptor(dir: &Path) -> SensorDescriptor {
+        SensorDescriptor {
+            id: "hwmon:spd5118:21-0051:temp1".into(),
+            kind: SensorKind::MbTemp,
+            label: "temp1".into(),
+            source: SensorSource::Hwmon,
+            input_path: dir.join("temp1_input").to_str().unwrap().into(),
+            chip_name: "spd5118".into(),
+            temp_type: None,
+            thresholds: None,
+        }
+    }
+
+    /// DEC-491: an spd5118 sensor with `temp1_enable = 0` keeps answering with
+    /// its last value. It must read as a failure (so DEC-193 quarantines it and
+    /// it shows unavailable), never as a frozen temperature.
+    #[test]
+    fn disabled_spd5118_sensor_is_a_read_failure_not_a_frozen_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("temp1_input"), "37500\n").unwrap();
+        fs::write(tmp.path().join("temp1_enable"), "0\n").unwrap();
+
+        let err = read_temp(&spd5118_descriptor(tmp.path())).unwrap_err();
+        let HwmonError::ReadError { path, message } = &err else {
+            panic!("expected ReadError, got {err:?}");
+        };
+        assert!(path.ends_with("temp1_enable"), "{path}");
+        assert!(message.contains("disabled"), "{message}");
+    }
+
+    /// The opposite branch: enabled, or no enable attribute at all, reads the
+    /// value exactly as before.
+    #[test]
+    fn enabled_or_unreported_spd5118_sensor_reads_normally() {
+        for enable in [Some("1\n"), None] {
+            let tmp = tempfile::tempdir().unwrap();
+            fs::write(tmp.path().join("temp1_input"), "37500\n").unwrap();
+            if let Some(v) = enable {
+                fs::write(tmp.path().join("temp1_enable"), v).unwrap();
+            }
+            let reading = read_temp(&spd5118_descriptor(tmp.path()))
+                .unwrap_or_else(|e| panic!("enable={enable:?} must read: {e}"));
+            assert!((reading.value_c - 37.5).abs() < f64::EPSILON);
+        }
+    }
+
+    /// Only the chips known to ignore their enable bit are checked: another
+    /// driver's `temp1_enable = 0` is that driver's business (it reports the
+    /// state itself), and the value is read as before.
+    #[test]
+    fn enable_attribute_is_checked_only_for_listed_chips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("temp1_input");
+        fs::write(&input, "45000\n").unwrap();
+        fs::write(tmp.path().join("temp1_enable"), "0\n").unwrap();
+        assert!(read_temp(&make_descriptor(input.to_str().unwrap())).is_ok());
     }
 }

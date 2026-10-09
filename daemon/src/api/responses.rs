@@ -868,8 +868,9 @@ pub struct InventoryTempSensor {
     #[serde(flatten)]
     pub sensor: SensorEntry,
     /// Fine class: `cpu_package` | `cpu_core` | `cpu_tctl` | `cpu_tdie` |
-    /// `motherboard_temp` | `vrm_temp` | `chipset_temp` | `gpu_temp` |
-    /// `disk_temp` | `coolant_temp` | `unknown_temp`. A refinement of `kind`.
+    /// `motherboard_temp` | `vrm_temp` | `chipset_temp` | `memory_temp` |
+    /// `gpu_temp` | `disk_temp` | `coolant_temp` | `unknown_temp`. A refinement
+    /// of `kind` (`memory_temp` is always `kind: mb_temp`, DEC-491).
     pub classification: String,
     /// Classifier confidence: `high` | `medium` | `low` | `unknown`.
     pub confidence: String,

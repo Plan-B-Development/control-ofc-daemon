@@ -79,9 +79,10 @@ pub struct SensorReadFailure {
 ///
 /// The per-tick hot path (DEC-133): touches only each sensor's
 /// `temp*_input` file — no directory enumeration, no label/type reads, no
-/// threshold/alarm snapshot. Returns the successful readings *and* the
-/// per-sensor failures; the caller owns all logging/quarantine policy
-/// (DEC-193) so this function is silent.
+/// threshold/alarm snapshot — plus, for a chip that ignores its own enable bit,
+/// the cached `temp*_enable` (DEC-491, `reader::read_temp`). Returns the
+/// successful readings *and* the per-sensor failures; the caller owns all
+/// logging/quarantine policy (DEC-193) so this function is silent.
 pub fn read_sensor_values(descriptors: &[SensorDescriptor]) -> SensorReadOutcome {
     let mut outcome = SensorReadOutcome::default();
     for d in descriptors {
@@ -158,6 +159,61 @@ mod tests {
         assert_eq!(outcome.failures.len(), 1);
         assert_eq!(outcome.failures[0].label, "Bad");
         assert!(outcome.failures[0].reason.contains("invalid temperature"));
+    }
+
+    /// DEC-491 (end-to-end): a DDR5 SPD hub on an i2c device. Discovery names it
+    /// by its bus device (`21-0051`), keeps it `MbTemp` so it still counts as
+    /// board evidence for the CPU plausibility check, and once its sensor is
+    /// switched off it reads as a failure the DEC-193 tracker quarantines.
+    #[test]
+    fn spd5118_dimm_is_board_evidence_and_quarantines_when_disabled() {
+        use crate::health::sensor_failure::SensorFailureTracker;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let i2c_dev = tmp.path().join("devices/i2c-21/21-0051");
+        fs::create_dir_all(&i2c_dev).unwrap();
+        let root = tmp.path().join("class");
+        let cpu = root.join("hwmon0");
+        let dimm = root.join("hwmon9");
+        fs::create_dir_all(&cpu).unwrap();
+        fs::create_dir_all(&dimm).unwrap();
+        fs::write(cpu.join("name"), "k10temp\n").unwrap();
+        fs::write(cpu.join("temp1_input"), "0\n").unwrap(); // a broken channel
+        fs::write(cpu.join("temp1_label"), "Tctl\n").unwrap();
+        fs::write(dimm.join("name"), "spd5118\n").unwrap();
+        fs::write(dimm.join("temp1_input"), "40000\n").unwrap();
+        fs::write(dimm.join("temp1_enable"), "1\n").unwrap();
+        std::os::unix::fs::symlink(&i2c_dev, dimm.join("device")).unwrap();
+
+        let descriptors = discovery::discover_sensors(&root).unwrap();
+        let d = descriptors
+            .iter()
+            .find(|d| d.chip_name == "spd5118")
+            .expect("the DIMM is discovered");
+        assert_eq!(d.id, "hwmon:spd5118:21-0051:temp1");
+        assert_eq!(d.kind, SensorKind::MbTemp);
+
+        // Enabled: the DIMM is the board evidence that rejects a 0 °C CPU.
+        let outcome = read_sensor_values(&descriptors);
+        assert!(outcome.failures.is_empty());
+        let rejected = plausibility::implausibly_low_cpu_readings(&outcome.readings);
+        assert_eq!(rejected.len(), 1, "the DIMM must count as board evidence");
+        assert!(rejected[0].id.contains("k10temp"));
+
+        // Disabled: a failure, then quarantined like any unreadable sensor.
+        fs::write(dimm.join("temp1_enable"), "0\n").unwrap();
+        let threshold = 3;
+        let mut tracker = SensorFailureTracker::new(threshold);
+        let now = std::time::Instant::now();
+        for _ in 0..=threshold {
+            let outcome = read_sensor_values(&descriptors);
+            assert!(outcome.readings.iter().all(|r| r.chip_name != "spd5118"));
+            tracker.record_tick(&descriptors, &outcome.failures, now);
+        }
+        let unavailable = tracker.unavailable();
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].id, "hwmon:spd5118:21-0051:temp1");
+        assert!(unavailable[0].reason.contains("disabled"));
     }
 
     /// DEC-288 (end-to-end, sysfs bytes -> the thermal ladder's verdict).

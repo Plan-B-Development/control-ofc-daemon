@@ -6,8 +6,9 @@
 //! to key off `SensorKind::CpuTemp`. [`classify_temp_sensor`] reuses
 //! [`crate::hwmon::discovery::classify_chip`] for the coarse decision and only
 //! refines *within* it (a `CpuTemp` becomes cpu_package / cpu_core / cpu_tctl /
-//! cpu_tdie; an `MbTemp` becomes motherboard / vrm / chipset / unknown), so the
-//! fine class can never contradict `kind`. Pure functions — no sysfs access.
+//! cpu_tdie; an `MbTemp` becomes motherboard / vrm / chipset / memory / unknown),
+//! so the fine class can never contradict `kind`. Pure functions — no sysfs
+//! access.
 
 use std::fmt;
 
@@ -23,6 +24,9 @@ pub enum TempClass {
     MotherboardTemp,
     VrmTemp,
     ChipsetTemp,
+    /// A memory-module (DIMM) temperature. Stays `kind: MbTemp` on the wire,
+    /// so it keeps counting as board evidence for `plausibility` (DEC-491).
+    MemoryTemp,
     GpuTemp,
     DiskTemp,
     CoolantTemp,
@@ -39,6 +43,7 @@ impl fmt::Display for TempClass {
             Self::MotherboardTemp => "motherboard_temp",
             Self::VrmTemp => "vrm_temp",
             Self::ChipsetTemp => "chipset_temp",
+            Self::MemoryTemp => "memory_temp",
             Self::GpuTemp => "gpu_temp",
             Self::DiskTemp => "disk_temp",
             Self::CoolantTemp => "coolant_temp",
@@ -197,9 +202,24 @@ fn refine_cpu(chip: &str, l: &str) -> TempClassification {
     TempClassification::new(class, confidence, format!("{chip} {what} — {src}"))
 }
 
-/// Refine a coarse `MbTemp` into VRM / chipset / generic-motherboard, or honest
-/// `unknown` when the coarse kind was only the unrecognised-chip default (an
-/// unknown chip with no classifying label) rather than a real motherboard chip.
+/// Memory-module temperature sensors the kernel binds by chip: `spd5118` is the
+/// DDR5 SPD hub (kernel ≥ 6.11), `jc42` the JEDEC JC-42.4 sensor on a DDR4/DDR3
+/// module. Both sit on the board's SMBus, one device per module. `jc42` is
+/// graded Medium: the same driver also binds standalone JC-42.4 thermometers.
+pub const MEMORY_MODULE_CHIPS: &[&str] = &["spd5118", "jc42"];
+
+/// Whether a lowercased label names a memory channel a board chip reports:
+/// nct6683's `DIMM n` / `PECI DIMM n`, nct6793+'s `Agent0 Dimm0`, `dell_smm`'s
+/// `SODIMM` (all contain "dimm"), and nct6776–6792's `PCH_DIM0_TEMP`..`3`,
+/// which contains "pch" and must be caught before the chipset rule.
+fn is_memory_label(l: &str) -> bool {
+    l.contains("dimm") || l.starts_with("pch_dim")
+}
+
+/// Refine a coarse `MbTemp` into memory / VRM / chipset / generic-motherboard,
+/// or honest `unknown` when the coarse kind was only the unrecognised-chip
+/// default (an unknown chip with no classifying label) rather than a real
+/// motherboard chip.
 fn refine_mb(chip: &str, l: &str) -> TempClassification {
     // `asusec` is the kernel's hwmon name for `asus_ec_sensors` (`BRD-e`).
     let known_mobo = is_superio_chip(chip)
@@ -207,7 +227,26 @@ fn refine_mb(chip: &str, l: &str) -> TempClassification {
         || chip == "asus_ec_sensors"
         || chip == "asus_wmi_sensors"
         || chip == "gigabyte_wmi";
-    if l.contains("vrm") {
+    // Memory first (DEC-491): `PCH_DIM0_TEMP` would otherwise read as chipset.
+    if chip == "spd5118" {
+        TempClassification::new(
+            TempClass::MemoryTemp,
+            Confidence::High,
+            "DDR5 memory-module temperature sensor (SPD hub, read over SMBus)",
+        )
+    } else if MEMORY_MODULE_CHIPS.contains(&chip) {
+        TempClassification::new(
+            TempClass::MemoryTemp,
+            Confidence::Medium,
+            "JEDEC JC-42.4 temperature sensor — usually on a memory module",
+        )
+    } else if is_memory_label(l) {
+        TempClassification::new(
+            TempClass::MemoryTemp,
+            Confidence::Medium,
+            "memory (DIMM) temperature (by label)",
+        )
+    } else if l.contains("vrm") {
         TempClassification::new(
             TempClass::VrmTemp,
             if known_mobo {
@@ -383,6 +422,70 @@ mod tests {
         assert_eq!(cls("it8696", "System").class, TempClass::MotherboardTemp);
     }
 
+    /// DEC-491: a memory-module chip refines to `memory_temp` whatever its
+    /// (synthetic) label — High for the DDR5 SPD hub, Medium for `jc42`, whose
+    /// driver also binds standalone thermometers.
+    #[test]
+    fn memory_module_chips_are_memory() {
+        for (chip, confidence) in [("spd5118", Confidence::High), ("jc42", Confidence::Medium)] {
+            assert!(MEMORY_MODULE_CHIPS.contains(&chip));
+            for label in ["temp1", ""] {
+                let c = cls(chip, label);
+                assert_eq!(c.class, TempClass::MemoryTemp, "{chip}/{label}");
+                assert_eq!(c.confidence, confidence, "{chip}/{label}");
+            }
+        }
+    }
+
+    /// DEC-491: board-reported memory channels refine to `memory_temp` by
+    /// label. `PCH_DIM0_TEMP` contains "pch" and read as `chipset_temp` before.
+    #[test]
+    fn board_memory_labels_are_memory_not_chipset() {
+        let cases = [
+            ("nct6683", "PECI DIMM 0"),
+            ("nct6686", "DIMM 1"),
+            ("nct6779", "PCH_DIM0_TEMP"),
+            ("nct6792", "PCH_DIM3_TEMP"),
+            // nct6793's spelling carries a trailing space (nct6775 driver).
+            ("nct6793", "Agent0 Dimm0 "),
+            ("nct6798", "Agent1 Dimm1"),
+            ("dell_smm", "SODIMM"),
+        ];
+        for (chip, label) in cases {
+            let c = cls(chip, label);
+            assert_eq!(c.class, TempClass::MemoryTemp, "{chip}/{label}");
+            assert_eq!(c.confidence, Confidence::Medium, "{chip}/{label}");
+        }
+        // The chipset rule still holds for a real chipset label.
+        assert_eq!(
+            cls("nct6779", "PCH_CHIP_TEMP").class,
+            TempClass::ChipsetTemp
+        );
+    }
+
+    /// DEC-491: the refinement never moves the coarse kind. Every memory sensor
+    /// stays `MbTemp` — never `CpuTemp` (the ladder's input, `DC-f`) — so it
+    /// keeps counting as board evidence for `plausibility`.
+    #[test]
+    fn memory_sensors_keep_coarse_kind_mb_temp() {
+        let cases = [
+            ("spd5118", "temp1"),
+            ("jc42", "temp1"),
+            ("nct6683", "PECI DIMM 0"),
+            ("nct6779", "PCH_DIM0_TEMP"),
+            ("nct6793", "Agent0 Dimm0 "),
+            ("dell_smm", "SODIMM"),
+        ];
+        for (chip, label) in cases {
+            assert_eq!(
+                crate::hwmon::discovery::classify_chip(chip, label, ""),
+                SensorKind::MbTemp,
+                "{chip}/{label}"
+            );
+            assert_eq!(cls(chip, label).class, TempClass::MemoryTemp);
+        }
+    }
+
     #[test]
     fn gpu_disk_coolant_echo_coarse_kind() {
         assert_eq!(cls("amdgpu", "edge").class, TempClass::GpuTemp);
@@ -417,6 +520,7 @@ mod tests {
         assert_eq!(TempClass::CpuTctl.to_string(), "cpu_tctl");
         assert_eq!(TempClass::MotherboardTemp.to_string(), "motherboard_temp");
         assert_eq!(TempClass::UnknownTemp.to_string(), "unknown_temp");
+        assert_eq!(TempClass::MemoryTemp.to_string(), "memory_temp");
         assert_eq!(Confidence::High.to_string(), "high");
         assert_eq!(Confidence::Unknown.to_string(), "unknown");
     }
