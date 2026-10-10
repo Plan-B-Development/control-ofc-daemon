@@ -1,5 +1,11 @@
 # control-ofc-daemon
 
+> [!IMPORTANT]
+> **Control-OFC is now Ventulus.** This repository is archived and read-only; development continues at
+> [Plan-B-Development/ventulusd](https://github.com/Plan-B-Development/ventulusd) — the daemon is `ventulusd`. Install and upgrade from the
+> [Ventulus pacman repository](https://github.com/Plan-B-Development/pacman-repo). v4.3.0 is the last
+> release under the Control-OFC name.
+
 **Latest release:** v4.3.0 — 2026-10-09. Pairs with `control-ofc-gui` ≥ v2.23.0 (the recommended capability floor; the package itself only hard-blocks GUIs < 2.0.0, the sole-writer cutover). [CHANGELOG.md](CHANGELOG.md) records which version introduced each capability.
 
 Rust workspace for the Control-OFC fan control daemon.
